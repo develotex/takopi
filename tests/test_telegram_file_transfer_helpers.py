@@ -10,6 +10,7 @@ from takopi.runners.mock import Return, ScriptRunner
 from takopi.telegram.api_models import ChatMember, File
 from takopi.settings import TelegramFilesSettings
 from takopi.telegram.commands import file_transfer as transfer
+from takopi.telegram.topic_state import TopicStateStore
 from takopi.telegram.types import TelegramDocument, TelegramIncomingMessage
 from takopi.transport_runtime import ResolvedMessage, TransportRuntime
 from tests.telegram_fakes import DEFAULT_ENGINE_ID, FakeBot, FakeTransport, make_cfg
@@ -81,7 +82,12 @@ def _runtime(tmp_path: Path) -> TransportRuntime:
                 alias="proj",
                 path=tmp_path,
                 worktrees_dir=Path(".worktrees"),
-            )
+            ),
+            "storage": ProjectConfig(
+                alias="storage",
+                path=tmp_path / "storage",
+                worktrees_dir=Path(".worktrees"),
+            ),
         },
         default_project="proj",
     )
@@ -733,6 +739,41 @@ async def test_handle_file_get_sends_file(tmp_path: Path) -> None:
     call = bot.document_calls[-1]
     assert call["filename"] == "notes.txt"
     assert call["content"] == b"hello"
+
+
+@pytest.mark.anyio
+async def test_file_transfer_project_directive_does_not_rebind_topic(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport()
+    bot = FakeBot()
+    cfg = replace(make_cfg(transport), runtime=_runtime(tmp_path), bot=bot)
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    (storage / "image.png").write_bytes(b"image")
+    store = TopicStateStore(tmp_path / "topic-state.json")
+    original = RunContext(project="proj", branch=None)
+    await store.set_context(123, 77, original)
+    msg = _msg("/file get /storage image.png", thread_id=77)
+
+    await transfer._handle_file_get(
+        cfg, msg, "/storage image.png", ambient_context=original, topic_store=store
+    )
+
+    assert bot.document_calls[-1]["content"] == b"image"
+    assert await store.get_context(123, 77) == original
+
+    plan = await transfer._prepare_file_put_plan(
+        cfg,
+        _msg("/file put /storage upload.txt", thread_id=77),
+        "/storage upload.txt",
+        ambient_context=original,
+        topic_store=store,
+    )
+
+    assert plan is not None
+    assert plan.run_root == storage
+    assert await store.get_context(123, 77) == original
 
 
 @pytest.mark.anyio

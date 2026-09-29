@@ -24,7 +24,6 @@ from ..files import (
     zip_directory,
 )
 from ..topic_state import TopicStateStore
-from ..topics import _maybe_update_topic_context, _topic_key
 from ..types import TelegramDocument, TelegramIncomingMessage
 from .reply import make_reply
 
@@ -139,14 +138,9 @@ async def _prepare_file_put_plan(
     except DirectiveError as exc:
         await reply(text=f"error:\n{exc}")
         return None
-    topic_key = _topic_key(msg, cfg) if topic_store is not None else None
-    await _maybe_update_topic_context(
-        cfg=cfg,
-        topic_store=topic_store,
-        topic_key=topic_key,
-        context=resolved.context,
-        context_source=resolved.context_source,
-    )
+    # File transfer directives select a filesystem root for this operation only.
+    # Binding the topic here would move the next agent run to a different cwd
+    # while retaining its old session token.
     if resolved.context is None or resolved.context.project is None:
         await reply(text="no project context available for file upload.")
         return None
@@ -507,14 +501,7 @@ async def _handle_file_get(
     except DirectiveError as exc:
         await reply(text=f"error:\n{exc}")
         return
-    topic_key = _topic_key(msg, cfg) if topic_store is not None else None
-    await _maybe_update_topic_context(
-        cfg=cfg,
-        topic_store=topic_store,
-        topic_key=topic_key,
-        context=resolved.context,
-        context_source=resolved.context_source,
-    )
+    # The explicit project selects the download root, not the topic's future cwd.
     if resolved.context is None or resolved.context.project is None:
         await reply(text="no project context available for file download.")
         return
