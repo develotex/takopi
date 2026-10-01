@@ -16,6 +16,7 @@ import takopi.telegram.topics as telegram_topics
 from takopi.directives import parse_directives
 from takopi.telegram.api_models import (
     Chat,
+    ChatMember,
     File,
     ForumTopic,
     Message,
@@ -1527,6 +1528,27 @@ async def test_maybe_rename_topic_updates_title(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_maybe_rename_topic_existing_only_keeps_binding(tmp_path: Path) -> None:
+    cfg = replace(
+        make_cfg(FakeTransport()),
+        topics=TelegramTopicsSettings(enabled=True, manage_topics=False),
+    )
+    store = TopicStateStore(tmp_path / "telegram_topics_state.json")
+    context = RunContext(project="takopi", branch="new")
+    await store.set_context(123, 77, context, topic_title="original title")
+
+    await telegram_topics._maybe_rename_topic(
+        cfg, store, chat_id=123, thread_id=77, context=context
+    )
+
+    assert cast(FakeBot, cfg.bot).edit_topic_calls == []
+    snapshot = await store.get_thread(123, 77)
+    assert snapshot is not None
+    assert snapshot.context == context
+    assert snapshot.topic_title == "original title"
+
+
+@pytest.mark.anyio
 async def test_maybe_rename_topic_skips_when_title_matches(tmp_path: Path) -> None:
     transport = FakeTransport()
     cfg = make_cfg(transport)
@@ -1551,6 +1573,37 @@ async def test_maybe_rename_topic_skips_when_title_matches(tmp_path: Path) -> No
 
     bot = cast(FakeBot, cfg.bot)
     assert bot.edit_topic_calls == []
+
+
+@pytest.mark.anyio
+async def test_topic_command_existing_only_never_creates_or_edits(tmp_path: Path) -> None:
+    class _NoManageBot(FakeBot):
+        async def create_forum_topic(self, chat_id: int, name: str) -> ForumTopic | None:
+            raise AssertionError("create_forum_topic must not be called")
+
+    transport = FakeTransport()
+    bot = _NoManageBot()
+    cfg = replace(
+        make_cfg(transport),
+        bot=bot,
+        topics=TelegramTopicsSettings(enabled=True, manage_topics=False),
+    )
+    store = TopicStateStore(tmp_path / "telegram_topics_state.json")
+    await _handle_topic_command(
+        cfg,
+        TelegramIncomingMessage(
+            transport="telegram", chat_id=123, message_id=10,
+            text="/topic takopi @master", sender_id=123,
+            thread_id=77, reply_to_message_id=None, reply_to_text=None,
+        ),
+        "takopi @master",
+        store,
+        resolved_scope="main",
+        scope_chat_ids=frozenset({123}),
+    )
+    assert bot.edit_topic_calls == []
+    assert not await store.get_thread(123, 77)
+    assert any("disabled" in call["message"].text for call in transport.send_calls)
 
 
 @pytest.mark.anyio
@@ -2386,14 +2439,20 @@ async def test_run_main_loop_persists_topic_sessions_in_project_scope(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("manage_topics", [True, False])
 async def test_run_main_loop_topic_title_changed_event_does_not_crash(
-    tmp_path: Path,
+    tmp_path: Path, manage_topics: bool,
 ) -> None:
     project_chat_id = -100
     resume_value = "resume-title"
 
     transport = FakeTransport()
-    bot = FakeBot()
+
+    class _MemberBot(FakeBot):
+        async def get_chat_member(self, chat_id: int, user_id: int) -> ChatMember | None:
+            return ChatMember(status="member", can_manage_topics=False)
+
+    bot = FakeBot() if manage_topics else _MemberBot()
     runner = ScriptRunner(
         [
             Emit(TitleChangedEvent(engine=CODEX_ENGINE, title="AI picked title")),
@@ -2432,7 +2491,9 @@ async def test_run_main_loop_topic_title_changed_event_does_not_crash(
         exec_cfg=exec_cfg,
         forward_coalesce_s=FAST_FORWARD_COALESCE_S,
         media_group_debounce_s=FAST_MEDIA_GROUP_DEBOUNCE_S,
-        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        topics=TelegramTopicsSettings(
+            enabled=True, scope="projects", manage_topics=manage_topics
+        ),
     )
 
     async def poller(_cfg: TelegramBridgeConfig):
@@ -2455,11 +2516,15 @@ async def test_run_main_loop_topic_title_changed_event_does_not_crash(
     stored = await store.get_session_resume(project_chat_id, 77, CODEX_ENGINE)
     assert stored == ResumeToken(engine=CODEX_ENGINE, value=resume_value)
     assert runner.calls == [("hello", None)]
+    if not manage_topics:
+        assert bot.edit_topic_calls == []
+    assert any(call["options"] and call["options"].thread_id == 77 for call in transport.send_calls)
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("manage_topics", [True, False])
 async def test_run_main_loop_auto_resumes_topic_default_engine(
-    tmp_path: Path,
+    tmp_path: Path, manage_topics: bool,
 ) -> None:
     state_path = tmp_path / "takopi.toml"
     topic_path = resolve_state_path(state_path)
@@ -2515,6 +2580,7 @@ async def test_run_main_loop_auto_resumes_topic_default_engine(
         topics=TelegramTopicsSettings(
             enabled=True,
             scope="main",
+            manage_topics=manage_topics,
         ),
     )
 

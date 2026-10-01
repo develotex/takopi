@@ -168,6 +168,8 @@ async def _maybe_rename_topic(
     context: RunContext,
     snapshot: TopicThreadSnapshot | None = None,
 ) -> None:
+    if not cfg.topics.manage_topics:
+        return
     title = _topic_title(runtime=cfg.runtime, context=context)
     if snapshot is None:
         snapshot = await store.get_thread(chat_id, thread_id)
@@ -276,6 +278,13 @@ async def _validate_topics_setup_for(
                 f"(chat_id={chat_id}); promote the bot to admin with manage topics."
             )
         if member.status == "creator":
+            continue
+        if not topics.manage_topics:
+            if member.status not in {"administrator", "member"}:
+                raise ConfigError(
+                    "topics enabled but bot cannot participate in the chat "
+                    f"(chat_id={chat_id}); add it as a member with permission to post."
+                )
             continue
         if member.status != "administrator":
             raise ConfigError(

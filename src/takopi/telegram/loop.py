@@ -1204,7 +1204,11 @@ async def run_main_loop(
                         await state.topic_store.set_session_resume(
                             topic_key[0], topic_key[1], token
                         )
-                        if running_task is not None and running_task.title:
+                        if (
+                            cfg.topics.manage_topics
+                            and running_task is not None
+                            and running_task.title
+                        ):
                             # Check if the title actually changed to avoid spamming the API.
                             snapshot = await state.topic_store.get_thread(*topic_key)
                             context = snapshot.context if snapshot else None

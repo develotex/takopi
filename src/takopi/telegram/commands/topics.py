@@ -281,6 +281,9 @@ async def _handle_topic_command(
     if error is not None:
         await reply(text=error)
         return
+    if not cfg.topics.manage_topics:
+        await reply(text="topic creation is disabled; use `/ctx set` in an existing topic.")
+        return
     chat_project = _topics_chat_project(cfg, msg.chat_id)
     context, error = _parse_project_branch_args(
         args_text,
