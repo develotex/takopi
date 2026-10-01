@@ -22,6 +22,7 @@ from ..topic_state import TopicStateStore
 from ..topics import (
     _maybe_rename_topic,
     _topic_key,
+    _topic_management_allowed,
     _topic_title,
     _topics_chat_project,
     _topics_command_error,
@@ -280,6 +281,9 @@ async def _handle_topic_command(
     )
     if error is not None:
         await reply(text=error)
+        return
+    if not _topic_management_allowed(cfg, msg.chat_id):
+        await reply(text="topic creation is disabled; use `/ctx set` in an existing topic.")
         return
     chat_project = _topics_chat_project(cfg, msg.chat_id)
     context, error = _parse_project_branch_args(
