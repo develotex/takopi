@@ -63,7 +63,10 @@ Send:
 /file get <path>
 ```
 
-Directories are zipped automatically.
+Directories are zipped automatically. A project directive such as
+`/file get /storage reports/image.png` selects the file's project for this
+transfer only; it does not change the topic's bound project or agent session.
+The same applies to `/file put`.
 
 ## Related
 
