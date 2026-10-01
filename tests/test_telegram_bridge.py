@@ -1535,17 +1535,36 @@ async def test_maybe_rename_topic_existing_only_keeps_binding(tmp_path: Path) ->
     )
     store = TopicStateStore(tmp_path / "telegram_topics_state.json")
     context = RunContext(project="takopi", branch="new")
+    await store.set_context(-100, 77, context, topic_title="original title")
+
+    await telegram_topics._maybe_rename_topic(
+        cfg, store, chat_id=-100, thread_id=77, context=context
+    )
+
+    assert cast(FakeBot, cfg.bot).edit_topic_calls == []
+    snapshot = await store.get_thread(-100, 77)
+    assert snapshot is not None
+    assert snapshot.context == context
+    assert snapshot.topic_title == "original title"
+
+
+@pytest.mark.anyio
+async def test_maybe_rename_private_topic_existing_only_still_renames(tmp_path: Path) -> None:
+    cfg = replace(
+        make_cfg(FakeTransport()),
+        topics=TelegramTopicsSettings(enabled=True, manage_topics=False),
+    )
+    store = TopicStateStore(tmp_path / "telegram_topics_state.json")
+    context = RunContext(project="takopi", branch="new")
     await store.set_context(123, 77, context, topic_title="original title")
 
     await telegram_topics._maybe_rename_topic(
         cfg, store, chat_id=123, thread_id=77, context=context
     )
 
-    assert cast(FakeBot, cfg.bot).edit_topic_calls == []
+    assert cast(FakeBot, cfg.bot).edit_topic_calls[-1]["name"] == "takopi @new"
     snapshot = await store.get_thread(123, 77)
-    assert snapshot is not None
-    assert snapshot.context == context
-    assert snapshot.topic_title == "original title"
+    assert snapshot is not None and snapshot.topic_title == "takopi @new"
 
 
 @pytest.mark.anyio
@@ -1592,18 +1611,68 @@ async def test_topic_command_existing_only_never_creates_or_edits(tmp_path: Path
     await _handle_topic_command(
         cfg,
         TelegramIncomingMessage(
-            transport="telegram", chat_id=123, message_id=10,
+            transport="telegram", chat_id=-100, message_id=10,
             text="/topic takopi @master", sender_id=123,
             thread_id=77, reply_to_message_id=None, reply_to_text=None,
         ),
         "takopi @master",
         store,
         resolved_scope="main",
-        scope_chat_ids=frozenset({123}),
+        scope_chat_ids=frozenset({-100}),
     )
     assert bot.edit_topic_calls == []
-    assert not await store.get_thread(123, 77)
+    assert not await store.get_thread(-100, 77)
     assert any("disabled" in call["message"].text for call in transport.send_calls)
+
+
+@pytest.mark.anyio
+async def test_topic_command_existing_only_allows_private_topic_creation(
+    tmp_path: Path,
+) -> None:
+    class _CreatingBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.create_calls: list[int] = []
+
+        async def create_forum_topic(self, chat_id: int, name: str) -> ForumTopic | None:
+            self.create_calls.append(chat_id)
+            return ForumTopic(message_thread_id=55)
+
+    bot = _CreatingBot()
+    transport = FakeTransport()
+    projects = ProjectsConfig(
+        projects={
+            "takopi": ProjectConfig(
+                alias="takopi", path=tmp_path, worktrees_dir=Path(".worktrees")
+            )
+        },
+        default_project=None,
+    )
+    cfg = replace(
+        make_cfg(transport),
+        bot=bot,
+        runtime=TransportRuntime(
+            router=_make_router(ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)),
+            projects=projects,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="main", manage_topics=False),
+    )
+    store = TopicStateStore(tmp_path / "telegram_topics_state.json")
+    await _handle_topic_command(
+        cfg,
+        TelegramIncomingMessage(
+            transport="telegram", chat_id=123, chat_type="private",
+            message_id=10, text="/topic takopi @master", sender_id=123,
+            thread_id=77, reply_to_message_id=None, reply_to_text=None,
+        ),
+        "takopi @master", store, resolved_scope="main",
+        scope_chat_ids=frozenset({123}),
+    )
+    assert bot.create_calls == [123]
+    snapshot = await store.get_thread(123, 55)
+    assert snapshot is not None and snapshot.context == RunContext(
+        project="takopi", branch="master"
+    )
 
 
 @pytest.mark.anyio
@@ -2518,6 +2587,65 @@ async def test_run_main_loop_topic_title_changed_event_does_not_crash(
     assert runner.calls == [("hello", None)]
     if not manage_topics:
         assert bot.edit_topic_calls == []
+    assert any(call["options"] and call["options"].thread_id == 77 for call in transport.send_calls)
+
+
+@pytest.mark.anyio
+async def test_run_main_loop_private_topic_title_event_renames_without_group_rights(
+    tmp_path: Path,
+) -> None:
+    class _PrivateTopicsBot(FakeBot):
+        async def get_me(self) -> User | None:
+            return User(id=1, username="bot", has_topics_enabled=True)
+
+        async def get_chat(self, chat_id: int) -> Chat | None:
+            return Chat(id=chat_id, type="private")
+
+    transport = FakeTransport()
+    bot = _PrivateTopicsBot()
+    runner = ScriptRunner(
+        [
+            Emit(TitleChangedEvent(engine=CODEX_ENGINE, title="New session title")),
+            Return(answer="ok"),
+        ],
+        engine=CODEX_ENGINE,
+    )
+    projects = ProjectsConfig(
+        projects={
+            "takopi": ProjectConfig(
+                alias="takopi", path=tmp_path,
+                worktrees_dir=Path(".worktrees"), chat_id=123,
+            )
+        },
+        default_project=None,
+        chat_map={123: "takopi"},
+    )
+    cfg = TelegramBridgeConfig(
+        bot=bot,
+        runtime=TransportRuntime(
+            router=_make_router(runner), projects=projects,
+            config_path=tmp_path / "takopi.toml",
+        ),
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=transport, presenter=MarkdownPresenter(), final_notify=True
+        ),
+        topics=TelegramTopicsSettings(
+            enabled=True, scope="projects", manage_topics=False
+        ),
+    )
+
+    async def poller(_cfg: TelegramBridgeConfig):
+        yield TelegramIncomingMessage(
+            transport="telegram", chat_id=123, chat_type="private",
+            message_id=1, text="hello", sender_id=123, thread_id=77,
+            reply_to_message_id=None, reply_to_text=None,
+        )
+
+    await run_main_loop(cfg, poller)
+    assert bot.edit_topic_calls and bot.edit_topic_calls[-1]["name"] == "New session title"
+    assert bot.edit_topic_calls[-1]["chat_id"] == 123
     assert any(call["options"] and call["options"].thread_id == 77 for call in transport.send_calls)
 
 

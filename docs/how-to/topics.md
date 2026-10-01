@@ -40,10 +40,10 @@ Topics bind Telegram **forum threads** to a project/branch context. Each topic k
     [transports.telegram.topics]
     enabled = true
     scope = "auto" # auto | main | projects | all
-    manage_topics = false # optional: use existing topics without admin rights
+    manage_topics = false # optional: use existing GROUP topics without admin rights
     ```
 
-Set `transports.telegram.topics.manage_topics` to `false` for existing-topic-only mode. Sessions, replies, `/new`, and `/ctx set` still work in existing topics. The bot will not create or rename topics; `/topic` replies with an explanation. Ordinary private chats are unchanged. If private **topics** are in scope, creating and renaming them is also disabled. The default is `true` for the usual managed-topic workflow. Startup checks group membership, not whether message delivery or posting works; verify both after changing bot rights/privacy mode.
+Set `transports.telegram.topics.manage_topics` to `false` to use existing **group** topics only. Sessions, replies, `/new`, and `/ctx set` still work in existing group topics. In groups the bot will not create or rename topics; `/topic` replies with an explanation. Private chats, including creation and renaming of **private topics**, keep their previous behavior. The default is `true` for the usual managed-topic workflow. Startup checks group membership, not whether message delivery or posting works; verify both after changing bot rights/privacy mode.
 
 ### Scope explained
 

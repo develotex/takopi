@@ -67,6 +67,7 @@ from .topics import (
     _resolve_topics_scope,
     _topic_icon_choice,
     _topic_key,
+    _topic_management_allowed,
     _topics_chat_allowed,
     _topics_chat_project,
     _validate_topics_setup,
@@ -1205,7 +1206,7 @@ async def run_main_loop(
                             topic_key[0], topic_key[1], token
                         )
                         if (
-                            cfg.topics.manage_topics
+                            _topic_management_allowed(cfg, topic_key[0])
                             and running_task is not None
                             and running_task.title
                         ):
