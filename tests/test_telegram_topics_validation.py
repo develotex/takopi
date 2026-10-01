@@ -74,6 +74,29 @@ async def test_validate_topics_existing_only_allows_member_without_manage_permis
 
 
 @pytest.mark.anyio
+async def test_validate_topics_existing_only_scope_all_checks_each_chat():
+    bot = MockBot(
+        user=User(id=1),
+        chats={
+            100: Chat(id=100, type="supergroup", is_forum=True),
+            200: Chat(id=200, type="supergroup", is_forum=True),
+        },
+        members={
+            (100, 1): ChatMember(status="administrator", can_manage_topics=False),
+            (200, 1): ChatMember(status="member", can_manage_topics=False),
+        },
+    )
+    await _validate_topics_setup_for(
+        bot=bot,
+        topics=TelegramTopicsSettings(
+            enabled=True, scope="all", manage_topics=False
+        ),
+        chat_id=100,
+        project_chat_ids=[200],
+    )
+
+
+@pytest.mark.anyio
 async def test_validate_topics_existing_only_rejects_removed_member():
     bot = MockBot(
         user=User(id=1),

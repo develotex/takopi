@@ -15,7 +15,7 @@ Topics bind Telegram **forum threads** to a project/branch context. Each topic k
 
 - The chat is a **forum-enabled supergroup**
 - **Topics are enabled** in the group settings
-- To create or rename topics, the bot is an **admin** with **Manage Topics** permission. To use existing topics only, the bot just needs permission to post in the group.
+- To create or rename topics, the bot is an **admin** with **Manage Topics** permission. To use existing topics only, the bot must be a member allowed to post in the group. For ordinary messages (not just commands and replies), disable bot privacy mode via @BotFather; non-admin bots with privacy mode enabled may not receive them.
 - If you want topics in project chats, set `projects.<alias>.chat_id`
 
 !!! note "Setting up workspace from scratch"
@@ -43,7 +43,7 @@ Topics bind Telegram **forum threads** to a project/branch context. Each topic k
     manage_topics = false # optional: use existing topics without admin rights
     ```
 
-Set `transports.telegram.topics.manage_topics` to `false` for existing-topic-only mode. Sessions, replies, `/new`, and `/ctx set` still work in existing topics. The bot will not create or rename topics; `/topic` replies with an explanation. This setting does not change private chats. The default is `true` for the usual managed-topic workflow.
+Set `transports.telegram.topics.manage_topics` to `false` for existing-topic-only mode. Sessions, replies, `/new`, and `/ctx set` still work in existing topics. The bot will not create or rename topics; `/topic` replies with an explanation. Ordinary private chats are unchanged. If private **topics** are in scope, creating and renaming them is also disabled. The default is `true` for the usual managed-topic workflow. Startup checks group membership, not whether message delivery or posting works; verify both after changing bot rights/privacy mode.
 
 ### Scope explained
 

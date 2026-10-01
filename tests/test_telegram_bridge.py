@@ -2701,6 +2701,54 @@ async def test_run_main_loop_auto_resumes_chat_sessions(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_run_main_loop_existing_only_keeps_private_chat_sessions(
+    tmp_path: Path,
+) -> None:
+    class _MemberBot(FakeBot):
+        async def get_chat_member(self, chat_id: int, user_id: int) -> ChatMember | None:
+            return ChatMember(status="member", can_manage_topics=False)
+
+    state_path = tmp_path / "takopi.toml"
+    store = ChatSessionStore(resolve_sessions_path(state_path))
+    await store.set_session_resume(
+        123, None, ResumeToken(engine=CODEX_ENGINE, value="private-resume")
+    )
+    bot = _MemberBot()
+    transport = FakeTransport()
+    runner = ScriptRunner([Return(answer="ok")], engine=CODEX_ENGINE)
+    cfg = TelegramBridgeConfig(
+        bot=bot,
+        runtime=TransportRuntime(
+            router=_make_router(runner),
+            projects=_empty_projects(),
+            config_path=state_path,
+        ),
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=transport, presenter=MarkdownPresenter(), final_notify=True
+        ),
+        session_mode="chat",
+        topics=TelegramTopicsSettings(
+            enabled=True, scope="main", manage_topics=False
+        ),
+    )
+
+    async def poller(_cfg: TelegramBridgeConfig):
+        yield TelegramIncomingMessage(
+            transport="telegram", chat_id=123, message_id=1,
+            text="followup", reply_to_message_id=None, reply_to_text=None,
+            sender_id=123, chat_type="private",
+        )
+
+    await run_main_loop(cfg, poller)
+    assert runner.calls == [
+        ("followup", ResumeToken(engine=CODEX_ENGINE, value="private-resume"))
+    ]
+    assert bot.edit_topic_calls == []
+
+
+@pytest.mark.anyio
 async def test_run_main_loop_prompt_upload_uses_caption_directives(
     tmp_path: Path,
 ) -> None:
