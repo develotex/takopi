@@ -80,6 +80,43 @@ async def test_each_receipt_state_survives_restart_without_claiming_delivery(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("considered", [False, True], ids=["delivered", "considered"])
+async def test_late_submission_ack_preserves_observed_delivery(
+    tmp_path: Path, considered: bool
+) -> None:
+    path = tmp_path / "inbox.json"
+    inbox = LiveInbox(path)
+    receipt = await inbox.receive(1, 10, 1, "session", "late update")
+    await inbox.mark_uncertain(receipt.id, "sending RPC")
+    text = await inbox.delivery_text(receipt.id)
+    if considered:
+        await inbox.reconcile("session", [{"role": "user", "content": text}])
+        observed = await inbox.mark_considered(receipt.id, "main agent applied update")
+    else:
+        observed = await inbox.mark_delivered(
+            receipt.id, {"role": "user", "content": text}
+        )
+
+    assert (await inbox.mark_submitted(receipt.id)) == observed
+    assert (await LiveInbox(path).get(receipt.id)) == observed
+
+
+@pytest.mark.anyio
+async def test_late_submission_ack_does_not_override_explicit_deferral(
+    tmp_path: Path,
+) -> None:
+    inbox = LiveInbox(tmp_path / "inbox.json")
+    receipt = await inbox.receive(1, 10, 1, "session", "later")
+    await inbox.mark_uncertain(receipt.id, "sending RPC")
+    deferred = await inbox.mark_deferred(receipt.id, "needs clarification")
+    with pytest.raises(
+        ValueError, match="Cannot move receipt from deferred to submitted"
+    ):
+        await inbox.mark_submitted(receipt.id)
+    assert (await inbox.get(receipt.id)) == deferred
+
+
+@pytest.mark.anyio
 async def test_reconcile_only_observed_user_message_in_exact_session(
     tmp_path: Path,
 ) -> None:

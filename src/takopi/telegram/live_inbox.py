@@ -248,11 +248,12 @@ class LiveInbox(JsonStateStore[_State]):
         *,
         reason: str | None = None,
         from_states: tuple[ReceiptState, ...],
+        preserve_states: tuple[ReceiptState, ...] = (),
     ) -> Receipt:
         async with self._lock:
             self._reload_locked_if_needed()
             item = self._required(receipt_id)
-            if item.state == state:
+            if item.state == state or item.state in preserve_states:
                 return _receipt(item)
             if item.state not in from_states:
                 raise ValueError(f"Cannot move receipt from {item.state} to {state}")
@@ -275,7 +276,10 @@ class LiveInbox(JsonStateStore[_State]):
 
     async def mark_submitted(self, receipt_id: ReceiptId) -> Receipt:
         return await self._transition(
-            receipt_id, "submitted", from_states=("received", "uncertain")
+            receipt_id,
+            "submitted",
+            from_states=("received", "uncertain"),
+            preserve_states=("delivered", "considered"),
         )
 
     async def mark_delivered(self, receipt_id: ReceiptId, user_entry: dict) -> Receipt:
