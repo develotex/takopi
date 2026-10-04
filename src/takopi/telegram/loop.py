@@ -16,7 +16,17 @@ from ..commands import list_command_ids
 from ..directives import DirectiveError
 from ..logging import get_logger
 from ..model import EngineId, ResumeToken
-from ..runners.run_options import EngineRunOptions
+from ..runners.run_options import EngineRunOptions, apply_run_options
+from ..runners.pi import PiRunner
+from .live_conversation import (
+    LiveConversationService,
+    LiveOwner,
+    LiveRunner,
+    live_route_key,
+    live_session_path,
+    quick_pi_answer,
+)
+from .live_inbox import LiveInbox, resolve_inbox_path
 from ..scheduler import ThreadJob, ThreadScheduler
 from ..progress import ProgressTracker
 from ..settings import TelegramTransportSettings
@@ -1289,26 +1299,106 @@ async def run_main_loop(
                 from ..runner_bridge import RunningTask
 
                 running_task = RunningTask(context=context)
-                await run_engine(
-                    exec_cfg=cfg.exec_cfg,
-                    runtime=cfg.runtime,
-                    running_tasks=state.running_tasks,
-                    chat_id=chat_id,
-                    user_msg_id=user_msg_id,
-                    text=text,
-                    resume_token=resume_token,
-                    context=context,
-                    reply_ref=reply_ref,
-                    running_task=running_task,
-                    on_thread_known=wrap_on_thread_known(
-                        on_thread_known, topic_key, chat_session_key, running_task
-                    ),
-                    engine_override=engine_override,
-                    thread_id=thread_id,
-                    show_resume_line=show_resume_line,
-                    progress_ref=progress_ref,
-                    run_options=run_options,
-                )
+                live_runner: LiveRunner | None = None
+                owner: LiveOwner | None = None
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and engine_for_overrides == "pi"
+                    and config_path is not None
+                ):
+                    entry = cfg.runtime.resolve_runner(
+                        resume_token=resume_token, engine_override=engine_override
+                    )
+                    root = (config_path.parent / "pi-live-sessions").resolve()
+                    path = (
+                        Path(resume_token.value).resolve()
+                        if resume_token is not None
+                        else live_session_path(config_path, chat_id, topic_key[1])
+                    )
+                    # Legacy Pi IDs and unrelated session paths remain on the
+                    # existing one-shot bridge, avoiding silent rebinding.
+                    if (
+                        isinstance(entry.runner, PiRunner)
+                        and entry.available
+                        and path.parent == root
+                        and path.name.startswith(f"{chat_id}-{topic_key[1]}-")
+                        and (
+                            resume_token is None
+                            or Path(resume_token.value).is_absolute()
+                        )
+                    ):
+                        cwd = cfg.runtime.resolve_run_cwd(context) or Path.cwd()
+                        with apply_run_options(run_options):
+                            rpc = entry.runner.rpc_run(path, cwd=cwd)
+                        live_runner = LiveRunner(
+                            entry.runner, rpc, running_task.resume_ready
+                        )
+                        owner = LiveOwner(
+                            chat_id, topic_key[1], str(path), live_runner, text[:1500]
+                        )
+                        if not live.register(owner):
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="This Pi session is already active; try your message again.",
+                            )
+                            return
+
+                async def monitor() -> None:
+                    assert live is not None and owner is not None
+                    while not running_task.done.is_set():
+                        await anyio.sleep(1)
+                        try:
+                            await live.reconcile(owner)
+                        except Exception as exc:  # noqa: BLE001 - RPC can exit while observed
+                            logger.debug("live.reconcile.failed", error=str(exc))
+
+                try:
+                    async with anyio.create_task_group() as live_group:
+                        if owner is not None:
+                            live_group.start_soon(monitor)
+                        await run_engine(
+                            exec_cfg=cfg.exec_cfg,
+                            runtime=cfg.runtime,
+                            running_tasks=state.running_tasks,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            text=text,
+                            resume_token=resume_token,
+                            context=context,
+                            reply_ref=reply_ref,
+                            running_task=running_task,
+                            on_thread_known=wrap_on_thread_known(
+                                on_thread_known,
+                                topic_key,
+                                chat_session_key,
+                                running_task,
+                            ),
+                            engine_override=engine_override,
+                            thread_id=thread_id,
+                            show_resume_line=show_resume_line,
+                            progress_ref=progress_ref,
+                            run_options=run_options,
+                            runner_override=live_runner,
+                        )
+                        live_group.cancel_scope.cancel()
+                    if live is not None and owner is not None:
+                        try:
+                            if not running_task.cancel_requested.is_set():
+                                await live.flush(owner)
+                            await live.reconcile(owner)
+                        except Exception as exc:  # noqa: BLE001 - retain receipts on failure
+                            logger.warning(
+                                "live.final_reconcile.failed", error=str(exc)
+                            )
+                finally:
+                    if live is not None and owner is not None:
+                        live.unregister(owner)
+                    if live_runner is not None:
+                        await live_runner.client.close()
 
             async def run_thread_job(job: ThreadJob) -> None:
                 await run_job(
@@ -1326,6 +1416,30 @@ async def run_main_loop(
                 )
 
             scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
+            live: LiveConversationService | None = None
+            if cfg.pi_live_conversation:
+                if config_path is None:
+                    raise ConfigError(
+                        "Pi live conversation needs a config path for durable receipts"
+                    )
+
+                async def live_reply(
+                    chat: int, thread: int, message: int, text: str
+                ) -> None:
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat,
+                        user_msg_id=message,
+                        thread_id=thread,
+                        text=text,
+                        notify=False,
+                    )
+
+                live = LiveConversationService(
+                    LiveInbox(resolve_inbox_path(config_path)),
+                    quick_pi_answer,
+                    live_reply,
+                )
 
             def resolve_topic_key(
                 msg: TelegramIncomingMessage,
@@ -1456,6 +1570,62 @@ async def run_main_loop(
                     topic_key=topic_key,
                 )
                 engine_override = engine_resolution.engine
+                if (
+                    live is not None
+                    and resolved.resume_token is not None
+                    and resolved.resume_token.engine == "pi"
+                    and config_path is not None
+                ):
+                    explicit_path = Path(resolved.resume_token.value)
+                    root = (config_path.parent / "pi-live-sessions").resolve()
+                    if (
+                        explicit_path.is_absolute()
+                        and explicit_path.resolve().parent == root
+                        and (
+                            topic_key is None
+                            or not explicit_path.name.startswith(
+                                f"{chat_id}-{topic_key[1]}-"
+                            )
+                        )
+                    ):
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=msg.thread_id,
+                            text="Pi live session belongs to a different topic.",
+                        )
+                        return
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and engine_override == "pi"
+                ):
+                    candidate = resolved.resume_token
+                    if candidate is None and state.topic_store is not None:
+                        candidate = await state.topic_store.get_session_resume(
+                            chat_id, topic_key[1], "pi"
+                        )
+                    key = live_route_key(chat_id, msg.thread_id, candidate)
+                    replied_task = (
+                        state.running_tasks.get(reply_ref) if reply_ref else None
+                    )
+                    active = live.owner(*key) if key is not None else None
+                    if (
+                        active is not None
+                        and (
+                            replied_task is None
+                            or (
+                                replied_task.resume is not None
+                                and replied_task.resume.value == active.session_key
+                            )
+                        )
+                        and key is not None
+                        and await live.handle(
+                            chat_id, key[1], user_msg_id, key[2], prompt_text
+                        )
+                    ):
+                        return
                 resume_decision = await resume_resolver.resolve(
                     resume_token=resolved.resume_token,
                     reply_id=reply_id,
@@ -1470,6 +1640,12 @@ async def run_main_loop(
                 if resume_decision.handled_by_running_task:
                     return
                 resume_token = resume_decision.resume_token
+                if live is not None and resume_token is not None:
+                    key = live_route_key(chat_id, msg.thread_id, resume_token)
+                    if key is not None and await live.handle(
+                        chat_id, key[1], user_msg_id, key[2], prompt_text
+                    ):
+                        return
                 if resume_token is None:
                     await run_job(
                         chat_id,
@@ -1822,6 +1998,31 @@ async def run_main_loop(
                     elif cfg.files.enabled:
                         tg.start_soon(
                             partial(reply, text=FILE_PUT_USAGE),
+                        )
+                    return
+                if command_id == "update" and live is not None:
+                    candidate = (
+                        await state.topic_store.get_session_resume(
+                            chat_id, topic_key[1], "pi"
+                        )
+                        if state.topic_store is not None and topic_key is not None
+                        else None
+                    )
+                    key = live_route_key(chat_id, msg.thread_id, candidate)
+                    if key is not None and live.owner(*key) is not None:
+                        tg.start_soon(
+                            live.handle,
+                            chat_id,
+                            key[1],
+                            msg.message_id,
+                            key[2],
+                            f"/update {args_text}",
+                        )
+                    else:
+                        tg.start_soon(
+                            partial(
+                                reply, text="/update requires an active Pi live topic."
+                            )
                         )
                     return
                 if command_id is not None and command_id not in state.reserved_commands:

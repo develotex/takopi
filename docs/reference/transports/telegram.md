@@ -16,6 +16,32 @@ This document captures current behavior so transport changes stay intentional.
 4. High-value messages enqueue a send.
 5. All writes go through the outbox.
 
+## Pi live conversation (opt-in)
+
+Set `pi_live_conversation = true` under `[transports.telegram]` and enable Telegram
+`topics`. New Pi tasks in a bound topic use one owned Pi RPC session; existing
+legacy/abbreviated Pi resume tokens keep the one-shot path. Other engines and
+inactive topics keep their current queue behavior. This requires a writable
+Takopi config directory for `telegram_live_inbox.json` and `pi-live-sessions/`.
+
+During an active Pi task, ask a status question in the same topic for an isolated,
+short-lived no-tools Pi answer. It sees only a bounded public task description and
+recorded progress, not the main session or pending tool/subagent results. Use
+`/update <instruction>` to unambiguously send a constraint to the main task.
+A question followed by `? Also ...` can both request an answer and submit an
+update; other ambiguous messages ask for clarification rather than silently
+changing the task. Commands `/cancel` and `/new`, media, and explicitly different
+resume routes keep their existing behavior.
+
+An update is persisted before the **received** reply. **Submitted** means the RPC
+command accepted it, not that Pi read it. **Delivered** requires observation of
+the exact user message in the main Pi stream. **Considered/deferred** requires an
+explicit main-agent marker and explanation; no marker means no consideration claim.
+If a command response is lost, the receipt stays **uncertain** instead of being
+blindly re-sent; recovery needs main-session inspection. The isolated quick answer
+is never fed into the writable main session. Replies remain in the same topic and
+are associated with the original user message.
+
 ## Incoming messages
 
 `parse_incoming_update` accepts text messages and voice notes.
