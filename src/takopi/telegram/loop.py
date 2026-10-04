@@ -23,8 +23,11 @@ from .live_conversation import (
     LiveOwner,
     LiveRunner,
     live_route_key,
+    legacy_session_busy,
     live_session_path,
     quick_pi_answer,
+    resolve_legacy_session,
+    verify_legacy_session,
 )
 from .live_inbox import LiveInbox, resolve_inbox_path
 from ..scheduler import ThreadJob, ThreadScheduler
@@ -1316,19 +1319,62 @@ async def run_main_loop(
                         if resume_token is not None
                         else live_session_path(config_path, chat_id, topic_key[1])
                     )
-                    # Legacy Pi IDs and unrelated session paths remain on the
-                    # existing one-shot bridge, avoiding silent rebinding.
+                    # A short ID is only a lookup hint. Resolve to one local
+                    # project file before claiming the canonical RPC owner.
+                    bound = (
+                        await state.topic_store.get_session_resume(
+                            chat_id, topic_key[1], "pi"
+                        )
+                        if state.topic_store is not None
+                        else None
+                    )
+                    fresh = (
+                        path.parent == root
+                        and path.name.startswith(f"{chat_id}-{topic_key[1]}-")
+                        and (resume_token is None or bound == resume_token)
+                    )
+                    existing = (
+                        resume_token is not None
+                        and Path(resume_token.value).is_absolute()
+                        and path.suffix == ".jsonl"
+                        and path.is_file()
+                        and bound == resume_token
+                    )
+                    cwd = cfg.runtime.resolve_run_cwd(context) or Path.cwd()
+                    legacy_id: str | None = None
+                    if (
+                        resume_token is not None
+                        and not Path(resume_token.value).is_absolute()
+                        and bound == resume_token
+                        and isinstance(entry.runner, PiRunner)
+                        and entry.available
+                    ):
+                        legacy_id = resume_token.value
+                        try:
+                            path = resolve_legacy_session(legacy_id, cwd)
+                        except ValueError:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Pi session ID не найден однозначно в этом проекте. Работа не запущена; уточните путь к сессии.",
+                            )
+                            return
+                        if legacy_session_busy(state.running_tasks, path):
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Эта Pi-сессия уже выполняется; дождитесь завершения текущего запуска.",
+                            )
+                            return
                     if (
                         isinstance(entry.runner, PiRunner)
                         and entry.available
-                        and path.parent == root
-                        and path.name.startswith(f"{chat_id}-{topic_key[1]}-")
-                        and (
-                            resume_token is None
-                            or Path(resume_token.value).is_absolute()
-                        )
+                        and (fresh or existing or legacy_id is not None)
                     ):
-                        cwd = cfg.runtime.resolve_run_cwd(context) or Path.cwd()
                         with apply_run_options(run_options):
                             rpc = entry.runner.rpc_run(path, cwd=cwd)
                         live_runner = LiveRunner(
@@ -1346,6 +1392,42 @@ async def run_main_loop(
                                 text="This Pi session is already active; try your message again.",
                             )
                             return
+                        if legacy_id is not None:
+                            try:
+                                await verify_legacy_session(rpc, path, legacy_id, cwd)
+                                assert state.topic_store is not None
+                                canonical = ResumeToken(engine="pi", value=str(path))
+                                await state.topic_store.set_session_resume(
+                                    chat_id, topic_key[1], canonical
+                                )
+                                resume_token = canonical
+                            except Exception as exc:  # noqa: BLE001 - no prompt on failed identity
+                                live.unregister(owner)
+                                await rpc.client.close()
+                                logger.warning(
+                                    "live.legacy_identity.failed", error=str(exc)
+                                )
+                                await send_plain(
+                                    cfg.exec_cfg.transport,
+                                    chat_id=chat_id,
+                                    user_msg_id=user_msg_id,
+                                    thread_id=thread_id,
+                                    text="Идентичность Pi-сессии не подтверждена. Работа не запущена; привязка темы сохранена.",
+                                )
+                                return
+                        live_runner.before_final = partial(live.finalize, owner)
+                        live_runner.on_progress = lambda status: setattr(
+                            owner, "progress", status
+                        )
+                    elif resume_token is not None:
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Не удалось безопасно открыть Pi live для этой сессии; проверьте привязку темы и путь к файлу JSONL. Работа не запущена.",
+                        )
+                        return
 
                 async def monitor() -> None:
                     assert live is not None and owner is not None
@@ -1387,8 +1469,6 @@ async def run_main_loop(
                         live_group.cancel_scope.cancel()
                     if live is not None and owner is not None:
                         try:
-                            if not running_task.cancel_requested.is_set():
-                                await live.flush(owner)
                             await live.reconcile(owner)
                         except Exception as exc:  # noqa: BLE001 - retain receipts on failure
                             logger.warning(
@@ -1559,6 +1639,7 @@ async def run_main_loop(
                 chat_session_key: tuple[int, int | None] | None,
                 reply_ref: MessageRef | None,
                 reply_id: int | None,
+                live_eligible: bool = True,
             ) -> None:
                 chat_id = msg.chat_id
                 user_msg_id = msg.message_id
@@ -1597,7 +1678,8 @@ async def run_main_loop(
                         )
                         return
                 if (
-                    live is not None
+                    live_eligible
+                    and live is not None
                     and topic_key is not None
                     and engine_override == "pi"
                 ):
@@ -1640,7 +1722,7 @@ async def run_main_loop(
                 if resume_decision.handled_by_running_task:
                     return
                 resume_token = resume_decision.resume_token
-                if live is not None and resume_token is not None:
+                if live_eligible and live is not None and resume_token is not None:
                     key = live_route_key(chat_id, msg.thread_id, resume_token)
                     if key is not None and await live.handle(
                         chat_id, key[1], user_msg_id, key[2], prompt_text
@@ -1707,6 +1789,7 @@ async def run_main_loop(
                     chat_session_key=chat_session_key,
                     reply_ref=reply_ref,
                     reply_id=reply_id,
+                    live_eligible=False,
                 )
 
             async def _dispatch_pending_prompt(pending: _PendingPrompt) -> None:
@@ -1762,6 +1845,10 @@ async def run_main_loop(
                     chat_session_key=pending.chat_session_key,
                     reply_ref=pending.reply_ref,
                     reply_id=pending.reply_id,
+                    live_eligible=not pending.is_voice_transcribed
+                    and not pending.forwards
+                    and resolved.prompt == pending.text.strip()
+                    and resolved.context_source != "directives",
                 )
 
             forward_coalescer = ForwardCoalescer(
@@ -2097,6 +2184,69 @@ async def run_main_loop(
                     )
                     tg.start_soon(_dispatch_pending_prompt, pending)
                     return
+                # Active ordinary text must be accepted before the destructive
+                # forward debounce can replace it with a later status question.
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and not is_voice_transcribed
+                    and msg.voice is None
+                    and msg.document is None
+                    and msg.media_group_id is None
+                    and text.strip()
+                ):
+                    try:
+                        resolved_live = cfg.runtime.resolve_message(
+                            text=text,
+                            reply_text=msg.reply_to_text,
+                            ambient_context=ambient_context,
+                            chat_id=chat_id,
+                        )
+                    except DirectiveError:
+                        resolved_live = None
+                    if (
+                        resolved_live is not None
+                        and resolved_live.prompt == text.strip()
+                        and resolved_live.context_source != "directives"
+                        and resolved_live.engine_override in (None, "pi")
+                    ):
+                        engine_live = await resolve_engine_defaults(
+                            explicit_engine=resolved_live.engine_override,
+                            context=resolved_live.context,
+                            chat_id=chat_id,
+                            topic_key=topic_key,
+                        )
+                        candidate = (
+                            resolved_live.resume_token
+                            or await state.topic_store.get_session_resume(  # type: ignore[union-attr]
+                                chat_id, topic_key[1], "pi"
+                            )
+                        )
+                        key = live_route_key(chat_id, msg.thread_id, candidate)
+                        active = live.owner(*key) if key is not None else None
+                        replied_task = (
+                            state.running_tasks.get(reply_ref) if reply_ref else None
+                        )
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is not None
+                            and (
+                                replied_task is None
+                                or (
+                                    replied_task.resume is not None
+                                    and replied_task.resume.value == active.session_key
+                                )
+                            )
+                            and await live.handle(
+                                chat_id,
+                                key[1],
+                                msg.message_id,
+                                key[2],
+                                resolved_live.prompt,
+                            )
+                        ):
+                            return
                 forward_coalescer.schedule(pending)
 
             allowed_user_ids = set(cfg.allowed_user_ids)

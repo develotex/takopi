@@ -19,17 +19,26 @@ This document captures current behavior so transport changes stay intentional.
 ## Pi live conversation (opt-in)
 
 Set `pi_live_conversation = true` under `[transports.telegram]` and enable Telegram
-`topics`. New Pi tasks in a bound topic use one owned Pi RPC session; existing
-legacy/abbreviated Pi resume tokens keep the one-shot path. Other engines and
-inactive topics keep their current queue behavior. This requires a writable
+`topics`. New Pi tasks in a bound topic use one owned Pi RPC session. Existing
+topics with an absolute JSONL Pi session path can resume live when that exact
+path is bound to the topic and the file exists. Abbreviated legacy Pi IDs can
+migrate in the same topic: resolve one header-matched session in the current
+project, claim its canonical file, verify Pi `get_state` before any prompt, then
+update the topic binding. Missing/ambiguous IDs, project mismatch, and locally
+running one-shot aliases fail closed without prompt; retry after the active run
+settles. Already-running external Pi processes cannot be attached retroactively.
+Other engines and inactive topics keep their current queue behavior. This requires a writable
 Takopi config directory for `telegram_live_inbox.json` and `pi-live-sessions/`.
 
 During an active Pi task, ask a status question in the same topic for an isolated,
 short-lived no-tools Pi answer. It sees only a bounded public task description and
-recorded progress, not the main session or pending tool/subagent results. Use
+recorded progress, same-topic receipt status and explicit acknowledgements,
+not the private main-session transcript or pending tool/subagent results. Use
 `/update <instruction>` to unambiguously send a constraint to the main task.
-A question followed by `? Also ...` can both request an answer and submit an
-update; other ambiguous messages ask for clarification rather than silently
+Ordinary Russian messages such as «Как дела?», «Не трогай авторизацию» and
+«Как дела? И ещё — не трогай авторизацию» are supported, as are English status
+questions and `? Also ...` instructions. Other ambiguous messages ask for
+clarification rather than silently
 changing the task. Commands `/cancel` and `/new`, media, and explicitly different
 resume routes keep their existing behavior.
 

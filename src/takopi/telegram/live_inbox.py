@@ -231,6 +231,15 @@ class LiveInbox(JsonStateStore[_State]):
             self._reload_locked_if_needed()
             return _delivery_text(self._required(receipt_id))
 
+    async def for_session(self, session_key: str) -> list[Receipt]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                _receipt(r)
+                for r in self._state.receipts
+                if r.session_key == session_key
+            ]
+
     async def pending(self, session_key: str) -> list[Receipt]:
         async with self._lock:
             self._reload_locked_if_needed()

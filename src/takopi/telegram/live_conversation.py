@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 import tempfile
 
 import anyio
 from pathlib import Path
 from uuid import uuid4
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from ..model import CompletedEvent, ResumeToken, TakopiEvent
+from ..model import ActionEvent, CompletedEvent, ResumeToken, TakopiEvent
+from ..runner_bridge import RunningTask
+from ..transport import MessageRef
 from ..runners.pi_rpc import PiRpcClient, PiRpcRun
+from ..runners.pi import _default_session_dir
 from .live_inbox import LiveInbox, Receipt
 
 
@@ -24,6 +29,111 @@ def live_session_path(config_path: Path, chat_id: int, thread_id: int) -> Path:
         / "pi-live-sessions"
         / f"{chat_id}-{thread_id}-{uuid4().hex}.jsonl"
     ).resolve()
+
+
+def _session_header(path: Path) -> dict | None:
+    try:
+        with path.open("rb") as handle:
+            line = handle.readline(8193)
+        if len(line) > 8192 or not line.endswith(b"\n"):
+            return None
+        header = json.loads(line)
+        return (
+            header
+            if isinstance(header, dict) and header.get("type") == "session"
+            else None
+        )
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def resolve_legacy_session(partial_id: str, cwd: Path) -> Path:
+    """Find one local project session without launching an alias-keyed writer.
+
+    The selected canonical path is only a candidate. The RPC owner's get_state
+    must validate the actual identity under its canonical-path lock before prompt.
+    """
+    if re.fullmatch(r"[a-fA-F0-9-]{8,36}", partial_id) is None:
+        raise ValueError("Invalid Pi session ID prefix")
+    project = cwd.resolve()
+    configured = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    directory = (
+        Path(configured).expanduser() if configured else _default_session_dir(project)
+    ).resolve()
+    matches: set[Path] = set()
+    if directory.is_dir():
+        for file in directory.glob("*.jsonl"):
+            path = file.resolve()
+            if path.parent != directory or not file.is_file():
+                continue
+            header = _session_header(path)
+            if (
+                header is not None
+                and isinstance(header.get("id"), str)
+                and header["id"].lower().startswith(partial_id.lower())
+                and isinstance(header.get("cwd"), str)
+                and Path(header["cwd"]).resolve() == project
+            ):
+                matches.add(path)
+    if len(matches) != 1:
+        raise ValueError("Pi session ID not uniquely found in this project")
+    return matches.pop()
+
+
+def legacy_session_busy(
+    running_tasks: Mapping[MessageRef, RunningTask], session_path: Path
+) -> bool:
+    header = _session_header(session_path)
+    if header is None or not isinstance(header.get("id"), str):
+        return True
+    full_id = header["id"].lower()
+    for task in running_tasks.values():
+        if task.done.is_set():
+            continue
+        token = task.resume
+        if token is None:
+            return True  # Identity is still unresolved; do not risk a second writer.
+        if token.engine != "pi":
+            continue
+        value = token.value
+        if (Path(value).is_absolute() and Path(value).resolve() == session_path) or (
+            re.fullmatch(r"[a-fA-F0-9-]{8,36}", value) is not None
+            and full_id.startswith(value.lower())
+        ):
+            return True
+    return False
+
+
+async def verify_legacy_session(
+    rpc: PiRpcRun, session_path: Path, partial_id: str, cwd: Path
+) -> None:
+    """Verify Pi's actual identity while its canonical RPC owner is held.
+
+    A get_state response is not permission to prompt until file identity and
+    project metadata agree. In particular, never fork a cross-project match.
+    """
+    before = session_path.stat()
+    header = _session_header(session_path)
+    response = await rpc.client.request("get_state")
+    data = response.get("data")
+    after = session_path.stat()
+    if (
+        not isinstance(data, dict)
+        or header is None
+        or not isinstance(header.get("id"), str)
+        or not isinstance(header.get("cwd"), str)
+        or not isinstance(data.get("sessionId"), str)
+        or not isinstance(data.get("sessionFile"), str)
+        or data.get("isStreaming") is not False
+        or data["sessionId"] != header["id"]
+        or not data["sessionId"].lower().startswith(partial_id.lower())
+        or Path(data["sessionFile"]).resolve() != session_path
+        or Path(header["cwd"]).resolve() != cwd.resolve()
+        or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+    ):
+        raise ValueError(
+            "Pi session identity/project mismatch; no prompt was submitted"
+        )
 
 
 def live_route_key(
@@ -85,6 +195,9 @@ class LiveRunner:
         self.rpc = rpc
         self.client = rpc.client
         self.ready = ready
+        self.before_final: Callable[[], Awaitable[None]] | None = None
+        self.on_progress: Callable[[str], None] | None = None
+        self._followups: list[str] = []
 
     def format_resume(self, token: ResumeToken) -> str:
         return self.runner.format_resume(token)  # type: ignore[attr-defined]
@@ -105,18 +218,40 @@ class LiveRunner:
             "[takopi-deferred:<marker>] <specific reason> in your assistant text. "
             "Do not claim consideration on delivery alone. Continue the main task.\n\n"
         )
-        async for event in self.rpc.run(guidance + prompt, resume):
-            yield event
+        next_prompt = guidance + prompt
+        next_resume = resume
+        for iteration in range(
+            9
+        ):  # Bound settlement drain even if updates arrive continuously.
+            completed: CompletedEvent | None = None
+            async for event in self.rpc.run(next_prompt, next_resume):
+                if isinstance(event, CompletedEvent):
+                    completed = event
+                else:
+                    if isinstance(event, ActionEvent) and self.on_progress is not None:
+                        # Kind and phase only; titles/details can contain tool arguments.
+                        self.on_progress(f"{event.action.kind}: {event.phase}")
+                    yield event
+            if self.before_final is not None:
+                await self.before_final()
+            if not self._followups:
+                if completed is not None:
+                    yield completed
+                return
+            if iteration == 8:
+                raise RuntimeError(
+                    "Live Pi settlement drain exceeded eight follow-ups; receipt state retained"
+                )
+            next_prompt = self._followups.pop(0)
+            next_resume = None
 
     async def steer(self, text: str) -> str:
         if self.ready is not None:
             await asyncio.wait_for(self.ready.wait(), timeout=20)
         if not self.rpc._active:
-            # The last agent_settled was already consumed. Continue the same
-            # session as a new prompt, never launch a second writable owner.
-            async for _ in self.rpc.run(text, None):
-                pass
-            return "handled"
+            # The streaming owner, not this caller, renders the continuation.
+            self._followups.append(text)
+            return "queued"
         return await self.rpc.steer(text)
 
     async def get_messages(self) -> list[dict]:
@@ -143,23 +278,51 @@ class LiveOwner:
     progress: str = "The main task is still running; a pending tool or child has no observed result."
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     quick_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
+    closing: bool = False
+    public_output: str = ""
 
 
 def _classify(text: str) -> tuple[str | None, str | None]:
     if text.startswith("/update "):
         return None, text[len("/update ") :].strip() or None
+    if text.startswith("/обнови "):
+        return None, text[len("/обнови ") :].strip() or None
     # Conservatively split an explicit question from a subsequent imperative.
     question, sep, rest = text.partition("?")
     if sep:
         update = rest.strip()
         if update.lower().startswith(
-            ("also ", "please ", "use ", "don't ", "do not ", "instead ", "make ")
+            (
+                "also ",
+                "please ",
+                "use ",
+                "don't ",
+                "do not ",
+                "instead ",
+                "make ",
+                "и ещё",
+                "и еще",
+                "не трогай",
+                "используй",
+                "пожалуйста",
+                "вместо ",
+                "исправь ",
+            )
         ):
             return question.strip() + "?", update
         if not update:
             return text.strip(), None
         return None, None
-    if text.lower().startswith(("status", "how is", "what's the status")):
+    if text.lower().startswith(
+        (
+            "status",
+            "how is",
+            "what's the status",
+            "как дела",
+            "какой статус",
+            "что со статусом",
+        )
+    ):
         return text.strip(), None
     if text.lower().startswith(
         (
@@ -172,6 +335,15 @@ def _classify(text: str) -> tuple[str | None, str | None]:
             "change ",
             "correct ",
             "important: ",
+            "не трогай",
+            "используй",
+            "пожалуйста",
+            "вместо ",
+            "исправь ",
+            "поменяй ",
+            "важно: ",
+            "не меняй",
+            "сделай ",
         )
     ):
         return None, text.strip()
@@ -208,7 +380,10 @@ class LiveConversationService:
 
     def register(self, owner: LiveOwner) -> bool:
         key = (owner.chat_id, owner.thread_id, owner.session_key)
-        if key in self._owners:
+        if key in self._owners or any(
+            registered.session_key == owner.session_key
+            for registered in self._owners.values()
+        ):
             return False
         self._owners[key] = owner
         return True
@@ -225,7 +400,7 @@ class LiveConversationService:
         self, chat: int, thread: int, message: int, session: str, text: str
     ) -> bool:
         owner = self.owner(chat, thread, session)
-        if owner is None:
+        if owner is None or owner.closing:
             return False
         question, update = _classify(text)
         if question is None and update is None:
@@ -233,42 +408,55 @@ class LiveConversationService:
                 chat,
                 thread,
                 message,
-                "Please clarify: ask a question or use /update <task instruction>.",
+                "Уточните вопрос или передайте инструкцию через /update <текст>. (Please clarify.)",
             )
             return True
         receipt: Receipt | None = None
         if update:
-            receipt = await self.inbox.receive(chat, thread, message, session, update)
-            # A retry is not a new delivery; uncertain/submitted states are not safe to resend.
-            if receipt.state == "received":
-                await self._reply(
-                    chat,
-                    thread,
-                    message,
-                    "Update received and stored; not yet confirmed delivered or considered.",
+            async with owner.lock:
+                if owner.closing:
+                    return False
+                receipt = await self.inbox.receive(
+                    chat, thread, message, session, update
                 )
-            else:
-                await self._reply(
-                    chat,
-                    thread,
-                    message,
-                    f"Update status: {receipt.state}; not necessarily considered.",
-                )
+                # A retry is not a new delivery; reply only after durable receive.
+                if receipt.state == "received":
+                    await self._reply(
+                        chat,
+                        thread,
+                        message,
+                        "Инструкция получена и сохранена (received); not yet confirmed delivered or considered.",
+                    )
+                    await self._drain_locked(owner)
+                else:
+                    await self._reply(
+                        chat,
+                        thread,
+                        message,
+                        f"Статус инструкции: {receipt.state}; это не означает, что она учтена.",
+                    )
         if question:
             try:
                 async with asyncio.timeout(self._timeout):
                     async with owner.quick_slots:
                         # Only explicitly public, scoped context. Never include a session
                         # file, tool args, private transcript, or another topic's data.
-                        snapshot = f"Task: {owner.task[:1500]}\nObserved progress: {owner.progress[:1500]}"
+                        statuses = await self.inbox.for_session(owner.session_key)
+                        receipts = "\n".join(
+                            f"#{r.message_id}: {r.text[:250]} — {r.state}"
+                            + (f" ({r.reason[:200]})" if r.reason else "")
+                            for r in statuses[-12:]
+                        )
+                        snapshot = (
+                            f"Task: {owner.task[:1000]}\nObserved progress: {owner.progress[:700]}"
+                            f"\nPublic result: {owner.public_output[:700]}\nUser updates: {receipts[:1500]}"
+                        )
                         answer = await self._answer(question, snapshot)
             except Exception:  # noqa: BLE001 - quick reply must not affect main run
                 answer = (
                     "Quick answer unavailable; the main task has not been interrupted."
                 )
             await self._reply(chat, thread, message, answer)
-        if receipt is not None and receipt.state == "received":
-            await self.submit(owner, receipt)
         return True
 
     async def _submit_locked(self, owner: LiveOwner, receipt: Receipt) -> None:
@@ -294,21 +482,38 @@ class LiveConversationService:
             return
 
     async def submit(self, owner: LiveOwner, receipt: Receipt) -> None:
-        async with owner.lock:
-            await self._submit_locked(owner, receipt)
+        await self.flush(owner)
+
+    async def _drain_locked(self, owner: LiveOwner) -> None:
+        for receipt in await self.inbox.pending(owner.session_key):
+            if receipt.state == "received":
+                await self._submit_locked(owner, receipt)
 
     async def flush(self, owner: LiveOwner) -> None:
         async with owner.lock:
-            for receipt in await self.inbox.pending(owner.session_key):
-                if receipt.state == "received":
-                    await self._submit_locked(owner, receipt)
+            await self._drain_locked(owner)
+
+    async def finalize(self, owner: LiveOwner) -> None:
+        async with owner.lock:
+            await self._drain_locked(owner)
+            if isinstance(owner.main, LiveRunner) and owner.main._followups:
+                return
+            owner.closing = True
+            self.unregister(owner)
 
     async def reconcile(self, owner: LiveOwner) -> None:
         async with owner.lock:
             entries = await owner.main.get_messages()
             if not isinstance(entries, list):
                 raise ValueError("Pi get_messages returned no message list")
-            await self.inbox.reconcile(owner.session_key, entries)
+            delivered = await self.inbox.reconcile(owner.session_key, entries)
+            for receipt in delivered:
+                await self._reply(
+                    receipt.chat_id,
+                    receipt.thread_id,
+                    receipt.message_id,
+                    "Инструкция доставлена Pi (delivered), но ещё не подтверждена как учтённая.",
+                )
             receipts = {
                 r.marker: r for r in await self.inbox.pending(owner.session_key)
             }

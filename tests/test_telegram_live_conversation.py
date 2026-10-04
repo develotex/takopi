@@ -146,6 +146,99 @@ async def test_clear_imperative_is_stored_without_explicit_command(
 
 
 @pytest.mark.anyio
+async def test_russian_question_mixed_and_correction_preserve_instruction(
+    tmp_path: Path,
+) -> None:
+    main = Main()
+    snapshots: list[str] = []
+    replies: list[str] = []
+
+    async def answer(_question: str, snapshot: str) -> str:
+        snapshots.append(snapshot)
+        return "Задача выполняется."
+
+    async def reply(_chat: int, _thread: int, _msg: int, text: str) -> None:
+        replies.append(text)
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "работа")
+    svc.register(owner)
+    await svc.handle(1, 10, 1, "a", "Как дела?")
+    assert not main.messages
+    await svc.handle(1, 10, 2, "a", "Как дела? И ещё — не трогай авторизацию")
+    await svc.handle(1, 10, 3, "a", "Не трогай авторизацию")
+    assert [s.splitlines()[-1] for s in main.messages] == [
+        "И ещё — не трогай авторизацию",
+        "Не трогай авторизацию",
+    ]
+    assert len(snapshots) == 2
+    assert any("получ" in r.lower() or "received" in r.lower() for r in replies)
+
+
+@pytest.mark.anyio
+async def test_mixed_update_is_submitted_before_later_correction_despite_slow_answer(
+    tmp_path: Path,
+) -> None:
+    main = Main()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def answer(_question: str, _snapshot: str) -> str:
+        entered.set()
+        await release.wait()
+        return "working"
+
+    async def reply(*_args: object) -> None:
+        pass
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "task")
+    svc.register(owner)
+    first = asyncio.create_task(svc.handle(1, 10, 100, "a", "Status? Also use green."))
+    await asyncio.wait_for(entered.wait(), 1)
+    await svc.handle(1, 10, 101, "a", "/update use blue.")
+    release.set()
+    await first
+    assert [s.splitlines()[-1] for s in main.messages] == [
+        "Also use green.",
+        "use blue.",
+    ]
+
+
+@pytest.mark.anyio
+async def test_quick_snapshot_reports_observed_receipt_evidence(tmp_path: Path) -> None:
+    main = Main()
+    snapshots: list[str] = []
+
+    async def answer(_question: str, snapshot: str) -> str:
+        snapshots.append(snapshot)
+        return "На основе данных."
+
+    async def reply(*_args: object) -> None:
+        pass
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "task")
+    svc.register(owner)
+    await svc.handle(1, 10, 7, "a", "Не трогай авторизацию")
+    receipt = (await svc.inbox.pending("a"))[0]
+    main.entries = [
+        {"role": "user", "content": await svc.inbox.delivery_text(receipt.id)},
+        {
+            "role": "assistant",
+            "content": f"[takopi-considered:{receipt.marker}] Не меняю авторизацию.",
+        },
+        {"role": "assistant", "content": "TOKEN_PRIVATE_INTERNAL_TRANSCRIPT"},
+    ]
+    await svc.reconcile(owner)
+    await svc.handle(1, 10, 8, "a", "Как дела?")
+    assert "Не трогай авторизацию" in snapshots[-1]
+    assert "considered" in snapshots[-1]
+    assert "Не меняю авторизацию" in snapshots[-1]
+    assert "TOKEN_PRIVATE_INTERNAL_TRANSCRIPT" not in snapshots[-1]
+
+
+@pytest.mark.anyio
 async def test_question_timeout_does_not_interrupt_main(tmp_path: Path) -> None:
     main = Main()
     replies: list[str] = []
