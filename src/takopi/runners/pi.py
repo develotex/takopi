@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path, PurePath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import msgspec
@@ -32,6 +32,9 @@ from .run_options import get_run_options
 from ..schemas import pi as pi_schema
 from ..utils.paths import get_run_base_dir
 from .tool_actions import tool_kind_and_title
+
+if TYPE_CHECKING:
+    from .pi_rpc import PiRpcRun
 
 logger = get_logger(__name__)
 
@@ -305,6 +308,21 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         self, prompt: str, resume: ResumeToken | None
     ) -> AsyncIterator[TakopiEvent]:
         return super().run(prompt, resume)
+
+    def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
+        """Create an explicit opt-in RPC owner; the one-shot run remains the default."""
+        from .pi_rpc import PiRpcClient, PiRpcRun
+
+        options = get_run_options()
+        args = list(self.extra_args)
+        if self.provider:
+            args.extend(["--provider", self.provider])
+        model = options.model if options is not None and options.model else self.model
+        if model:
+            args.extend(["--model", model])
+        if options is not None and options.reasoning:
+            args.extend(["--thinking", str(options.reasoning)])
+        return PiRpcRun(PiRpcClient(session_path, cwd, args))
 
     def extract_resume(self, text: str | None) -> ResumeToken | None:
         if not text:
