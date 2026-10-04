@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -33,70 +34,81 @@ class PiRpcClient:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._events: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         self._write_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._error: RuntimeError | None = None
 
     async def start(self) -> None:
-        if self._proc is not None:
-            return
-        if self._closed:
-            raise RuntimeError("Pi RPC client is closed")
-        async with _OWNER_LOCK:
-            if self.session_path in _OWNERS:
-                raise RuntimeError("Pi RPC session already has an owner")
-            _OWNERS[self.session_path] = self
-        try:
-            cmd = [
-                _PI_COMMAND,
-                *self.args,
-                "--mode",
-                "rpc",
-                "--session",
-                str(self.session_path),
-            ]
-            env = dict(os.environ)
-            env.setdefault("NO_COLOR", "1")
-            env.setdefault("CI", "1")
-            self._proc = await anyio.open_process(
-                cmd,
-                cwd=self.cwd,
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=os.name == "posix",
-            )
-            assert self._proc.stdout is not None and self._proc.stderr is not None
-            self._tasks = [
-                asyncio.create_task(self._read_stdout()),
-                asyncio.create_task(self._drain_stderr()),
-            ]
-        except BaseException:
-            _OWNERS.pop(self.session_path, None)
-            raise
+        # Serialize creation with close: shutdown must never miss a child in flight.
+        async with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("Pi RPC client is closed")
+            if self._proc is not None:
+                return
+            async with _OWNER_LOCK:
+                if self.session_path in _OWNERS:
+                    raise RuntimeError("Pi RPC session already has an owner")
+                _OWNERS[self.session_path] = self
+            try:
+                cmd = [
+                    _PI_COMMAND,
+                    *self.args,
+                    "--mode",
+                    "rpc",
+                    "--session",
+                    str(self.session_path),
+                ]
+                env = dict(os.environ)
+                env.setdefault("NO_COLOR", "1")
+                env.setdefault("CI", "1")
+                self._proc = await anyio.open_process(
+                    cmd,
+                    cwd=self.cwd,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=os.name == "posix",
+                )
+                assert self._proc.stdout is not None and self._proc.stderr is not None
+                self._tasks = [
+                    asyncio.create_task(self._read_stdout()),
+                    asyncio.create_task(self._drain_stderr()),
+                ]
+            except BaseException:
+                if _OWNERS.get(self.session_path) is self:
+                    del _OWNERS[self.session_path]
+                raise
 
     async def request(
         self, type: str, *, timeout: float = 30, **fields: object
     ) -> dict[str, Any]:
-        await self.start()
-        if self._error is not None:
-            raise self._error
-        assert self._proc is not None and self._proc.stdin is not None
-        ident = str(uuid4())
-        future: asyncio.Future[dict[str, Any]] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._pending[ident] = future
-        try:
-            payload = msgspec.json.encode({"id": ident, "type": type, **fields}) + b"\n"
-            async with self._write_lock:
-                await self._proc.stdin.send(payload)
-            response = await asyncio.wait_for(future, timeout)
-            if not response.get("success"):
-                raise RuntimeError(str(response.get("error", "Pi RPC request failed")))
-            return response
-        finally:
-            self._pending.pop(ident, None)
+        # The budget covers process creation, lock contention, stdin and response.
+        async with asyncio.timeout(timeout):
+            await self.start()
+            if self._error is not None:
+                raise self._error
+            assert self._proc is not None and self._proc.stdin is not None
+            ident = str(uuid4())
+            future: asyncio.Future[dict[str, Any]] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._pending[ident] = future
+            try:
+                payload = (
+                    msgspec.json.encode({"id": ident, "type": type, **fields}) + b"\n"
+                )
+                async with self._write_lock:
+                    await self._proc.stdin.send(payload)
+                response = await future
+                if not response.get("success"):
+                    raise RuntimeError(
+                        str(response.get("error", "Pi RPC request failed"))
+                    )
+                return response
+            finally:
+                self._pending.pop(ident, None)
+                future.cancel()
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
         while True:
@@ -154,32 +166,39 @@ class PiRpcClient:
             self._events.put_nowait(_END)
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._fail(RuntimeError("Pi RPC client closed"))
-        proc = self._proc
-        try:
-            if proc is not None:
-                if proc.stdin is not None:
-                    await proc.stdin.aclose()
+        # Bridge shutdown runs under AnyIO task-group cancellation.
+        with anyio.CancelScope(shield=True):
+            async with self._lifecycle_lock:
+                if self._closed:
+                    return
+                self._fail(RuntimeError("Pi RPC client closed"))
+                proc = self._proc
                 try:
-                    with anyio.fail_after(2):
-                        await proc.wait()
-                except TimeoutError:
-                    proc.terminate()
-                    try:
-                        with anyio.fail_after(2):
-                            await proc.wait()
-                    except TimeoutError:
-                        proc.kill()
-                        await proc.wait()
-        finally:
-            for task in self._tasks:
-                task.cancel()
-            if self._tasks:
-                await asyncio.gather(*self._tasks, return_exceptions=True)
-            _OWNERS.pop(self.session_path, None)
+                    if proc is not None:
+                        if proc.stdin is not None:
+                            with suppress(OSError, anyio.ClosedResourceError):
+                                await proc.stdin.aclose()
+                        try:
+                            with anyio.fail_after(2):
+                                await proc.wait()
+                        except TimeoutError:
+                            proc.terminate()
+                            try:
+                                with anyio.fail_after(2):
+                                    await proc.wait()
+                            except TimeoutError:
+                                proc.kill()
+                                await proc.wait()
+                finally:
+                    for task in self._tasks:
+                        task.cancel()
+                    if self._tasks:
+                        await asyncio.gather(*self._tasks, return_exceptions=True)
+                    # If reaping fails, retain ownership and permit a second close.
+                    if proc is None or proc.returncode is not None:
+                        self._closed = True
+                        if _OWNERS.get(self.session_path) is self:
+                            del _OWNERS[self.session_path]
 
 
 class PiRpcRun:
@@ -189,14 +208,29 @@ class PiRpcRun:
         self.client = client
         self.session_key: str | None = None
         self._active = False
+        self._unsettled = False
+        self._interrupting = False
+        self._command_lock = asyncio.Lock()
+
+    async def _reconcile(self) -> None:
+        # The stream observer can disappear while Pi continues its original run.
+        # Never submit a new prompt until the old run's boundary is consumed.
+        async with asyncio.timeout(30):
+            async for record in self.client.events():
+                if record.get("type") == "agent_settled":
+                    self._unsettled = False
+                    return
+            raise RuntimeError("Pi RPC stopped before agent_settled")
 
     async def run(
         self, prompt: str, resume: ResumeToken | None
-    ) -> AsyncIterator[TakopiEvent]:
+    ) -> AsyncGenerator[TakopiEvent]:
         if self._active:
             raise RuntimeError("Pi RPC run already active")
         self._active = True
         try:
+            if self._unsettled:
+                await self._reconcile()
             await self.client.start()
             response = await self.client.request("get_state")
             data = response.get("data")
@@ -220,10 +254,13 @@ class PiRpcRun:
             # Use the actual resolved file rather than truncating a session ID.
             token = ResumeToken(engine=ENGINE, value=session_file)
             state = PiStreamState(resume=token, has_modern_agent_end=True)
+            self._interrupting = False
+            self._unsettled = True  # A timed-out prompt may still have reached Pi.
             result = await self.client.request("prompt", message=prompt)
             disposition = result.get("data", {}).get("disposition")
             if disposition != "started":
                 raise RuntimeError(f"Pi RPC prompt did not start a run: {disposition}")
+            meta = {"cwd": str(self.client.cwd), "control": self}
             async for record in self.client.events():
                 kind = record.get("type")
                 if kind == "agent_start" and not state.started:
@@ -232,17 +269,18 @@ class PiRpcRun:
                         engine=ENGINE,
                         resume=token,
                         title="pi",
-                        meta={"cwd": str(self.client.cwd)},
+                        meta=meta,
                     )
                 try:
                     event = pi_schema.decode_event(msgspec.json.encode(record))
                 except msgspec.DecodeError:
                     continue  # RPC also emits queue updates and extension records.
                 for translated in translate_pi_event(
-                    event, title="pi", meta={"cwd": str(self.client.cwd)}, state=state
+                    event, title="pi", meta=meta, state=state
                 ):
                     yield translated
                 if kind == "agent_settled":
+                    self._unsettled = False
                     break
             else:
                 raise RuntimeError("Pi RPC stopped before agent_settled")
@@ -250,19 +288,28 @@ class PiRpcRun:
             self._active = False
 
     async def steer(self, text: str) -> str:
-        if not self._active:
-            raise RuntimeError("Pi RPC run is not active")
-        response = await self.client.request("steer", message=text)
-        data = response.get("data")
-        if not isinstance(data, dict) or data.get("disposition") not in {
-            "queued",
-            "handled",
-        }:
-            raise RuntimeError("Pi RPC steer returned invalid disposition")
-        return str(data["disposition"])
+        async with self._command_lock:
+            if self._interrupting:
+                raise RuntimeError("Pi RPC run is being interrupted")
+            if not self._active:
+                raise RuntimeError("Pi RPC run is not active")
+            response = await self.client.request("steer", message=text)
+            data = response.get("data")
+            if not isinstance(data, dict) or data.get("disposition") not in {
+                "queued",
+                "handled",
+            }:
+                raise RuntimeError("Pi RPC steer returned invalid disposition")
+            return str(data["disposition"])
 
     async def interrupt(self) -> bool:
-        if not self._active:
-            return False
-        await self.client.request("abort")
-        return True
+        async with self._command_lock:
+            if not self._unsettled:
+                return False
+            if self._interrupting:
+                return True
+            self._interrupting = True
+            # Pi's abort continues queued steer/follow-up work unless cleared first.
+            await self.client.request("clear_queue")
+            await self.client.request("abort")
+            return True
