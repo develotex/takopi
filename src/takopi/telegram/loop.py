@@ -2314,7 +2314,13 @@ async def _run_main_loop_impl(
                     else resolved
                 )
                 rejection = "Directive cannot rebind the active or starting Pi topic; no prompt sent. Use another topic or wait for completion."
-                if target.engine_override not in (None, "pi"):
+                effective_engine = await resolve_engine_defaults(
+                    explicit_engine=target.engine_override,
+                    context=target.context,
+                    chat_id=topic_key[0],
+                    topic_key=topic_key,
+                )
+                if effective_engine.engine != "pi":
                     return rejection
                 if owner_context is None:
                     if active is not None:
@@ -3467,7 +3473,11 @@ async def _run_main_loop_impl(
                                 "Project/branch command cannot target the active Pi task; use another topic or wait for completion.",
                             )
                             return
-                if command_id in ("new", "ctx") and live_topic_running(topic_key):
+                if live_topic_running(topic_key) and (
+                    command_id in ("new", "ctx")
+                    or command_id == "agent"
+                    and args_text.lower().split(maxsplit=1)[:1] in (["set"], ["clear"])
+                ):
                     await reply(
                         text=f"/{command_id} cannot change a topic with an active or starting Pi task. Wait for completion."
                     )

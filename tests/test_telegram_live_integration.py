@@ -626,6 +626,8 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "bound_reply_other_project",
         "bound_reply_non_pi_directive",
         "bound_forwarded_other_branch",
+        "bound_default_non_pi",
+        "bound_agent_change",
         "unbound_other_project",
         "bound_plugin_command",
         "bound_plugin_callback",
@@ -812,7 +814,12 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
         chat_map={-100: "test"},
     )
     extra_engines = []
-    if mode in ("bound_non_pi_directive", "bound_reply_non_pi_directive"):
+    if mode in (
+        "bound_non_pi_directive",
+        "bound_reply_non_pi_directive",
+        "bound_default_non_pi",
+        "bound_agent_change",
+    ):
         from takopi.runners.mock import Return, ScriptRunner
 
         extra_engines = [
@@ -879,11 +886,16 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                     "bound_update_after_branch_rebind",
                     "bound_reply_other_project",
                     "bound_reply_non_pi_directive",
+                    "bound_default_non_pi",
+                    "bound_agent_change",
                 )
             ):
                 await rpc.run_started.wait()
             else:
                 await progress_ready.wait()
+        if mode == "bound_default_non_pi":
+            # Model a topic default changed externally while its Pi run remains active.
+            await store.set_default_engine(-100, 77, "codex")
         if mode in ("bound_reply_other_project", "bound_reply_non_pi_directive"):
             assert transport.progress_ref is not None
         if mode == "bound_update_after_branch_rebind":
@@ -908,7 +920,11 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 chat_id=-100,
                 thread_id=77,
                 message_id=2,
-                text="/codex /test Do another task"
+                text="/agent set codex"
+                if mode == "bound_agent_change"
+                else "Please do X"
+                if mode == "bound_default_non_pi"
+                else "/codex /test Do another task"
                 if mode == "bound_reply_non_pi_directive"
                 else "/codex /other Do another task"
                 if mode == "bound_non_pi_directive"
@@ -1035,6 +1051,13 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                         await store.get_session_resume(-100, 77, "pi")
                     ) == ResumeToken("pi", str(path))
                     assert all(r.message_id != 2 for r in pending)
+                    if command_first:
+                        with anyio.fail_after(2):
+                            while not any(r.message_id == 3 for r in pending):
+                                await anyio.sleep(0.01)
+                                pending = await LiveInbox(
+                                    resolve_inbox_path(config)
+                                ).pending(str(rpc.path))
                     assert [(r.message_id, r.text) for r in pending] == (
                         [(3, "Не трогай авторизацию")] if command_first else []
                     ), "message after rejected /new must retain the old live owner"
@@ -1049,8 +1072,14 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 "bound_reply_other_project",
                 "bound_reply_non_pi_directive",
                 "bound_forwarded_other_branch",
+                "bound_default_non_pi",
+                "bound_agent_change",
             ):
-                expected = "Directive cannot rebind the active or starting Pi topic"
+                expected = (
+                    "/agent cannot change a topic"
+                    if mode == "bound_agent_change"
+                    else "Directive cannot rebind the active or starting Pi topic"
+                )
                 with anyio.fail_after(2):
                     while not any(
                         expected in call["message"].text
@@ -1058,6 +1087,8 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                     ):
                         await anyio.sleep(0.01)
                 assert (await store.get_context(-100, 77)) == RunContext(project="test")
+                if mode == "bound_agent_change":
+                    assert await store.get_default_engine(-100, 77) is None
                 assert all(r.message_id != 2 for r in pending)
                 assert all(
                     "Do another task" not in text and "Please deploy change" not in text
