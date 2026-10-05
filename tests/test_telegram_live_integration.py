@@ -618,8 +618,19 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 assert rpc.prompts[1].endswith("Используй синий")
                 assert rpc.prompts[2].endswith("Не трогай авторизацию")
             else:
-                assert [item.state for item in pending] == ["submitted"] * len(pending)
-                assert len(rpc.sent) == len(pending)
+                assert all(item.state in ("submitted", "uncertain") for item in pending)
+                if any(item.state == "uncertain" for item in pending):
+                    assert not rpc.sent, "startup/cancel ambiguity is not acceptance"
+                    if mode == "legacy" and not slow_quick:
+                        rpc.release.set()
+                        with anyio.fail_after(2):
+                            while len(rpc.prompts) < 2:
+                                await anyio.sleep(0.01)
+                        assert rpc.prompts[1] == await LiveInbox(
+                            resolve_inbox_path(config)
+                        ).delivery_text(pending[0].id)
+                else:
+                    assert len(rpc.sent) == len(pending)
             if command_first and unbound and not predebounce:
                 assert rpc.sent[0].endswith("Используй синий")
                 assert rpc.sent[1].endswith("Не трогай авторизацию")

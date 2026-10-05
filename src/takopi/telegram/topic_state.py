@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import msgspec
 
@@ -174,14 +175,24 @@ class TopicStateStore(JsonStateStore[_TopicState]):
                 return None
             return ResumeToken(engine=engine, value=entry.resume)
 
-    async def session_owners(self, engine: str, resume: str) -> set[tuple[int, int]]:
-        """Return persisted topic bindings to one exact engine session value."""
+    async def session_owners(
+        self, engine: str, resume: str, session_id: str | None = None
+    ) -> set[tuple[int, int]]:
+        """Return exact-path owners and any persisted short ID alias of its full ID."""
         async with self._lock:
             self._reload_locked_if_needed()
             owners: set[tuple[int, int]] = set()
             for key, thread in self._state.threads.items():
                 entry = thread.sessions.get(engine)
-                if entry is None or entry.resume != resume:
+                if entry is None or not (
+                    entry.resume == resume
+                    or (
+                        session_id is not None
+                        and re.fullmatch(r"[a-fA-F0-9-]{8,36}", entry.resume)
+                        is not None
+                        and session_id.lower().startswith(entry.resume.lower())
+                    )
+                ):
                     continue
                 try:
                     chat, topic = key.split(":", 1)

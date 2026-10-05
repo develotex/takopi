@@ -35,6 +35,7 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "wrong_topic",
         "owner_conflict",
         "other_bound",
+        "other_bound_short",
         "header_mismatch",
         "header_absent",
     ],
@@ -57,6 +58,7 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         "after_file_observed",
         "owner_conflict",
         "other_bound",
+        "other_bound_short",
     ):
         path.parent.mkdir()
         path.write_text(
@@ -163,9 +165,13 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
     await store.set_context(-100, 77, RunContext(project="test"))
     if case == "wrong_topic":
         await store.set_context(-100, 78, RunContext(project="test"))
-    if case == "other_bound":
+    if case in ("other_bound", "other_bound_short"):
         await store.set_session_resume(
-            -100, 78, ResumeToken(engine="pi", value=str(path))
+            -100,
+            78,
+            ResumeToken(
+                engine="pi", value=str(path) if case == "other_bound" else ident[:12]
+            ),
         )
     transport = FakeTransport()
     cfg = TelegramBridgeConfig(
@@ -207,10 +213,10 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
             "header" in item["message"].text.lower() for item in transport.send_calls
         )
         return
-    if case in ("wrong_topic", "owner_conflict", "other_bound"):
+    if case in ("wrong_topic", "owner_conflict", "other_bound", "other_bound_short"):
         assert current.state == "uncertain"
         assert not rpc.prompts
-        if case in ("wrong_topic", "other_bound"):
+        if case in ("wrong_topic", "other_bound", "other_bound_short"):
             assert not rpc.calls
         else:
             assert "get_state" in rpc.calls

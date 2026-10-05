@@ -28,6 +28,7 @@ from .live_conversation import (
     live_session_path,
     quick_pi_answer,
     resolve_legacy_session,
+    session_header_id,
     verify_bound_session,
     verify_fresh_session,
     verify_legacy_session,
@@ -1378,6 +1379,22 @@ async def run_main_loop(
                                 text="Эта Pi-сессия уже выполняется; дождитесь завершения текущего запуска.",
                             )
                             return
+                    if existing and state.topic_store is not None:
+                        try:
+                            owners = await state.topic_store.session_owners(
+                                "pi", str(path), session_header_id(path)
+                            )
+                            if owners - {(chat_id, topic_key[1])}:
+                                raise ValueError("Another topic owns this Pi session")
+                        except ValueError:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Pi session identity or topic ownership is conflicting; no prompt submitted.",
+                            )
+                            return
                     if resume_token is not None and not existing and legacy_id is None:
                         await send_plain(
                             cfg.exec_cfg.transport,
@@ -1446,6 +1463,13 @@ async def run_main_loop(
                             try:
                                 await verify_legacy_session(rpc, path, legacy_id, cwd)
                                 assert state.topic_store is not None
+                                owners = await state.topic_store.session_owners(
+                                    "pi", str(path), session_header_id(path)
+                                )
+                                if owners - {(chat_id, topic_key[1])}:
+                                    raise ValueError(
+                                        "Another topic owns this Pi session"
+                                    )
                                 canonical = ResumeToken(engine="pi", value=str(path))
                                 await state.topic_store.set_session_resume(
                                     chat_id, topic_key[1], canonical
@@ -2498,7 +2522,9 @@ async def run_main_loop(
                                 path = Path(intent.session_key)
                                 assert state.topic_store is not None
                                 owners = await state.topic_store.session_owners(
-                                    "pi", str(path)
+                                    "pi",
+                                    str(path),
+                                    session_header_id(path) if path.exists() else None,
                                 )
                                 if owners - {(chat_id, topic_key[1])}:
                                     raise ValueError(

@@ -6,6 +6,20 @@ from takopi.telegram.topic_state import TopicStateStore
 
 
 @pytest.mark.anyio
+async def test_session_owners_includes_short_id_aliases(tmp_path) -> None:
+    store = TopicStateStore(tmp_path / "topics.json")
+    path = str(tmp_path / "pi-live-sessions" / "session.jsonl")
+    ident = "abcdef0123456789abcdef0123456789"
+    await store.set_session_resume(1, 10, ResumeToken(engine="pi", value=ident[:12]))
+    await store.set_session_resume(1, 11, ResumeToken(engine="pi", value=path))
+    await store.set_session_resume(
+        1, 12, ResumeToken(engine="pi", value="deadbeef0000")
+    )
+    assert await store.session_owners("pi", path, ident) == {(1, 10), (1, 11)}
+    assert await store.session_owners("pi", path) == {(1, 11)}
+
+
+@pytest.mark.anyio
 async def test_topic_state_store_roundtrip(tmp_path) -> None:
     path = tmp_path / "telegram_topics_state.json"
     store = TopicStateStore(path)

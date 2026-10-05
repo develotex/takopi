@@ -139,6 +139,13 @@ async def verify_legacy_session(
         )
 
 
+def session_header_id(session_path: Path) -> str:
+    header = _session_header(session_path)
+    if header is None or not isinstance(header.get("id"), str):
+        raise ValueError("Pi session header is missing")
+    return header["id"]
+
+
 async def verify_bound_session(rpc: PiRpcRun, session_path: Path, cwd: Path) -> None:
     """Verify an already bound canonical path and project before any prompt."""
     header = _session_header(session_path)
