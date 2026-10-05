@@ -421,6 +421,7 @@ class _PendingPrompt:
     forwards: list[tuple[int, str]]
     cancel_scope: anyio.CancelScope | None = None
     forward_barrier: anyio.Event | None = None
+    dispatch_cancel_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2144,7 +2145,7 @@ async def _run_main_loop_impl(
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
             legacy_pending: set[tuple[int, int]] = set()
             legacy_queued: set[tuple[int, int, int]] = set()
-            legacy_dispatching: set[tuple[int, int, int]] = set()
+            legacy_dispatching: dict[tuple[int, int, int], _PendingPrompt] = {}
             recovery_queue: asyncio.Queue[Callable[[], Awaitable[None]]] = (
                 asyncio.Queue(maxsize=32)
             )
@@ -2332,6 +2333,7 @@ async def _run_main_loop_impl(
                 reply_id: int | None,
                 live_eligible: bool = True,
                 legacy_fallback: bool = False,
+                cancel_requested: Callable[[], bool] | None = None,
             ) -> None:
                 chat_id = msg.chat_id
                 user_msg_id = msg.message_id
@@ -2500,6 +2502,11 @@ async def _run_main_loop_impl(
                 )
                 if resume_decision.handled_by_running_task:
                     return
+                if cancel_requested is not None and cancel_requested():
+                    await make_reply(cfg, msg)(
+                        text="Forwarded task cancelled before submission; no prompt sent."
+                    )
+                    return
                 resume_token = resume_decision.resume_token
                 if live_eligible and live is not None and resume_token is not None:
                     key = scoped_live_key(chat_id, msg.thread_id, resume_token, context)
@@ -2562,6 +2569,11 @@ async def _run_main_loop_impl(
                         user_msg_id=user_msg_id,
                         thread_id=msg.thread_id,
                         text="Could not queue task; no prompt submitted. Resend after checking the topic.",
+                    )
+                    return
+                if cancel_requested is not None and cancel_requested():
+                    await make_reply(cfg, msg)(
+                        text="Forwarded task cancelled before queueing; no prompt sent."
                     )
                     return
                 legacy_key = (
@@ -2660,12 +2672,12 @@ async def _run_main_loop_impl(
                     else None
                 )
                 if dispatch_key is not None:
-                    legacy_dispatching.add(dispatch_key)
+                    legacy_dispatching[dispatch_key] = pending
                 try:
                     await _dispatch_pending_prompt_impl(pending)
                 finally:
                     if dispatch_key is not None:
-                        legacy_dispatching.discard(dispatch_key)
+                        legacy_dispatching.pop(dispatch_key, None)
                     if (
                         pending.topic_key is not None
                         and pending.forwards
@@ -2727,6 +2739,11 @@ async def _run_main_loop_impl(
                     if pending.topic_key is not None and pending.forwards:
                         release_legacy_topic_if_idle(pending.topic_key)
                     return
+                if pending.dispatch_cancel_requested:
+                    await reply(
+                        text="Forwarded task cancelled before submission; no prompt sent."
+                    )
+                    return
                 initial_directive = False
                 if (
                     live is not None
@@ -2762,6 +2779,9 @@ async def _run_main_loop_impl(
                             )
                         ),
                         legacy_fallback=bool(pending.forwards),
+                        cancel_requested=(lambda: pending.dispatch_cancel_requested)
+                        if pending.forwards
+                        else None,
                     )
                 finally:
                     if (
@@ -3071,6 +3091,9 @@ async def _run_main_loop_impl(
                                     for ref, task in state.running_tasks.items()
                                 )
                                 or any(key[:2] == topic_key for key in legacy_queued)
+                                or any(
+                                    key[:2] == topic_key for key in legacy_dispatching
+                                )
                             )
                         ):
                             await reply(
@@ -3081,6 +3104,42 @@ async def _run_main_loop_impl(
                             forward_coalescer.cancel(forwarded_pending[0])
                             await reply(
                                 text="Pending forwarded task cancelled before submission; no prompt sent."
+                            )
+                            return
+                        dispatching_matches = [
+                            pending
+                            for key, pending in legacy_dispatching.items()
+                            if key[:2] == topic_key
+                            and (
+                                cancel_reply_id is None
+                                or pending.msg.message_id == cancel_reply_id
+                                or any(
+                                    fid == cancel_reply_id
+                                    for fid, _ in pending.forwards
+                                )
+                            )
+                        ]
+                        if (
+                            cancel_reply_id is None
+                            and dispatching_matches
+                            and (
+                                len(dispatching_matches) != 1
+                                or any(key[:2] == topic_key for key in legacy_queued)
+                                or any(
+                                    ref.channel_id == chat_id
+                                    and task.thread_id == topic_key[1]
+                                    for ref, task in state.running_tasks.items()
+                                )
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the original prompt or progress message to cancel one."
+                            )
+                            return
+                        if len(dispatching_matches) == 1:
+                            dispatching_matches[0].dispatch_cancel_requested = True
+                            await reply(
+                                text="Cancellation requested during forwarded dispatch. If progress appears, reply to it to cancel the run."
                             )
                             return
                         candidates = [
@@ -4042,6 +4101,19 @@ async def _run_main_loop_impl(
                             topic_key[1],
                             msg.message_id,
                             f"Directive not accepted: initial Pi task #{initial.message_id} remains unresolved. Retry or defer it first.",
+                        )
+                        return
+                    if (
+                        resolved_live is not None
+                        and resolved_live.prompt.strip()
+                        and resolved_live.engine_override not in (None, "pi")
+                        and live_topic_running(topic_key)
+                    ):
+                        await live._startup_reply(
+                            chat_id,
+                            topic_key[1],
+                            msg.message_id,
+                            "Non-Pi directive cannot rebind an active or starting Pi topic. Use another topic or wait for completion.",
                         )
                         return
                     if (

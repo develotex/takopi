@@ -622,6 +622,7 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "unbound_forward_after_update",
         "bound_held_steer_cancel",
         "bound_other_project",
+        "bound_non_pi_directive",
         "unbound_other_project",
         "bound_plugin_command",
         "bound_plugin_callback",
@@ -807,8 +808,20 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
         default_project=None,
         chat_map={-100: "test"},
     )
+    extra_engines = []
+    if mode == "bound_non_pi_directive":
+        from takopi.runners.mock import Return, ScriptRunner
+
+        extra_engines = [
+            RunnerEntry(
+                engine="codex",
+                runner=ScriptRunner([Return("forbidden")], engine="codex"),
+            )
+        ]
     runtime = TransportRuntime(
-        router=AutoRouter([RunnerEntry(engine="pi", runner=runner)], "pi"),
+        router=AutoRouter(
+            [RunnerEntry(engine="pi", runner=runner), *extra_engines], "pi"
+        ),
         projects=projects,
         config_path=config,
     )
@@ -884,7 +897,9 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 chat_id=-100,
                 thread_id=77,
                 message_id=2,
-                text="/update Используй синий"
+                text="/codex /other Do another task"
+                if mode == "bound_non_pi_directive"
+                else "/update Используй синий"
                 if mode == "bound_update_mentions"
                 else "/spy change"
                 if mode == "bound_plugin_command"
@@ -1003,6 +1018,14 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                     assert (
                         await store.get_session_resume(-100, 77, "pi")
                     ) == ResumeToken("pi", str(path))
+                return
+            if mode == "bound_non_pi_directive":
+                assert (await store.get_context(-100, 77)) == RunContext(project="test")
+                assert all(r.message_id != 2 for r in pending)
+                assert any(
+                    "Non-Pi directive cannot rebind" in call["message"].text
+                    for call in transport.send_calls
+                )
                 return
             if mode == "bound_update_mentions":
                 assert [(r.message_id, r.text) for r in pending] == [

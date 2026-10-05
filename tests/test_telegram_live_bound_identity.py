@@ -402,6 +402,16 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 sender_id=123,
                 raw={"message": {"message_thread_id": 77}},
             )
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=13,
+                text="/cancel",
+                reply_to_message_id=2,
+                reply_to_text="Forward A",
+                sender_id=123,
+            )
         elif mode == "two_forward_queued":
             for message_id, sender_id, text in (
                 (1, 123, "Task A"),
@@ -626,6 +636,25 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 assert dispatches == [], (
                     "plugin callback with unproven topic must fail closed"
                 )
+                if mode == "dispatching_cancel_peer":
+                    with anyio.fail_after(2):
+                        while not any(
+                            "Cancellation requested during forwarded dispatch"
+                            in call["message"].text
+                            for call in transport.send_calls
+                        ):
+                            await anyio.sleep(0.01)
+                    release_progress.set()
+                    with anyio.fail_after(2):
+                        while not any(
+                            "Forwarded task cancelled before queueing"
+                            in call["message"].text
+                            for call in transport.send_calls
+                        ):
+                            await anyio.sleep(0.01)
+                    assert not legacy_started.is_set(), (
+                        "cancelled forwarded task must never start Pi"
+                    )
             else:
                 assert dispatches == ["started"], [
                     call["message"].text for call in transport.send_calls

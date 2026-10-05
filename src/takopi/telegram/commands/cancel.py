@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import anyio
+
 from ...logging import get_logger
 from ...progress import ProgressTracker
 from ...runner_bridge import RunningTasks
@@ -209,7 +211,13 @@ async def handle_callback_steer(
 
     try:
         await control.steer(claimed.text)
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001 - cancellation may leave steer outcome unknown
+        if not isinstance(exc, Exception):
+            # Never replay a steer that may have reached the active turn. Do not
+            # leave the claimed fallback's topic reserved after task shutdown.
+            with anyio.CancelScope(shield=True):
+                await scheduler.settle_claimed(claimed)
+            raise
         await scheduler.requeue_front(claimed)
         logger.warning(
             "steer.failed",
@@ -225,6 +233,7 @@ async def handle_callback_steer(
         )
         return
 
+    await scheduler.settle_claimed(claimed)
     await _edit_labelled_message(cfg, progress_ref, claimed, label="steered")
     await cfg.bot.answer_callback_query(
         callback_query_id=query.callback_query_id,

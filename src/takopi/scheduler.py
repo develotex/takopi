@@ -126,6 +126,11 @@ class ThreadScheduler:
         async with self._lock:
             return self._pop_queued_locked(chat_id, progress_msg_id)
 
+    async def settle_claimed(self, job: ThreadJob) -> None:
+        """Release an exclusive topic reservation after the claimed job leaves the queue."""
+        if job.legacy_fallback and self._on_cancel_queued is not None:
+            await self._on_cancel_queued(job)
+
     async def requeue_front(self, job: ThreadJob) -> None:
         key = self.thread_key(job.resume_token)
         async with self._lock:

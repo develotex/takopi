@@ -1117,7 +1117,10 @@ async def test_handle_callback_cancel_cancels_queued_job() -> None:
 
 
 @pytest.mark.anyio
-async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
+@pytest.mark.parametrize("legacy_fallback", [False, True])
+async def test_handle_callback_steer_sends_queued_text_to_active_turn(
+    legacy_fallback: bool,
+) -> None:
     transport = FakeTransport()
     cfg = replace(
         make_cfg(transport),
@@ -1141,7 +1144,16 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
         async def interrupt(self) -> bool:
             return True
 
-    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    released: list[int] = []
+
+    async def on_cancel(job) -> None:
+        released.append(job.user_msg_id)
+
+    scheduler = ThreadScheduler(
+        task_group=_NoopTaskGroup(),
+        run_job=_noop_run_job,
+        on_cancel_queued=on_cancel,
+    )
     progress_id = 88
     progress_ref = MessageRef(channel_id=123, message_id=progress_id)
     resume = ResumeToken(engine=CODEX_ENGINE, value="sid")
@@ -1151,6 +1163,7 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
         text="queued prompt",
         resume_token=resume,
         progress_ref=progress_ref,
+        legacy_fallback=legacy_fallback,
     )
     control = _Control()
     running_task = RunningTask(resume=resume, control=control)
@@ -1167,6 +1180,7 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
     await telegram_loop.handle_callback_steer(cfg, query, running_tasks, scheduler)
 
     assert control.steered == ["queued prompt"]
+    assert released == ([10] if legacy_fallback else [])
     assert transport.edit_calls
     steered_text = transport.edit_calls[0]["message"].text.lower()
     assert "steered" in steered_text
