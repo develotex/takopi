@@ -1,13 +1,18 @@
 """Pre-spawn in-process canonical ownership for Pi RPC and one-shot runners."""
 
+import asyncio
 import json
 import sys
+from collections.abc import AsyncGenerator
+from typing import Any, cast
+
+import anyio
 from uuid import uuid4
 from pathlib import Path
 
 import pytest
 
-from takopi.model import ResumeToken
+from takopi.model import ResumeToken, StartedEvent, TakopiEvent
 from takopi.runners.pi import PiRunner
 from takopi.runners.pi_rpc import PiRpcClient
 
@@ -146,6 +151,48 @@ async def test_relative_jsonl_resume_claims_against_runner_cwd(
     ):
         await anext(runner.run("Task", ResumeToken("pi", "./existing.jsonl")))
     assert spawned
+
+
+@pytest.mark.anyio
+async def test_one_shot_claim_survives_inner_stream_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "existing.jsonl"
+    path.write_text(
+        json.dumps({"type": "session", "id": uuid4().hex, "cwd": str(tmp_path)}) + "\n"
+    )
+    cleanup_started, finish_cleanup = anyio.Event(), anyio.Event()
+
+    class Runner(PiRunner):
+        async def _run_with_state(
+            self, prompt: str, resume: ResumeToken | None, state: Any
+        ) -> AsyncGenerator[TakopiEvent]:
+            try:
+                yield StartedEvent(engine="pi", resume=ResumeToken("pi", str(path)))
+            finally:
+                cleanup_started.set()
+                await finish_cleanup.wait()
+
+    runner = Runner(extra_args=[], model=None, provider=None)
+    with pi_rpc.enable_live_claims():
+        stream = cast(
+            AsyncGenerator[TakopiEvent],
+            runner.run("Task", ResumeToken("pi", str(path))),
+        )
+        await anext(stream)
+        closer = asyncio.create_task(stream.aclose())
+        try:
+            with anyio.fail_after(1):
+                await cleanup_started.wait()
+            with pytest.raises(RuntimeError, match="owner"):
+                async with pi_rpc.claim_one_shot(path):
+                    pass
+        finally:
+            finish_cleanup.set()
+            await closer
 
 
 @pytest.mark.anyio

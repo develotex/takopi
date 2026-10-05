@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -1338,6 +1338,11 @@ async def _run_main_loop_impl(
                     )
                     else None
                 )
+                if (
+                    topic_key is not None
+                    and (chat_id, topic_key[1], user_msg_id) in cancelled_initial_ids
+                ):
+                    return
                 stateful_mode = topic_key is not None or chat_session_key is not None
                 show_resume_line = should_show_resume_line(
                     show_resume_line=cfg.show_resume_line,
@@ -1443,6 +1448,7 @@ async def _run_main_loop_impl(
                                 session_header_id(candidate_path)
                                 if candidate_path.is_file()
                                 else None,
+                                relative_resolver=resolve_stored_pi_alias,
                             )
                         except (ValueError, OSError, ConfigError):
                             other_owners = None
@@ -1585,7 +1591,10 @@ async def _run_main_loop_impl(
                     if existing and state.topic_store is not None:
                         try:
                             owners = await state.topic_store.session_owners(
-                                "pi", str(path), session_header_id(path)
+                                "pi",
+                                str(path),
+                                session_header_id(path),
+                                relative_resolver=resolve_stored_pi_alias,
                             )
                             if owners - {(chat_id, topic_key[1])}:
                                 raise ValueError("Another topic owns this Pi session")
@@ -1621,6 +1630,8 @@ async def _run_main_loop_impl(
                                 rpc = entry.runner.rpc_run(path, cwd=cwd)
                         provisional_id: str | None = None
                         startup_key = (chat_id, topic_key[1], user_msg_id)
+                        if startup_key in cancelled_initial_ids:
+                            running_task.cancel_requested.set()
                         startup_cancel[startup_key] = running_task
                         if resume_token is None or existing:
                             try:
@@ -1708,7 +1719,10 @@ async def _run_main_loop_impl(
                                 await verify_legacy_session(rpc, path, legacy_id, cwd)
                                 assert state.topic_store is not None
                                 owners = await state.topic_store.session_owners(
-                                    "pi", str(path), session_header_id(path)
+                                    "pi",
+                                    str(path),
+                                    session_header_id(path),
+                                    relative_resolver=resolve_stored_pi_alias,
                                 )
                                 if owners - {(chat_id, topic_key[1])}:
                                     raise ValueError(
@@ -1955,6 +1969,30 @@ async def _run_main_loop_impl(
             scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
             starting_live: set[tuple[int, int, str]] = set()
 
+            def resolve_stored_pi_alias(
+                chat: int,
+                _thread: int,
+                context: RunContext | None,
+                value: str,
+            ) -> Path | None:
+                try:
+                    cwd = cfg.runtime.resolve_run_cwd(
+                        context or cfg.runtime.default_context_for_chat(chat)
+                    )
+                except ConfigError:
+                    return None
+                if cwd is None:
+                    return None
+                path = (cwd / value).resolve()
+                header = pi_session_header(path)
+                if (
+                    header is None
+                    or not isinstance(header.get("cwd"), str)
+                    or Path(header["cwd"]).resolve() != cwd.resolve()
+                ):
+                    return None
+                return path
+
             def scoped_live_key(
                 chat: int,
                 thread: int | None,
@@ -1964,24 +2002,16 @@ async def _run_main_loop_impl(
                 if token is not None and token.engine == "pi":
                     candidate = Path(token.value)
                     if not candidate.is_absolute() and candidate.suffix == ".jsonl":
-                        try:
-                            cwd = cfg.runtime.resolve_run_cwd(context)
-                        except ConfigError:
-                            return None
-                        if cwd is None:
-                            return None
-                        path = (cwd / candidate).resolve()
-                        header = pi_session_header(path)
-                        if (
-                            header is None
-                            or not isinstance(header.get("cwd"), str)
-                            or Path(header["cwd"]).resolve() != cwd.resolve()
-                        ):
+                        path = resolve_stored_pi_alias(
+                            chat, thread or 0, context, token.value
+                        )
+                        if path is None:
                             return None
                         token = ResumeToken(engine="pi", value=str(path))
                 return live_route_key(chat, thread, token)
 
             startup_cancel: dict[tuple[int, int, int], RunningTask] = {}
+            cancelled_initial_ids: set[tuple[int, int, int]] = set()
             plugin_inflight: set[tuple[int, int]] = set()
             retry_starting: set[tuple[int, int, str]] = set()
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
@@ -2717,11 +2747,14 @@ async def _run_main_loop_impl(
 
                 if classification.is_cancel:
                     if live is not None and topic_key is not None:
+                        cancel_reply_id = (
+                            None if reply_id == topic_key[1] else reply_id
+                        )  # Telegram's implicit topic-root reply is not a run target.
                         candidates = [
                             task
                             for (chat, thread, first), task in startup_cancel.items()
                             if (chat, thread) == topic_key
-                            and (reply_id is None or first == reply_id)
+                            and (cancel_reply_id is None or first == cancel_reply_id)
                         ]
                         owner = live.topic_owner(*topic_key)
                         if (
@@ -2732,8 +2765,8 @@ async def _run_main_loop_impl(
                                 for task in state.running_tasks.values()
                             )
                             and (
-                                reply_id is None
-                                or owner.running_task.user_message_id == reply_id
+                                cancel_reply_id is None
+                                or owner.running_task.user_message_id == cancel_reply_id
                             )
                             and not any(
                                 task is owner.running_task for task in candidates
@@ -2746,8 +2779,46 @@ async def _run_main_loop_impl(
                                 text="Cancelling Pi startup; no new prompt will be submitted."
                             )
                             return
+                        initial = await live.inbox.initial_for_topic(*topic_key)
+                        pending_fresh = fresh_pending.get(topic_key)
+                        if (
+                            not candidates
+                            and initial is not None
+                            and initial.state == "scheduled"
+                            and pending_fresh is not None
+                            and initial.message_id == pending_fresh[1]
+                            and (
+                                cancel_reply_id is None
+                                or cancel_reply_id == initial.message_id
+                            )
+                        ):
+                            cancelled_initial_ids.add(initial.id)
+                            for key, pending in list(state.pending_prompts.items()):
+                                if (
+                                    pending.topic_key == topic_key
+                                    and pending.msg.message_id == initial.message_id
+                                ):
+                                    forward_coalescer.cancel(key)
+                            fresh_pending.pop(topic_key, None)
+                            starting_live.discard(
+                                (chat_id, topic_key[1], initial.session_key)
+                            )
+                            await live.inbox.mark_initial_deferred(
+                                initial.id,
+                                initial.session_key,
+                                "User cancelled scheduled Pi startup before dispatch",
+                            )
+                            await reply(
+                                text="Scheduled Pi startup cancelled before prompt; no prompt submitted."
+                            )
+                            return
+                    cancel_msg = (
+                        replace(msg, reply_to_message_id=None, reply_to_text=None)
+                        if topic_key is not None and reply_id == topic_key[1]
+                        else msg
+                    )
                     tg.start_soon(
-                        handle_cancel, cfg, msg, state.running_tasks, scheduler
+                        handle_cancel, cfg, cancel_msg, state.running_tasks, scheduler
                     )
                     return
 
@@ -3072,6 +3143,7 @@ async def _run_main_loop_impl(
                                     "pi",
                                     str(path),
                                     session_header_id(path) if path.exists() else None,
+                                    relative_resolver=resolve_stored_pi_alias,
                                 )
                                 if owners - {(chat_id, topic_key[1])}:
                                     raise ValueError(

@@ -284,14 +284,24 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("reply_original", [False, True])
+@pytest.mark.parametrize(
+    ("phase", "reply_kind"),
+    [
+        ("identity", "none"),
+        ("identity", "original"),
+        ("identity", "root"),
+        ("debounce", "none"),
+        ("debounce", "root"),
+    ],
+)
 async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
     tmp_path: Path,
-    reply_original: bool,
+    phase: str,
+    reply_kind: str,
 ) -> None:
     config = tmp_path / "takopi.toml"
     entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
-    rpc_runs: list[object] = []
+    rpc_runs: list[Rpc] = []
 
     class Rpc:
         def __init__(self, session_path: Path):
@@ -362,7 +372,7 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
         ),
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
-        forward_coalesce_s=0,
+        forward_coalesce_s=0.3 if phase == "debounce" else 0,
     )
 
     async def poller(_cfg):
@@ -376,15 +386,18 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
             reply_to_text=None,
             sender_id=123,
         )
-        await entered.wait()
+        if phase == "identity":
+            await entered.wait()
+        else:
+            await anyio.sleep(0.05)
         yield TelegramIncomingMessage(
             transport="telegram",
             chat_id=-100,
             thread_id=77,
             message_id=2,
             text="/cancel",
-            reply_to_message_id=1 if reply_original else None,
-            reply_to_text="Build task" if reply_original else None,
+            reply_to_message_id={"original": 1, "root": 77}.get(reply_kind),
+            reply_to_text="Build task" if reply_kind == "original" else None,
             sender_id=123,
         )
         emitted.set()
@@ -396,8 +409,10 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
             await emitted.wait()
         await anyio.sleep(0.05)
         release.set()
-        await anyio.sleep(0.1)
-        assert rpc_runs and not rpc_runs[0].prompt_sent
+        await anyio.sleep(0.4 if phase == "debounce" else 0.1)
+        assert all(not rpc.prompt_sent for rpc in rpc_runs)
+        if phase == "identity":
+            assert rpc_runs
         assert (
             await LiveInbox(resolve_inbox_path(config)).initial_for_topic(-100, 77)
             is None

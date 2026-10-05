@@ -116,6 +116,7 @@ class PiRpcClient:
                     self._tasks = [
                         asyncio.create_task(self._read_stdout()),
                         asyncio.create_task(self._drain_stderr()),
+                        asyncio.create_task(self._watch_parent()),
                     ]
             except BaseException:
                 if self._proc is not None:
@@ -208,6 +209,16 @@ class PiRpcClient:
         except (RuntimeError, OSError, ValueError, msgspec.DecodeError) as exc:
             self._fail(RuntimeError(f"Pi RPC stream failed: {exc}"))
 
+    async def _watch_parent(self) -> None:
+        # Tools can inherit stdout and keep the pipe open after Pi itself dies.
+        # Observing only EOF would strand response waiters and event consumers.
+        assert self._proc is not None
+        while self._proc.returncode is None:
+            # asyncio.Process.wait() can itself wait for inherited pipes to
+            # close even after its process has exited; returncode does not.
+            await asyncio.sleep(0.1)
+        self._fail(RuntimeError(f"Pi RPC process exited (rc={self._proc.returncode})"))
+
     async def _drain_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
         try:
@@ -233,17 +244,20 @@ class PiRpcClient:
                 if proc.stdin is not None:
                     with suppress(OSError, anyio.ClosedResourceError):
                         await proc.stdin.aclose()
-                try:
-                    with anyio.fail_after(2):
-                        await proc.wait()
-                except TimeoutError:
-                    proc.terminate()
+                if proc.returncode is None:
                     try:
                         with anyio.fail_after(2):
                             await proc.wait()
                     except TimeoutError:
-                        proc.kill()
-                        await proc.wait()
+                        if proc.returncode is None:
+                            proc.terminate()
+                        try:
+                            with anyio.fail_after(2):
+                                await proc.wait()
+                        except TimeoutError:
+                            if proc.returncode is None:
+                                proc.kill()
+                            await proc.wait()
                 # Pi can exit while a tool/subagent still holds its session
                 # file open. The RPC claim is not safe to release until its
                 # dedicated POSIX process group is terminated too.

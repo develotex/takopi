@@ -386,6 +386,30 @@ async def test_close_reaps_tool_descendants_before_releasing_session(
 
 
 @pytest.mark.anyio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited pipe")
+async def test_rpc_parent_exit_detected_while_tool_inherits_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.setattr(pi_rpc, "_PI_COMMAND", sys.executable)
+    script = (
+        "import subprocess,sys\n"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)'], "
+        "stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=subprocess.DEVNULL)\n"
+        "sys.exit(7)\n"
+    )
+    client = PiRpcClient(tmp_path / "session.jsonl", tmp_path, ["-c", script])
+    try:
+        await client.start()
+        with pytest.raises(RuntimeError, match=r"rc=7"):
+            async with asyncio.timeout(1):
+                await anext(client.events())
+    finally:
+        await client.close()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["fresh", "bound"])
 async def test_identity_change_after_verification_refuses_prompt(
     tmp_path: Path, mode: str
