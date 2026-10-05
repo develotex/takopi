@@ -1338,11 +1338,16 @@ async def _run_main_loop_impl(
                     )
                     else None
                 )
-                if (
-                    topic_key is not None
-                    and (chat_id, topic_key[1], user_msg_id) in cancelled_initial_ids
-                ):
-                    return
+                if topic_key is not None:
+                    recovery = recovery_cancel.get((chat_id, topic_key[1], user_msg_id))
+                    if (
+                        chat_id,
+                        topic_key[1],
+                        user_msg_id,
+                    ) in cancelled_initial_ids or (
+                        recovery is not None and recovery[0].is_set()
+                    ):
+                        return
                 stateful_mode = topic_key is not None or chat_session_key is not None
                 show_resume_line = should_show_resume_line(
                     show_resume_line=cfg.show_resume_line,
@@ -1630,7 +1635,10 @@ async def _run_main_loop_impl(
                                 rpc = entry.runner.rpc_run(path, cwd=cwd)
                         provisional_id: str | None = None
                         startup_key = (chat_id, topic_key[1], user_msg_id)
-                        if startup_key in cancelled_initial_ids:
+                        recovery = recovery_cancel.get(startup_key)
+                        if startup_key in cancelled_initial_ids or (
+                            recovery is not None and recovery[0].is_set()
+                        ):
                             running_task.cancel_requested.set()
                         startup_cancel[startup_key] = running_task
                         if resume_token is None or existing:
@@ -2012,6 +2020,9 @@ async def _run_main_loop_impl(
 
             startup_cancel: dict[tuple[int, int, int], RunningTask] = {}
             cancelled_initial_ids: set[tuple[int, int, int]] = set()
+            recovery_cancel: dict[
+                tuple[int, int, int], tuple[asyncio.Event, int | None]
+            ] = {}
             plugin_inflight: set[tuple[int, int]] = set()
             retry_starting: set[tuple[int, int, str]] = set()
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
@@ -2779,6 +2790,59 @@ async def _run_main_loop_impl(
                                 text="Cancelling Pi startup; no new prompt will be submitted."
                             )
                             return
+                        if (
+                            owner is not None
+                            and owner.running_task is not None
+                            and any(
+                                task is owner.running_task
+                                for task in state.running_tasks.values()
+                            )
+                            and (
+                                cancel_reply_id is None
+                                or cancel_reply_id == owner.running_task.user_message_id
+                                or any(
+                                    (chat, thread, command)
+                                    == (
+                                        chat_id,
+                                        topic_key[1],
+                                        owner.running_task.user_message_id,
+                                    )
+                                    and original == cancel_reply_id
+                                    for (chat, thread, command), (
+                                        _,
+                                        original,
+                                    ) in recovery_cancel.items()
+                                )
+                            )
+                        ):
+                            tg.start_soon(
+                                handle_cancel,
+                                cfg,
+                                replace(
+                                    msg, reply_to_message_id=None, reply_to_text=None
+                                ),
+                                state.running_tasks,
+                                scheduler,
+                            )
+                            return
+                        recovery_pending = [
+                            event
+                            for (chat, thread, command), (
+                                event,
+                                original,
+                            ) in recovery_cancel.items()
+                            if (chat, thread) == topic_key
+                            and (
+                                cancel_reply_id is None
+                                or cancel_reply_id in (command, original)
+                            )
+                        ]
+                        if len(recovery_pending) == 1:
+                            recovery_pending[0].set()
+                            await reply(
+                                text="Cancelling Pi recovery inspection; no retry prompt will be submitted."
+                            )
+                            return
                         initial = await live.inbox.initial_for_topic(*topic_key)
                         pending_fresh = fresh_pending.get(topic_key)
                         if (
@@ -3126,9 +3190,13 @@ async def _run_main_loop_impl(
                             )
                             return
 
+                        retry_cancel = asyncio.Event()
+
                         async def run_initial_retry(intent: InitialIntent) -> None:
                             rpc: PiRpcRun | None = None
                             try:
+                                if retry_cancel.is_set():
+                                    return
                                 if config_path is None:
                                     raise ValueError("Live config path unavailable")
                                 cwd = (
@@ -3174,6 +3242,8 @@ async def _run_main_loop_impl(
                                 decision = await live.inspect_initial_retry(
                                     intent, rpc, cwd, config_path.parent
                                 )
+                                if retry_cancel.is_set():
+                                    return
                                 if decision == "fresh":
                                     prompt = intent.prompt
                                 else:
@@ -3215,6 +3285,9 @@ async def _run_main_loop_impl(
                             finally:
                                 if rpc is not None:
                                     await rpc.client.close()
+                                recovery_cancel.pop(
+                                    (chat_id, topic_key[1], msg.message_id), None
+                                )
                                 retry_starting.discard(intent_key)
                                 if fresh_pending.get(topic_key, (None, 0))[0] == Path(
                                     intent.session_key
@@ -3240,6 +3313,10 @@ async def _run_main_loop_impl(
                                 "Pi recovery queue full; initial retry not started. Please retry later.",
                             )
                             return
+                        recovery_cancel[(chat_id, topic_key[1], msg.message_id)] = (
+                            retry_cancel,
+                            initial.message_id,
+                        )
                         fresh_pending[topic_key] = (
                             Path(initial.session_key),
                             initial.message_id,
@@ -3264,9 +3341,14 @@ async def _run_main_loop_impl(
                             )
                             return
 
+                        idle_cancel = asyncio.Event()
+                        idle_retry_spawned = False
+
                         async def run_idle_retry(receipt: Receipt) -> None:
                             rpc: PiRpcRun | None = None
                             try:
+                                if idle_cancel.is_set():
+                                    return
                                 token = ResumeToken(
                                     engine="pi", value=receipt.session_key
                                 )
@@ -3297,6 +3379,8 @@ async def _run_main_loop_impl(
                                     )
                                 if not await live.begin_idle_retry(receipt, rpc, cwd):
                                     return
+                                if idle_cancel.is_set():
+                                    return
                                 await run_job(
                                     chat_id,
                                     msg.message_id,
@@ -3321,6 +3405,9 @@ async def _run_main_loop_impl(
                             finally:
                                 if rpc is not None:
                                     await rpc.client.close()
+                                recovery_cancel.pop(
+                                    (chat_id, recovery_key[1], msg.message_id), None
+                                )
                                 retry_starting.discard(recovery_key)
                                 if not await scheduler.has_pending_for_topic(
                                     token, chat_id, recovery_key[1]
@@ -3328,16 +3415,23 @@ async def _run_main_loop_impl(
                                     starting_live.discard(recovery_key)
 
                         def spawn_idle_retry(receipt: Receipt) -> None:
+                            nonlocal idle_retry_spawned
+                            if idle_cancel.is_set():
+                                return
+
                             async def work() -> None:
                                 await run_idle_retry(receipt)
 
                             if not enqueue_recovery(work):
                                 raise RuntimeError("Pi recovery queue is full")
+                            idle_retry_spawned = True
                             starting_live.add(recovery_key)
                             retry_starting.add(recovery_key)
 
                         async def inspect_receipt() -> None:
                             try:
+                                if idle_cancel.is_set():
+                                    return
                                 handled = await live.recover_receipt(
                                     chat_id,
                                     recovery_key[1],
@@ -3357,6 +3451,11 @@ async def _run_main_loop_impl(
                                     msg.message_id,
                                     "Pi recovery queue full; no retry started. Please try later.",
                                 )
+                            finally:
+                                if not idle_retry_spawned:
+                                    recovery_cancel.pop(
+                                        (chat_id, recovery_key[1], msg.message_id), None
+                                    )
 
                         if not enqueue_recovery(inspect_receipt):
                             await live._startup_reply(
@@ -3364,6 +3463,15 @@ async def _run_main_loop_impl(
                                 key[1],
                                 msg.message_id,
                                 "Pi recovery queue full; nothing submitted. Please retry later.",
+                            )
+                        else:
+                            recovery_cancel[
+                                (chat_id, recovery_key[1], msg.message_id)
+                            ] = (
+                                idle_cancel,
+                                int(parts[1])
+                                if len(parts) > 1 and parts[1].isdigit()
+                                else None,
                             )
                         return
                     if active is not None and (

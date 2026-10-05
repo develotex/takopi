@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+
+import anyio
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
@@ -17,6 +19,7 @@ from takopi.runners.pi import PiRunner
 from takopi.runners.pi_rpc import PiRpcRun
 from takopi.settings import TelegramTopicsSettings
 from takopi.telegram.bridge import TelegramBridgeConfig, run_main_loop
+from takopi.telegram.live_conversation import LiveConversationService
 from takopi.telegram.live_inbox import LiveInbox, resolve_inbox_path
 from takopi.telegram.topic_state import TopicStateStore, resolve_state_path
 from takopi.telegram.types import TelegramIncomingMessage
@@ -39,13 +42,18 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "header_mismatch",
         "header_absent",
         "bound_bypass",
+        "cancel_before_file",
+        "cancel_after_file",
+        "cancel_root_reply",
     ],
 )
 async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent_fifo(
     tmp_path: Path,
     case: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = tmp_path / "takopi.toml"
+    entered, release = anyio.Event(), anyio.Event()
     path = tmp_path / "pi-live-sessions" / f"-100-77-{uuid4().hex}.jsonl"
     ident = uuid4().hex
     inbox = LiveInbox(resolve_inbox_path(config))
@@ -53,6 +61,17 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         -100, 77, 1, str(path), "Build original task", str(tmp_path)
     )
     await inbox.mark_initial_uncertain(initial.id, initial.session_key)
+    if case == "cancel_before_file":
+        original_inspect = LiveConversationService.inspect_initial_retry
+
+        async def delayed_inspect(self, *args):
+            entered.set()
+            await release.wait()
+            return await original_inspect(self, *args)
+
+        monkeypatch.setattr(
+            LiveConversationService, "inspect_initial_retry", delayed_inspect
+        )
     update = (
         None
         if case == "bound_bypass"
@@ -65,6 +84,8 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         "other_bound",
         "other_bound_short",
         "bound_bypass",
+        "cancel_after_file",
+        "cancel_root_reply",
     ):
         path.parent.mkdir()
         path.write_text(
@@ -88,6 +109,9 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         async def request(self, typ):
             self.calls.append(typ)
             if typ == "get_state":
+                if case.startswith("cancel_") and case != "cancel_before_file":
+                    entered.set()
+                    await release.wait()
                 if case in ("before_file", "header_mismatch", "header_absent"):
                     assert not path.exists(), "new Pi JSONL is absent during get_state"
                 if case == "owner_conflict":
@@ -212,10 +236,29 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
             reply_to_text=None,
             sender_id=123,
         )
+        if case.startswith("cancel_"):
+            with anyio.fail_after(2):
+                await entered.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=51,
+                text="/cancel",
+                reply_to_message_id=77 if case == "cancel_root_reply" else None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            await anyio.sleep(0.05)
+            release.set()
 
     await run_main_loop(cfg, poller)
     current = await inbox.initial_by_id(initial.id)
     assert current is not None
+    if case.startswith("cancel_"):
+        assert not rpc.prompts, "Cancelling inspection must not submit a retry prompt"
+        assert current.state == "uncertain"
+        return
     if case in ("header_mismatch", "header_absent"):
         assert current.state == "uncertain"
         assert update is not None

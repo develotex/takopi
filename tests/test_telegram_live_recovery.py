@@ -33,6 +33,7 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "retry",
         "retry_fifo",
         "retry_cancel",
+        "cancel_inspection",
         "finalize_order",
         "closing_unresolved",
         "poll_recovery",
@@ -86,6 +87,9 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
         async def request(self, typ: str):
             self.requests.append(typ)
             if typ == "get_state":
+                if case == "cancel_inspection":
+                    self.started.set()
+                    await self.release.wait()
                 if case == "conflict":
                     raise RuntimeError("canonical owner conflict")
                 return {
@@ -259,6 +263,21 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
             reply_to_text=None,
             sender_id=123,
         )
+        if case == "cancel_inspection":
+            await rpc.started.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=51,
+                text="/cancel",
+                reply_to_message_id=50,
+                reply_to_text="/update retry 33 confirm",
+                sender_id=123,
+            )
+            emitted.set()
+            await anyio.sleep(0.05)
+            rpc.release.set()
         if case == "poll_recovery":
             emitted.set()  # polling must advance even while retry ACK is held
             yield TelegramIncomingMessage(
@@ -394,7 +413,7 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
         assert not rpc.prompts and final.state == "delivered"
     else:
         assert not rpc.prompts and final.state == "uncertain"
-        if case in ("conflict", "mismatch", "streaming"):
+        if case in ("conflict", "mismatch", "streaming", "cancel_inspection"):
             assert "get_state" in rpc.requests
         else:
             assert not rpc.requests
