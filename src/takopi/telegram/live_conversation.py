@@ -219,6 +219,7 @@ class LiveRunner:
         self.on_followup_started: Callable[[str], Awaitable[None]] | None = None
         self._followups: list[str] = []
         self._inflight_followup: str | None = None
+        self.cancel_requested: anyio.Event | None = None
         self.settlement_ok = False
         self.final_failure = "Live update delivery is uncertain; final result is incomplete. Check the scoped receipt before retrying."
 
@@ -247,6 +248,15 @@ class LiveRunner:
         for iteration in range(
             9
         ):  # Bound settlement drain even if updates arrive continuously.
+            if self.cancel_requested is not None and self.cancel_requested.is_set():
+                yield CompletedEvent(
+                    engine="pi",
+                    ok=False,
+                    answer="",
+                    resume=next_resume,
+                    error="Pi task cancelled before prompt continuation",
+                )
+                return
             completed: CompletedEvent | None = None
             async for event in self.rpc.run(next_prompt, next_resume):
                 if isinstance(event, CompletedEvent):

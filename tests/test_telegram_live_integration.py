@@ -1353,6 +1353,34 @@ async def test_settlement_continuation_is_rendered_before_final_and_cancellable(
 
 
 @pytest.mark.anyio
+async def test_cancellation_before_settlement_followup_never_submits_second_prompt():
+    class Rpc:
+        def __init__(self):
+            self.sent: list[str] = []
+            self.client = self
+
+        async def run(self, prompt, _resume):
+            self.sent.append(prompt)
+            yield StartedEvent(engine="pi", resume=ResumeToken("pi", "/tmp/a.jsonl"))
+            yield CompletedEvent(engine="pi", ok=True, answer="old")
+
+    rpc = Rpc()
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+    cancelled = anyio.Event()
+    runner.cancel_requested = cancelled
+    runner._followups.append("use the update")
+
+    async def before_final() -> bool:
+        cancelled.set()  # Interrupt acknowledged later; no next prompt yet.
+        return True
+
+    runner.before_final = before_final
+    results = [event async for event in runner.run("build", None)]
+    assert len(rpc.sent) == 1
+    assert not any(isinstance(event, CompletedEvent) and event.ok for event in results)
+
+
+@pytest.mark.anyio
 async def test_main_prompt_teaches_explicit_ack_without_quick_transcript():
     rpc = FakeRun()
     runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))

@@ -437,6 +437,49 @@ async def test_rpc_parent_exit_detected_while_tool_inherits_stdout(
 
 
 @pytest.mark.anyio
+async def test_cancel_during_rpc_identity_check_refuses_first_prompt(
+    tmp_path: Path,
+) -> None:
+    entered, release, cancelled = asyncio.Event(), asyncio.Event(), anyio.Event()
+
+    class Client:
+        session_path = tmp_path / "session.jsonl"
+        cwd = tmp_path
+        prompts = 0
+
+        async def start(self):
+            pass
+
+        async def request(self, typ: str, **_fields):
+            if typ == "get_state":
+                entered.set()
+                await release.wait()
+                return {
+                    "data": {
+                        "sessionId": "fixture",
+                        "sessionFile": str(self.session_path),
+                    }
+                }
+            self.prompts += 1
+            return {"data": {"disposition": "started"}}
+
+    fake_client = Client()
+    rpc = PiRpcRun(cast(PiRpcClient, fake_client))
+    rpc.cancel_requested = cancelled
+
+    async def attempt():
+        await anext(rpc.run("Never submit", None))
+
+    task = asyncio.create_task(attempt())
+    await asyncio.wait_for(entered.wait(), 1)
+    cancelled.set()
+    release.set()
+    with pytest.raises(RuntimeError, match="cancelled before prompt"):
+        await task
+    assert fake_client.prompts == 0
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["fresh", "bound"])
 async def test_identity_change_after_verification_refuses_prompt(
     tmp_path: Path, mode: str

@@ -289,6 +289,7 @@ class PiRpcRun:
         self.client = client
         self.session_key: str | None = None
         self.expected_session_id: str | None = None
+        self.cancel_requested: anyio.Event | None = None
         self._active = False
         self._prompt_started = False
         self._unsettled = False
@@ -345,6 +346,10 @@ class PiRpcRun:
             token = ResumeToken(engine=ENGINE, value=session_file)
             state = PiStreamState(resume=token, has_modern_agent_end=True)
             self._interrupting = False
+            if self.cancel_requested is not None and self.cancel_requested.is_set():
+                raise RuntimeError(
+                    "Pi RPC cancelled before prompt; no prompt submitted"
+                )
             self._unsettled = True  # A timed-out prompt may still have reached Pi.
             result = await self.client.request("prompt", message=prompt)
             disposition = result.get("data", {}).get("disposition")

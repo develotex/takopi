@@ -1683,6 +1683,8 @@ async def _run_main_loop_impl(
                             running_task.resume_ready,
                             initial_recovery=recovery_rpc is not None,
                         )
+                        live_runner.cancel_requested = running_task.cancel_requested
+                        rpc.cancel_requested = running_task.cancel_requested
                         owner = LiveOwner(
                             chat_id,
                             topic_key[1],
@@ -2799,6 +2801,7 @@ async def _run_main_loop_impl(
                                 legacy_pending.add(forward_topic)
                         finally:
                             barrier.set()
+                            pending_forward.forward_barrier = None
                     else:
                         forward_coalescer.attach_forward(msg)
                     return
@@ -3005,6 +3008,15 @@ async def _run_main_loop_impl(
                                 or cancel_reply_id == initial.message_id
                             )
                         ):
+                            if cancel_reply_id is None and any(
+                                ref.channel_id == chat_id
+                                and task.thread_id == topic_key[1]
+                                for ref, task in state.running_tasks.items()
+                            ):
+                                await reply(
+                                    text="multiple runs are active; reply to the progress message to cancel one."
+                                )
+                                return
                             cancelled_initial_ids.add(initial.id)
                             for key, pending in list(state.pending_prompts.items()):
                                 if (
