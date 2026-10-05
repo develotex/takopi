@@ -2248,6 +2248,8 @@ async def _run_main_loop_impl(
                     else None
                 )
                 _, ok = await ensure_topic_context(
+                    raw_text=text,
+                    message_id=msg.message_id,
                     resolved=resolved,
                     ambient_context=ambient_context,
                     topic_key=topic_key,
@@ -2275,14 +2277,87 @@ async def _run_main_loop_impl(
                     chat_prefs=state.chat_prefs,
                 )
 
+            async def active_topic_rejection(
+                *,
+                raw_text: str,
+                message_id: int,
+                resolved: ResolvedMessage,
+                ambient_context: RunContext | None,
+                topic_key: tuple[int, int] | None,
+            ) -> str | None:
+                if live is None or topic_key is None:
+                    return None
+                active = live.topic_owner(*topic_key)
+                if active is None and not any(
+                    key[:2] == topic_key for key in starting_live
+                ):
+                    return None
+                owner_context = (
+                    active.running_task.context
+                    if active is not None and active.running_task is not None
+                    else await state.topic_store.get_context(*topic_key)
+                    if state.topic_store is not None
+                    else None
+                )
+                try:
+                    explicit = cfg.runtime.resolve_message(
+                        text=raw_text,
+                        reply_text=None,
+                        ambient_context=ambient_context,
+                        chat_id=topic_key[0],
+                    )
+                except DirectiveError:
+                    explicit = None  # The ordinary resolver reports invalid directives.
+                target = (
+                    explicit
+                    if explicit is not None and explicit.context_source == "directives"
+                    else resolved
+                )
+                rejection = "Directive cannot rebind the active or starting Pi topic; no prompt sent. Use another topic or wait for completion."
+                if target.engine_override not in (None, "pi"):
+                    return rejection
+                if owner_context is None:
+                    if active is not None:
+                        return rejection  # Closing owner: binding cannot be inferred.
+                    initial = await live.inbox.initial_for_topic(*topic_key)
+                    if initial is not None:
+                        try:
+                            target_cwd = cfg.runtime.resolve_run_cwd(target.context)
+                        except ConfigError:
+                            return rejection
+                        return (
+                            None
+                            if target_cwd is not None
+                            and str(target_cwd.resolve()) == initial.cwd
+                            else rejection
+                        )
+                    # The first fresh prompt establishes identity; a different
+                    # message must not change its context before that happens.
+                    if fresh_pending.get(topic_key, (None, None))[1] == message_id:
+                        return None
+                    return rejection
+                return rejection if target.context != owner_context else None
+
             async def ensure_topic_context(
                 *,
+                raw_text: str,
+                message_id: int,
                 resolved: ResolvedMessage,
                 ambient_context: RunContext | None,
                 topic_key: tuple[int, int] | None,
                 chat_project: str | None,
                 reply: Callable[..., Awaitable[None]],
             ) -> tuple[RunContext | None, bool]:
+                rejection = await active_topic_rejection(
+                    raw_text=raw_text,
+                    message_id=message_id,
+                    resolved=resolved,
+                    ambient_context=ambient_context,
+                    topic_key=topic_key,
+                )
+                if rejection is not None:
+                    await reply(text=rejection)
+                    return ambient_context, False
                 effective_context = ambient_context
                 if (
                     state.topic_store is not None
@@ -2729,6 +2804,8 @@ async def _run_main_loop_impl(
                     )
 
                 _effective_context, ok = await ensure_topic_context(
+                    raw_text=pending.text,
+                    message_id=msg.message_id,
                     resolved=resolved,
                     ambient_context=pending.ambient_context,
                     topic_key=pending.topic_key,
@@ -4059,7 +4136,6 @@ async def _run_main_loop_impl(
                 reply_task = state.running_tasks.get(reply_ref) if reply_ref else None
                 if reply_task is not None:
                     if live is not None and topic_key is not None:
-                        active_reply_owner = live.topic_owner(*topic_key)
                         if reply_task.thread_id != topic_key[1]:
                             await live._startup_reply(
                                 chat_id,
@@ -4068,38 +4144,29 @@ async def _run_main_loop_impl(
                                 "Reply targets a run in another topic; no prompt sent.",
                             )
                             return
-                        if active_reply_owner is not None or any(
-                            key[:2] == topic_key for key in starting_live
-                        ):
-                            try:
-                                resolved_reply = cfg.runtime.resolve_message(
-                                    text=text,
-                                    reply_text=msg.reply_to_text,
-                                    ambient_context=ambient_context,
-                                    chat_id=chat_id,
-                                )
-                            except DirectiveError:
-                                resolved_reply = (
-                                    None  # Later dispatch reports parse errors.
-                                )
-                            owner_context = (
-                                active_reply_owner.running_task.context
-                                if active_reply_owner is not None
-                                and active_reply_owner.running_task is not None
-                                else await state.topic_store.get_context(*topic_key)
-                                if state.topic_store is not None
-                                else None
+                        try:
+                            resolved_reply = cfg.runtime.resolve_message(
+                                text=text,
+                                reply_text=msg.reply_to_text,
+                                ambient_context=ambient_context,
+                                chat_id=chat_id,
                             )
-                            if resolved_reply is not None and (
-                                resolved_reply.engine_override not in (None, "pi")
-                                or owner_context is None
-                                or resolved_reply.context != owner_context
-                            ):
+                        except DirectiveError:
+                            resolved_reply = None  # Dispatch reports parse errors.
+                        if resolved_reply is not None:
+                            rejection = await active_topic_rejection(
+                                raw_text=text,
+                                message_id=msg.message_id,
+                                resolved=resolved_reply,
+                                ambient_context=ambient_context,
+                                topic_key=topic_key,
+                            )
+                            if rejection is not None:
                                 await live._startup_reply(
                                     chat_id,
                                     topic_key[1],
                                     msg.message_id,
-                                    "Reply directive cannot rebind the active Pi topic. Use another topic or wait for completion.",
+                                    rejection,
                                 )
                                 return
                     logger.debug(
@@ -4132,6 +4199,22 @@ async def _run_main_loop_impl(
                         )
                     except DirectiveError:
                         resolved_live = None
+                    if resolved_live is not None and resolved_live.prompt.strip():
+                        rejection = await active_topic_rejection(
+                            raw_text=text,
+                            message_id=msg.message_id,
+                            resolved=resolved_live,
+                            ambient_context=ambient_context,
+                            topic_key=topic_key,
+                        )
+                        if rejection is not None:
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                rejection,
+                            )
+                            return
                     if (
                         resolved_live is not None
                         and resolved_live.context_source == "directives"

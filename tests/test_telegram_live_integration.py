@@ -625,6 +625,7 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "bound_non_pi_directive",
         "bound_reply_other_project",
         "bound_reply_non_pi_directive",
+        "bound_forwarded_other_branch",
         "unbound_other_project",
         "bound_plugin_command",
         "bound_plugin_callback",
@@ -922,7 +923,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 else "/test Change goal"
                 if mode == "unbound_directive_after"
                 else "@dev Please deploy change"
-                if mode == "bound_reply_other_project"
+                if mode in ("bound_reply_other_project", "bound_forwarded_other_branch")
                 else "/other Please deploy change"
                 if mode in ("bound_other_project", "unbound_other_project")
                 else "/update Используй синий"
@@ -935,7 +936,11 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                     and transport.progress_ref is not None
                     else None
                 ),
-                reply_to_text="Working" if mode.startswith("bound_reply_") else None,
+                reply_to_text=(
+                    transport.send_calls[0]["message"].text
+                    if mode.startswith("bound_reply_")
+                    else None
+                ),
                 sender_id=123,
             )
         if held_steer:
@@ -947,7 +952,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             thread_id=77,
             message_id=3,
             text="Forwarded source content"
-            if mode == "unbound_forward_after_update"
+            if mode in ("unbound_forward_after_update", "bound_forwarded_other_branch")
             else "Не трогай авторизацию"
             if command_first
             else "Как дела?",
@@ -955,7 +960,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             reply_to_text=None,
             sender_id=123,
             raw={"forward_origin": {"type": "user"}}
-            if mode == "unbound_forward_after_update"
+            if mode in ("unbound_forward_after_update", "bound_forwarded_other_branch")
             else {},
         )
         if command_first:
@@ -1043,12 +1048,9 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 "bound_non_pi_directive",
                 "bound_reply_other_project",
                 "bound_reply_non_pi_directive",
+                "bound_forwarded_other_branch",
             ):
-                expected = (
-                    "Non-Pi directive cannot rebind"
-                    if mode == "bound_non_pi_directive"
-                    else "Reply directive cannot rebind"
-                )
+                expected = "Directive cannot rebind the active or starting Pi topic"
                 with anyio.fail_after(2):
                     while not any(
                         expected in call["message"].text
