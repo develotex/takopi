@@ -623,6 +623,8 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "bound_held_steer_cancel",
         "bound_other_project",
         "bound_non_pi_directive",
+        "bound_reply_other_project",
+        "bound_reply_non_pi_directive",
         "unbound_other_project",
         "bound_plugin_command",
         "bound_plugin_callback",
@@ -809,7 +811,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
         chat_map={-100: "test"},
     )
     extra_engines = []
-    if mode == "bound_non_pi_directive":
+    if mode in ("bound_non_pi_directive", "bound_reply_non_pi_directive"):
         from takopi.runners.mock import Return, ScriptRunner
 
         extra_engines = [
@@ -870,11 +872,19 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             if (
                 unbound
                 or held_steer
-                or mode in ("bound_other_project", "bound_update_after_branch_rebind")
+                or mode
+                in (
+                    "bound_other_project",
+                    "bound_update_after_branch_rebind",
+                    "bound_reply_other_project",
+                    "bound_reply_non_pi_directive",
+                )
             ):
                 await rpc.run_started.wait()
             else:
                 await progress_ready.wait()
+        if mode in ("bound_reply_other_project", "bound_reply_non_pi_directive"):
+            assert transport.progress_ref is not None
         if mode == "bound_update_after_branch_rebind":
             await store.set_context(-100, 77, RunContext(project="test", branch="dev"))
         if mode == "bound_update_mentions":
@@ -897,7 +907,9 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 chat_id=-100,
                 thread_id=77,
                 message_id=2,
-                text="/codex /other Do another task"
+                text="/codex /test Do another task"
+                if mode == "bound_reply_non_pi_directive"
+                else "/codex /other Do another task"
                 if mode == "bound_non_pi_directive"
                 else "/update Используй синий"
                 if mode == "bound_update_mentions"
@@ -909,13 +921,21 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 if mode == "bound_update_after_branch_rebind"
                 else "/test Change goal"
                 if mode == "unbound_directive_after"
+                else "@dev Please deploy change"
+                if mode == "bound_reply_other_project"
                 else "/other Please deploy change"
                 if mode in ("bound_other_project", "unbound_other_project")
                 else "/update Используй синий"
                 if command_first
                 else "Не трогай авторизацию",
-                reply_to_message_id=None,
-                reply_to_text=None,
+                reply_to_message_id=(
+                    cast(int, transport.progress_ref.message_id)
+                    if mode
+                    in ("bound_reply_other_project", "bound_reply_non_pi_directive")
+                    and transport.progress_ref is not None
+                    else None
+                ),
+                reply_to_text="Working" if mode.startswith("bound_reply_") else None,
                 sender_id=123,
             )
         if held_steer:
@@ -1019,12 +1039,27 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                         await store.get_session_resume(-100, 77, "pi")
                     ) == ResumeToken("pi", str(path))
                 return
-            if mode == "bound_non_pi_directive":
+            if mode in (
+                "bound_non_pi_directive",
+                "bound_reply_other_project",
+                "bound_reply_non_pi_directive",
+            ):
+                expected = (
+                    "Non-Pi directive cannot rebind"
+                    if mode == "bound_non_pi_directive"
+                    else "Reply directive cannot rebind"
+                )
+                with anyio.fail_after(2):
+                    while not any(
+                        expected in call["message"].text
+                        for call in transport.send_calls
+                    ):
+                        await anyio.sleep(0.01)
                 assert (await store.get_context(-100, 77)) == RunContext(project="test")
                 assert all(r.message_id != 2 for r in pending)
-                assert any(
-                    "Non-Pi directive cannot rebind" in call["message"].text
-                    for call in transport.send_calls
+                assert all(
+                    "Do another task" not in text and "Please deploy change" not in text
+                    for text in rpc.sent
                 )
                 return
             if mode == "bound_update_mentions":

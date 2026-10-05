@@ -4056,9 +4056,52 @@ async def _run_main_loop_impl(
                     is_voice_transcribed=is_voice_transcribed,
                     forwards=[],
                 )
-                if reply_id is not None and state.running_tasks.get(
-                    MessageRef(channel_id=chat_id, message_id=reply_id)
-                ):
+                reply_task = state.running_tasks.get(reply_ref) if reply_ref else None
+                if reply_task is not None:
+                    if live is not None and topic_key is not None:
+                        active_reply_owner = live.topic_owner(*topic_key)
+                        if reply_task.thread_id != topic_key[1]:
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Reply targets a run in another topic; no prompt sent.",
+                            )
+                            return
+                        if active_reply_owner is not None or any(
+                            key[:2] == topic_key for key in starting_live
+                        ):
+                            try:
+                                resolved_reply = cfg.runtime.resolve_message(
+                                    text=text,
+                                    reply_text=msg.reply_to_text,
+                                    ambient_context=ambient_context,
+                                    chat_id=chat_id,
+                                )
+                            except DirectiveError:
+                                resolved_reply = (
+                                    None  # Later dispatch reports parse errors.
+                                )
+                            owner_context = (
+                                active_reply_owner.running_task.context
+                                if active_reply_owner is not None
+                                and active_reply_owner.running_task is not None
+                                else await state.topic_store.get_context(*topic_key)
+                                if state.topic_store is not None
+                                else None
+                            )
+                            if resolved_reply is not None and (
+                                resolved_reply.engine_override not in (None, "pi")
+                                or owner_context is None
+                                or resolved_reply.context != owner_context
+                            ):
+                                await live._startup_reply(
+                                    chat_id,
+                                    topic_key[1],
+                                    msg.message_id,
+                                    "Reply directive cannot rebind the active Pi topic. Use another topic or wait for completion.",
+                                )
+                                return
                     logger.debug(
                         "forward.prompt.bypass",
                         chat_id=chat_id,
