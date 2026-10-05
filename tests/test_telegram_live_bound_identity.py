@@ -19,8 +19,9 @@ from takopi.runners.pi import PiRunner
 from takopi.runners.pi_rpc import PiRpcClient, PiRpcRun
 from takopi.settings import TelegramTopicsSettings
 from takopi.telegram.bridge import TelegramBridgeConfig, run_main_loop
+from takopi.telegram.live_inbox import LiveInbox, resolve_inbox_path
 from takopi.telegram.topic_state import TopicStateStore, resolve_state_path
-from takopi.telegram.types import TelegramIncomingMessage
+from takopi.telegram.types import TelegramCallbackQuery, TelegramIncomingMessage
 from takopi.transport import Transport
 from takopi.transport_runtime import TransportRuntime
 from tests.telegram_fakes import FakeBot, FakeTransport
@@ -129,6 +130,255 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
         "no prompt submitted" in item["message"].text.lower()
         for item in transport.send_calls
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["delayed_plugin", "unknown_callback"])
+async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    import takopi.telegram.loop as loop
+
+    config = tmp_path / "takopi.toml"
+    entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
+    dispatches: list[str] = []
+    monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
+
+    async def fake_dispatch(*_args, **_kwargs):
+        dispatches.append("started")
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(loop, "dispatch_command", fake_dispatch)
+
+    class Runner(PiRunner):
+        def rpc_run(self, *_args, **_kwargs):
+            raise AssertionError("live start must wait for delayed plugin")
+
+        async def run(self, *_args):
+            raise AssertionError("plugin/initial must not start Pi concurrently")
+            yield  # pragma: no cover
+
+    runtime = TransportRuntime(
+        router=AutoRouter(
+            [
+                RunnerEntry(
+                    engine="pi", runner=Runner(extra_args=[], model=None, provider=None)
+                )
+            ],
+            "pi",
+        ),
+        projects=ProjectsConfig(
+            projects={
+                "test": ProjectConfig(
+                    alias="test",
+                    path=tmp_path,
+                    worktrees_dir=tmp_path / ".worktrees",
+                    chat_id=-100,
+                )
+            },
+            default_project=None,
+            chat_map={-100: "test"},
+        ),
+        config_path=config,
+    )
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=cast(Transport, FakeTransport()),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        pi_live_conversation=True,
+        forward_coalesce_s=0,
+    )
+
+    async def poller(_cfg):
+        if mode == "unknown_callback":
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=1,
+                callback_query_id="missing-thread",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {}},
+            )
+        else:
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="/spy run",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            await entered.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+        emitted.set()
+        await release.wait()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_main_loop, cfg, poller)
+        try:
+            with anyio.fail_after(2):
+                await emitted.wait()
+            await anyio.sleep(0.05)
+            if mode == "unknown_callback":
+                assert dispatches == [], (
+                    "plugin callback with unproven topic must fail closed"
+                )
+            else:
+                assert dispatches == ["started"]
+                assert (
+                    await LiveInbox(resolve_inbox_path(config)).initial_for_topic(
+                        -100, 77
+                    )
+                    is None
+                )
+        finally:
+            release.set()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reply_original", [False, True])
+async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
+    tmp_path: Path,
+    reply_original: bool,
+) -> None:
+    config = tmp_path / "takopi.toml"
+    entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
+    rpc_runs: list[object] = []
+
+    class Rpc:
+        def __init__(self, session_path: Path):
+            self.client = self
+            self.session_path = session_path
+            self.cwd = tmp_path
+            self.prompt_sent = False
+
+        async def request(self, typ: str):
+            assert typ == "get_state"
+            entered.set()
+            await release.wait()
+            return {
+                "data": {
+                    "sessionId": "fixture",
+                    "sessionFile": str(self.session_path),
+                    "isStreaming": False,
+                }
+            }
+
+        async def run(self, *_args):
+            self.prompt_sent = True
+            raise AssertionError("cancelled startup must not submit a Pi prompt")
+            yield  # pragma: no cover
+
+        async def close(self):
+            pass
+
+    class Runner(PiRunner):
+        def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
+            rpc = Rpc(session_path)
+            rpc_runs.append(rpc)
+            return cast(PiRpcRun, rpc)
+
+    runtime = TransportRuntime(
+        router=AutoRouter(
+            [
+                RunnerEntry(
+                    engine="pi", runner=Runner(extra_args=[], model=None, provider=None)
+                )
+            ],
+            "pi",
+        ),
+        projects=ProjectsConfig(
+            projects={
+                "test": ProjectConfig(
+                    alias="test",
+                    path=tmp_path,
+                    worktrees_dir=tmp_path / ".worktrees",
+                    chat_id=-100,
+                )
+            },
+            default_project=None,
+            chat_map={-100: "test"},
+        ),
+        config_path=config,
+    )
+    transport = FakeTransport()
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=cast(Transport, transport),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        pi_live_conversation=True,
+        forward_coalesce_s=0,
+    )
+
+    async def poller(_cfg):
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=-100,
+            thread_id=77,
+            message_id=1,
+            text="Build task",
+            reply_to_message_id=None,
+            reply_to_text=None,
+            sender_id=123,
+        )
+        await entered.wait()
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=-100,
+            thread_id=77,
+            message_id=2,
+            text="/cancel",
+            reply_to_message_id=1 if reply_original else None,
+            reply_to_text="Build task" if reply_original else None,
+            sender_id=123,
+        )
+        emitted.set()
+        await asyncio.Event().wait()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_main_loop, cfg, poller)
+        with anyio.fail_after(2):
+            await emitted.wait()
+        await anyio.sleep(0.05)
+        release.set()
+        await anyio.sleep(0.1)
+        assert rpc_runs and not rpc_runs[0].prompt_sent
+        assert (
+            await LiveInbox(resolve_inbox_path(config)).initial_for_topic(-100, 77)
+            is None
+        )
+        assert not any(
+            "nothing is currently running" in call["message"].text
+            for call in transport.send_calls
+        )
+        tg.cancel_scope.cancel()
 
 
 @pytest.mark.anyio

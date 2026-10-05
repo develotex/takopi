@@ -330,20 +330,19 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         path = Path(token)
         cwd = (get_run_base_dir() or Path.cwd()).resolve()
         if not path.is_absolute():
-            if path.suffix == ".jsonl":
-                path = (cwd / path).resolve()
-                header = session_header(path)
-                if (
-                    header is None
-                    or not isinstance(header.get("cwd"), str)
-                    or Path(header["cwd"]).resolve() != cwd
-                ):
-                    raise ValueError(
-                        "Pi relative session path is not a same-project JSONL"
-                    )
-            else:
-                path = resolve_legacy_session(token, cwd)
+            path = (
+                (cwd / path).resolve()
+                if path.suffix == ".jsonl"
+                else resolve_legacy_session(token, cwd)
+            )
         async with claim_one_shot(path):
+            header = session_header(path)
+            if (
+                header is None
+                or not isinstance(header.get("cwd"), str)
+                or Path(header["cwd"]).resolve() != cwd
+            ):
+                raise ValueError("Pi session path is not a same-project JSONL")
             yield
 
     def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:

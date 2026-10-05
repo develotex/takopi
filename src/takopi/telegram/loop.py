@@ -1361,6 +1361,19 @@ async def _run_main_loop_impl(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
+                if (
+                    live is not None
+                    and topic_key in plugin_inflight
+                    and engine_for_overrides == "pi"
+                ):
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=thread_id,
+                        text="Plugin command is still running in this topic; Pi task not accepted. Resend after it completes.",
+                    )
+                    return
                 # All Pi launch paths (including media, directives and queued
                 # one-shot jobs) pass this gate, not just the opt-in RPC branch.
                 # Otherwise a legacy prompt can overtake an unresolved live
@@ -1451,7 +1464,11 @@ async def _run_main_loop_impl(
                             return
                 from ..runner_bridge import RunningTask
 
-                running_task = RunningTask(context=context)
+                running_task = RunningTask(
+                    context=context,
+                    thread_id=thread_id,
+                    user_message_id=user_msg_id,
+                )
                 live_runner: LiveRunner | None = None
                 owner: LiveOwner | None = None
                 owner_done = anyio.Event()
@@ -1601,6 +1618,8 @@ async def _run_main_loop_impl(
                             with apply_run_options(run_options):
                                 rpc = entry.runner.rpc_run(path, cwd=cwd)
                         provisional_id: str | None = None
+                        startup_key = (chat_id, topic_key[1], user_msg_id)
+                        startup_cancel[startup_key] = running_task
                         if resume_token is None or existing:
                             try:
                                 if existing:
@@ -1610,6 +1629,7 @@ async def _run_main_loop_impl(
                                         rpc, path, cwd
                                     )
                             except BaseException as exc:  # noqa: BLE001 - cancellation must close the claimed RPC too
+                                startup_cancel.pop(startup_key, None)
                                 await rpc.client.close()
                                 if not isinstance(exc, Exception):
                                     raise
@@ -1637,6 +1657,7 @@ async def _run_main_loop_impl(
                             identity_verified=provisional_id is None,
                         )
                         if not live.register(owner):
+                            startup_cancel.pop(startup_key, None)
                             await rpc.client.close()
                             await send_plain(
                                 cfg.exec_cfg.transport,
@@ -1644,6 +1665,28 @@ async def _run_main_loop_impl(
                                 user_msg_id=user_msg_id,
                                 thread_id=thread_id,
                                 text="This Pi session is already active; try your message again.",
+                            )
+                            return
+                        startup_cancel.pop(startup_key, None)
+                        if running_task.cancel_requested.is_set():
+                            live.unregister(owner)
+                            await rpc.client.close()
+                            initial = await live.inbox.initial_for_topic(*topic_key)
+                            if (
+                                initial is not None
+                                and initial.message_id == user_msg_id
+                            ):
+                                await live.inbox.mark_initial_deferred(
+                                    initial.id,
+                                    initial.session_key,
+                                    "User cancelled Pi startup before prompt",
+                                )
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Pi startup cancelled before prompt; no prompt submitted.",
                             )
                             return
                         if legacy_id is not None:
@@ -1790,6 +1833,25 @@ async def _run_main_loop_impl(
                             logger.debug("live.reconcile.failed", error=str(exc))
 
                 try:
+                    if owner is not None and running_task.cancel_requested.is_set():
+                        assert live is not None
+                        if (
+                            initial_intent is not None
+                            and initial_intent.session_key == owner.session_key
+                        ):
+                            await live.inbox.mark_initial_deferred(
+                                initial_intent.id,
+                                owner.session_key,
+                                "User cancelled Pi startup before prompt",
+                            )
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Pi startup cancelled before prompt; no prompt submitted.",
+                        )
+                        return
                     async with anyio.create_task_group() as live_group:
                         if owner is not None:
                             live_group.start_soon(monitor)
@@ -1878,6 +1940,8 @@ async def _run_main_loop_impl(
 
             scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
             starting_live: set[tuple[int, int, str]] = set()
+            startup_cancel: dict[tuple[int, int, int], RunningTask] = {}
+            plugin_inflight: set[tuple[int, int]] = set()
             retry_starting: set[tuple[int, int, str]] = set()
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
             legacy_pending: set[tuple[int, int]] = set()
@@ -2521,7 +2585,7 @@ async def _run_main_loop_impl(
             async def live_plugin_blocked(topic_key: tuple[int, int] | None) -> bool:
                 if live is None or topic_key is None:
                     return False
-                if live_topic_running(topic_key):
+                if topic_key in plugin_inflight or live_topic_running(topic_key):
                     return True
                 if await live.inbox.initial_for_topic(*topic_key) is not None:
                     return True
@@ -2530,6 +2594,16 @@ async def _run_main_loop_impl(
                     and receipt.thread_id == topic_key[1]
                     for receipt in await live.inbox.unresolved_all()
                 )
+
+            async def run_guarded_plugin(
+                topic_key: tuple[int, int] | None,
+                work: Callable[[], Awaitable[None]],
+            ) -> None:
+                try:
+                    await work()
+                finally:
+                    if topic_key is not None:
+                        plugin_inflight.discard(topic_key)
 
             async def route_message(msg: TelegramIncomingMessage) -> None:
                 reply = make_reply(cfg, msg)
@@ -2599,6 +2673,36 @@ async def _run_main_loop_impl(
                 ambient_context = ctx.ambient_context
 
                 if classification.is_cancel:
+                    if live is not None and topic_key is not None:
+                        candidates = [
+                            task
+                            for (chat, thread, first), task in startup_cancel.items()
+                            if (chat, thread) == topic_key
+                            and (reply_id is None or first == reply_id)
+                        ]
+                        owner = live.topic_owner(*topic_key)
+                        if (
+                            owner is not None
+                            and owner.running_task is not None
+                            and not any(
+                                task is owner.running_task
+                                for task in state.running_tasks.values()
+                            )
+                            and (
+                                reply_id is None
+                                or owner.running_task.user_message_id == reply_id
+                            )
+                            and not any(
+                                task is owner.running_task for task in candidates
+                            )
+                        ):
+                            candidates.append(owner.running_task)
+                        if len(candidates) == 1:
+                            candidates[0].cancel_requested.set()
+                            await reply(
+                                text="Cancelling Pi startup; no new prompt will be submitted."
+                            )
+                            return
                     tg.start_soon(
                         handle_cancel, cfg, msg, state.running_tasks, scheduler
                     )
@@ -2736,12 +2840,20 @@ async def _run_main_loop_impl(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                if trigger_mode == "mentions" and not should_trigger_run(
-                    msg,
-                    bot_username=state.bot_username,
-                    runtime=cfg.runtime,
-                    command_ids=state.command_ids,
-                    reserved_chat_commands=state.reserved_chat_commands,
+                if (
+                    trigger_mode == "mentions"
+                    and not (
+                        live is not None
+                        and topic_key is not None
+                        and classification.command_id == "update"
+                    )
+                    and not should_trigger_run(
+                        msg,
+                        bot_username=state.bot_username,
+                        runtime=cfg.runtime,
+                        command_ids=state.command_ids,
+                        reserved_chat_commands=state.reserved_chat_commands,
+                    )
                 ):
                     return
 
@@ -3202,26 +3314,43 @@ async def _run_main_loop_impl(
                             chat_prefs=state.chat_prefs,
                             topic_store=state.topic_store,
                         )
+                        if await live_plugin_blocked(topic_key):
+                            await reply(
+                                text="Plugin command not accepted: Pi live topic became busy."
+                            )
+                            return
+                        if live is not None and topic_key is not None:
+                            plugin_inflight.add(topic_key)
                         tg.start_soon(
-                            dispatch_command,
-                            cfg,
-                            msg,
-                            text,
-                            command_id,
-                            args_text,
-                            state.running_tasks,
-                            scheduler,
-                            wrap_on_thread_known(
-                                scheduler.note_thread_known,
-                                topic_key,
-                                chat_session_key,
-                                None,
+                            run_guarded_plugin,
+                            topic_key,
+                            partial(
+                                dispatch_command,
+                                cfg,
+                                msg,
+                                text,
+                                command_id,
+                                args_text,
+                                state.running_tasks,
+                                scheduler,
+                                wrap_on_thread_known(
+                                    scheduler.note_thread_known,
+                                    topic_key,
+                                    chat_session_key,
+                                    None,
+                                ),
+                                stateful_mode,
+                                default_engine_override,
+                                engine_overrides_resolver,
                             ),
-                            stateful_mode,
-                            default_engine_override,
-                            engine_overrides_resolver,
                         )
                         return
+
+                if live is not None and topic_key in plugin_inflight and text.strip():
+                    await reply(
+                        text="Plugin command is still running here; this message was not accepted. Resend after it completes."
+                    )
+                    return
 
                 pending = _PendingPrompt(
                     msg=msg,
@@ -3513,6 +3642,21 @@ async def _run_main_loop_impl(
                         if command_id in state.command_ids:
                             callback_msg = _callback_message(update)
                             ctx = await build_message_context(callback_msg)
+                            if (
+                                live is not None
+                                and ctx.topic_key is None
+                                and cfg.topics.enabled
+                                and _topics_chat_allowed(
+                                    cfg,
+                                    ctx.chat_id,
+                                    scope_chat_ids=state.topics_chat_ids,
+                                )
+                            ):
+                                await cfg.bot.answer_callback_query(
+                                    callback_query_id=update.callback_query_id,
+                                    text="Topic cannot be verified; command not accepted.",
+                                )
+                                return
                             if await live_plugin_blocked(ctx.topic_key):
                                 await cfg.bot.answer_callback_query(
                                     callback_query_id=update.callback_query_id,
@@ -3547,24 +3691,36 @@ async def _run_main_loop_impl(
                                 cfg.bot.answer_callback_query,
                                 update.callback_query_id,
                             )
+                            if await live_plugin_blocked(ctx.topic_key):
+                                await cfg.bot.answer_callback_query(
+                                    callback_query_id=update.callback_query_id,
+                                    text="Pi live topic became busy; command not accepted.",
+                                )
+                                return
+                            if live is not None and ctx.topic_key is not None:
+                                plugin_inflight.add(ctx.topic_key)
                             tg.start_soon(
-                                dispatch_command,
-                                cfg,
-                                callback_msg,
-                                update.data,
-                                command_id,
-                                args_text,
-                                state.running_tasks,
-                                scheduler,
-                                wrap_on_thread_known(
-                                    scheduler.note_thread_known,
-                                    ctx.topic_key,
-                                    ctx.chat_session_key,
-                                    None,
+                                run_guarded_plugin,
+                                ctx.topic_key,
+                                partial(
+                                    dispatch_command,
+                                    cfg,
+                                    callback_msg,
+                                    update.data,
+                                    command_id,
+                                    args_text,
+                                    state.running_tasks,
+                                    scheduler,
+                                    wrap_on_thread_known(
+                                        scheduler.note_thread_known,
+                                        ctx.topic_key,
+                                        ctx.chat_session_key,
+                                        None,
+                                    ),
+                                    ctx.stateful_mode,
+                                    default_engine_override,
+                                    engine_overrides_resolver,
                                 ),
-                                ctx.stateful_mode,
-                                default_engine_override,
-                                engine_overrides_resolver,
                             )
                         else:
                             tg.start_soon(

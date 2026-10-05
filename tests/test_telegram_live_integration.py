@@ -627,6 +627,7 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "bound_plugin_callback",
         "bound_new_during_active",
         "bound_update_after_branch_rebind",
+        "bound_update_mentions",
     ],
 )
 @pytest.mark.parametrize("command_first", [False, True])
@@ -863,6 +864,8 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 await progress_ready.wait()
         if mode == "bound_update_after_branch_rebind":
             await store.set_context(-100, 77, RunContext(project="test", branch="dev"))
+        if mode == "bound_update_mentions":
+            await store.set_trigger_mode(-100, 77, "mentions")
         if mode == "bound_plugin_callback":
             from takopi.telegram.types import TelegramCallbackQuery
 
@@ -881,7 +884,9 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 chat_id=-100,
                 thread_id=77,
                 message_id=2,
-                text="/spy change"
+                text="/update Используй синий"
+                if mode == "bound_update_mentions"
+                else "/spy change"
                 if mode == "bound_plugin_command"
                 else "/new"
                 if mode == "bound_new_during_active"
@@ -954,7 +959,14 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 with anyio.fail_after(1):
                     if slow_quick:
                         await quick_entered.wait()
-                    await cancel_entered.wait()
+                    if slow_quick:
+                        while not cancel_entered.is_set() and not any(
+                            "Cancelling Pi startup" in call["message"].text
+                            for call in transport.send_calls
+                        ):
+                            await anyio.sleep(0.01)
+                    else:
+                        await cancel_entered.wait()
                     if held_steer:
                         await cancel_finished.wait()
                 if slow_quick:
@@ -991,6 +1003,11 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                     assert (
                         await store.get_session_resume(-100, 77, "pi")
                     ) == ResumeToken("pi", str(path))
+                return
+            if mode == "bound_update_mentions":
+                assert [(r.message_id, r.text) for r in pending] == [
+                    (2, "Используй синий")
+                ], "/update must bypass mentions-only filter into the durable inbox"
                 return
             if mode in ("bound_other_project", "unbound_other_project"):
                 assert [(r.message_id, r.text) for r in pending] == (
