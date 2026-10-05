@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path, PurePath
@@ -308,6 +309,29 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         self, prompt: str, resume: ResumeToken | None
     ) -> AsyncIterator[TakopiEvent]:
         return super().run(prompt, resume)
+
+    def shield_subprocess_start(self) -> bool:
+        from .pi_rpc import live_claims_enabled
+
+        return live_claims_enabled()
+
+    @asynccontextmanager
+    async def pre_spawn_scope(
+        self, state: PiStreamState, resume: ResumeToken | None
+    ) -> AsyncIterator[None]:
+        from .pi_rpc import claim_one_shot, live_claims_enabled
+
+        if not live_claims_enabled():
+            yield  # Live opt-in off: preserve legacy one-shot semantics.
+            return
+        from .pi_identity import resolve_legacy_session
+
+        token = state.resume.value
+        path = Path(token)
+        if not path.is_absolute():
+            path = resolve_legacy_session(token, get_run_base_dir() or Path.cwd())
+        async with claim_one_shot(path):
+            yield
 
     def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
         """Create an explicit opt-in RPC owner; the one-shot run remains the default."""

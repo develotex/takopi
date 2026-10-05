@@ -43,6 +43,7 @@ class Receipt:
     marker: str
     state: ReceiptState = "received"
     reason: str | None = None
+    ever_attempted: bool | None = None  # None for pre-migration records: fail closed.
 
     @property
     def id(self) -> ReceiptId:
@@ -86,6 +87,7 @@ class _Record(msgspec.Struct):
     marker: str
     state: ReceiptState
     reason: str | None
+    ever_attempted: bool | None = None
 
 
 class _State(msgspec.Struct):
@@ -372,6 +374,7 @@ class LiveInbox(JsonStateStore[_State]):
                 uuid4().hex,
                 "received",
                 None,
+                False,
             )
             self._state.receipts.append(item)
             self._state.next_sequence += 1
@@ -484,6 +487,28 @@ class LiveInbox(JsonStateStore[_State]):
             reason=reason,
             from_states=("received", "submitted"),
         )
+
+    async def mark_attempted(self, receipt_id: ReceiptId) -> Receipt:
+        """Persist possible Pi acceptance *before* the RPC command is written."""
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = self._required(receipt_id)
+            if item.state not in ("received", "uncertain"):
+                raise ValueError("Receipt not pending for Pi submission")
+            item.ever_attempted = True
+            self._save_locked()
+            return _receipt(item)
+
+    async def mark_local_pending(self, receipt_id: ReceiptId) -> Receipt:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = self._required(receipt_id)
+            if item.state != "uncertain":
+                raise ValueError("Local follow-up is no longer pending")
+            if item.ever_attempted is False:
+                item.reason = "Only locally queued; not submitted to Pi"
+                self._save_locked()
+            return _receipt(item)
 
     async def mark_submitted(self, receipt_id: ReceiptId) -> Receipt:
         return await self._transition(

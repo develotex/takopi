@@ -38,6 +38,7 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "other_bound_short",
         "header_mismatch",
         "header_absent",
+        "bound_bypass",
     ],
 )
 async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent_fifo(
@@ -52,13 +53,18 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         -100, 77, 1, str(path), "Build original task", str(tmp_path)
     )
     await inbox.mark_initial_uncertain(initial.id, initial.session_key)
-    update = await inbox.receive(-100, 77, 2, str(path), "Use green")
+    update = (
+        None
+        if case == "bound_bypass"
+        else await inbox.receive(-100, 77, 2, str(path), "Use green")
+    )
     if case in (
         "after_file_unobserved",
         "after_file_observed",
         "owner_conflict",
         "other_bound",
         "other_bound_short",
+        "bound_bypass",
     ):
         path.parent.mkdir()
         path.write_text(
@@ -115,7 +121,7 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
                     + "\n"
                 )
             self.entries.append({"role": "user", "content": prompt})
-            if prompt == await inbox.delivery_text(update.id):
+            if update is not None and prompt == await inbox.delivery_text(update.id):
                 self.entries.append(
                     {
                         "role": "assistant",
@@ -173,6 +179,10 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
                 engine="pi", value=str(path) if case == "other_bound" else ident[:12]
             ),
         )
+    if case == "bound_bypass":
+        await store.set_session_resume(
+            -100, 77, ResumeToken(engine="pi", value=str(path))
+        )
     transport = FakeTransport()
     cfg = TelegramBridgeConfig(
         bot=FakeBot(),
@@ -195,7 +205,9 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
             chat_id=-100,
             thread_id=78 if case == "wrong_topic" else 77,
             message_id=50,
-            text="/update retry-initial 1 confirm",
+            text="Another task"
+            if case == "bound_bypass"
+            else "/update retry-initial 1 confirm",
             reply_to_message_id=None,
             reply_to_text=None,
             sender_id=123,
@@ -206,6 +218,7 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
     assert current is not None
     if case in ("header_mismatch", "header_absent"):
         assert current.state == "uncertain"
+        assert update is not None
         assert (await inbox.get(update.id)).state == "uncertain"
         assert len(rpc.prompts) == 1
         assert await store.get_session_resume(-100, 77, "pi") is None
@@ -213,15 +226,22 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
             "header" in item["message"].text.lower() for item in transport.send_calls
         )
         return
-    if case in ("wrong_topic", "owner_conflict", "other_bound", "other_bound_short"):
+    if case in (
+        "wrong_topic",
+        "owner_conflict",
+        "other_bound",
+        "other_bound_short",
+        "bound_bypass",
+    ):
         assert current.state == "uncertain"
         assert not rpc.prompts
-        if case in ("wrong_topic", "other_bound", "other_bound_short"):
+        if case in ("wrong_topic", "other_bound", "other_bound_short", "bound_bypass"):
             assert not rpc.calls
         else:
             assert "get_state" in rpc.calls
         return
     assert current.state == "completed"
+    assert update is not None
     assert (await inbox.get(update.id)).state == "considered"
     assert len(rpc.prompts) == 2
     if case == "after_file_observed":

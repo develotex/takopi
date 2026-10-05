@@ -34,6 +34,8 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "retry_fifo",
         "retry_cancel",
         "finalize_order",
+        "closing_unresolved",
+        "poll_recovery",
         "observed",
         "conflict",
         "wrong_topic",
@@ -101,7 +103,8 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
             self.prompts.append(prompt)
             assert resume == (
                 ResumeToken(engine="pi", value=str(session))
-                if len(self.prompts) == 1 or case == "finalize_order"
+                if len(self.prompts) == 1
+                or case in ("finalize_order", "closing_unresolved")
                 else None
             )
             self._active = True
@@ -109,13 +112,14 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
             self.started.set()
             if case in ("retry_fifo", "retry_cancel"):
                 await self.release.wait()
-            self.entries.append({"role": "user", "content": prompt})
-            self.entries.append(
-                {
-                    "role": "assistant",
-                    "content": f"[takopi-considered:{receipt.marker}] Applied green to the task.",
-                }
-            )
+            if case != "closing_unresolved":
+                self.entries.append({"role": "user", "content": prompt})
+                self.entries.append(
+                    {
+                        "role": "assistant",
+                        "content": f"[takopi-considered:{receipt.marker}] Applied green to the task.",
+                    }
+                )
             self._active = False
             yield CompletedEvent(
                 engine="pi",
@@ -196,7 +200,11 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
             self.held = False
 
         async def send(self, *, channel_id, message, options=None):
-            if "Final with green" in message.text and not self.held:
+            if (
+                "Final with green" in message.text
+                or "Live update delivery is uncertain" in message.text
+                or (case == "poll_recovery" and "inspecting canonical" in message.text)
+            ) and not self.held:
                 self.held = True
                 self.final_entered.set()
                 await self.final_release.wait()
@@ -205,7 +213,11 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
             )
 
     held_transport = HeldFinalTransport()
-    transport = held_transport if case == "finalize_order" else FakeTransport()
+    transport = (
+        held_transport
+        if case in ("finalize_order", "closing_unresolved", "poll_recovery")
+        else FakeTransport()
+    )
     cfg = TelegramBridgeConfig(
         bot=FakeBot(),
         runtime=runtime,
@@ -247,8 +259,26 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
             reply_to_text=None,
             sender_id=123,
         )
-        if case in ("retry_fifo", "retry_cancel", "finalize_order"):
-            if case == "finalize_order":
+        if case == "poll_recovery":
+            emitted.set()  # polling must advance even while retry ACK is held
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=78,
+                message_id=51,
+                text="Unrelated topic",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            await held_transport.final_release.wait()
+        if case in (
+            "retry_fifo",
+            "retry_cancel",
+            "finalize_order",
+            "closing_unresolved",
+        ):
+            if case in ("finalize_order", "closing_unresolved"):
                 await held_transport.final_entered.wait()
             else:
                 await rpc.started.wait()
@@ -261,7 +291,7 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
                     "Use blue"
                     if case == "retry_fifo"
                     else "Next task"
-                    if case == "finalize_order"
+                    if case in ("finalize_order", "closing_unresolved")
                     else "/cancel"
                 ),
                 reply_to_message_id=50 if case == "retry_cancel" else None,
@@ -271,18 +301,26 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
                 sender_id=123,
             )
             emitted.set()
-            if case == "finalize_order":
+            if case in ("finalize_order", "closing_unresolved"):
                 await held_transport.final_release.wait()
             else:
                 await rpc.release.wait()
 
-    if case in ("retry_fifo", "retry_cancel", "finalize_order"):
+    if case in (
+        "retry_fifo",
+        "retry_cancel",
+        "finalize_order",
+        "closing_unresolved",
+        "poll_recovery",
+    ):
         async with anyio.create_task_group() as tg:
             tg.start_soon(run_main_loop, cfg, poller)
             try:
-                with anyio.fail_after(2):
+                with anyio.fail_after(1.5 if case == "poll_recovery" else 2):
                     await emitted.wait()
-                    if case == "retry_fifo":
+                    if case == "poll_recovery":
+                        assert not held_transport.final_release.is_set()
+                    elif case == "retry_fifo":
                         pending = await inbox.pending(str(session))
                         assert [r.text for r in pending] == ["Use green", "Use blue"]
                         assert [r.state for r in pending] == ["uncertain", "received"]
@@ -294,6 +332,35 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
                         while len(rpc.prompts) < 2:
                             await anyio.sleep(0.01)
                         assert rpc.prompts[1].endswith("Use blue")
+                    elif case == "closing_unresolved":
+                        assert len(rpc.prompts) == 1
+                        assert (await inbox.get(receipt.id)).state == "uncertain"
+                        await anyio.sleep(0.1)
+                        assert not any(
+                            call["message"]
+                            .text.lower()
+                            .startswith(("queued ·", "starting ·"))
+                            and call["options"] is not None
+                            and call["options"].reply_to is not None
+                            and call["options"].reply_to.message_id == 51
+                            for call in transport.send_calls
+                        ), "closing owner must reject new prompt before queued progress"
+                        held_transport.final_release.set()
+                        await anyio.sleep(0.1)
+                        assert len(rpc.prompts) == 1, (
+                            "unresolved receipt must block new writable prompt"
+                        )
+                        assert not any(
+                            call["message"]
+                            .text.lower()
+                            .startswith(("queued ·", "starting ·"))
+                            and call["options"] is not None
+                            and call["options"].reply_to is not None
+                            and call["options"].reply_to.message_id == 51
+                            for call in transport.send_calls
+                        ), (
+                            "new task must not claim queued while an earlier receipt blocks it"
+                        )
                     elif case == "finalize_order":
                         assert len(rpc.prompts) == 1, (
                             "new job must wait for final rendering"
@@ -307,7 +374,7 @@ async def test_idle_restart_retry_uses_exact_canonical_owner_and_first_marker(
                         assert rpc.prompts[0] == await inbox.delivery_text(receipt.id)
             finally:
                 rpc.release.set()
-                if case == "finalize_order":
+                if case in ("finalize_order", "closing_unresolved", "poll_recovery"):
                     held_transport.final_release.set()
                 tg.cancel_scope.cancel()
         return

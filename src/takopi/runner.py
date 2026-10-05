@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 from weakref import WeakValueDictionary
@@ -593,10 +594,27 @@ class JsonlSubprocessRunner(BaseRunner):
             ):
                 yield evt
 
+    def shield_subprocess_start(self) -> bool:
+        return False
+
+    @asynccontextmanager
+    async def pre_spawn_scope(
+        self, state: Any, resume: ResumeToken | None
+    ) -> AsyncIterator[None]:
+        """Runner-specific ownership before child creation; no-op by default."""
+        yield
+
     async def run_impl(
         self, prompt: str, resume: ResumeToken | None
     ) -> AsyncIterator[TakopiEvent]:
         state = self.new_state(prompt, resume)
+        async with self.pre_spawn_scope(state, resume):
+            async for event in self._run_with_state(prompt, resume, state):
+                yield event
+
+    async def _run_with_state(
+        self, prompt: str, resume: ResumeToken | None, state: Any
+    ) -> AsyncIterator[TakopiEvent]:
         self.start_run(prompt, resume, state=state)
 
         tag = self.tag()
@@ -616,6 +634,7 @@ class JsonlSubprocessRunner(BaseRunner):
 
         async with manage_subprocess(
             cmd,
+            shield_start=self.shield_subprocess_start(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -187,6 +187,11 @@ class TopicStateStore(JsonStateStore[_TopicState]):
                 if entry is None or not (
                     entry.resume == resume
                     or (
+                        Path(entry.resume).is_absolute()
+                        and Path(resume).is_absolute()
+                        and Path(entry.resume).resolve() == Path(resume).resolve()
+                    )
+                    or (
                         session_id is not None
                         and re.fullmatch(r"[a-fA-F0-9-]{8,36}", entry.resume)
                         is not None

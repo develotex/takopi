@@ -15,8 +15,10 @@ async def test_session_owners_includes_short_id_aliases(tmp_path) -> None:
     await store.set_session_resume(
         1, 12, ResumeToken(engine="pi", value="deadbeef0000")
     )
-    assert await store.session_owners("pi", path, ident) == {(1, 10), (1, 11)}
-    assert await store.session_owners("pi", path) == {(1, 11)}
+    alias = path.replace("/session.jsonl", "/./session.jsonl")
+    await store.set_session_resume(1, 13, ResumeToken(engine="pi", value=alias))
+    assert await store.session_owners("pi", path, ident) == {(1, 10), (1, 11), (1, 13)}
+    assert await store.session_owners("pi", path) == {(1, 11), (1, 13)}
 
 
 @pytest.mark.anyio

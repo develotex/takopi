@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import anyio
 import pytest
 
 from takopi.telegram.live_conversation import LiveConversationService, LiveOwner
@@ -153,7 +154,37 @@ async def test_initial_intent_restart_notice_has_id_but_never_replays_prompt(
 
 
 @pytest.mark.anyio
-async def test_recovery_notice_and_scoped_user_deferral_after_restart(tmp_path: Path):
+async def test_quick_reply_failure_does_not_kill_bounded_owner_worker(tmp_path: Path):
+    answered = anyio.Event()
+    replies: list[int] = []
+
+    async def answer(_question: str, _snapshot: str) -> str:
+        return "Working"
+
+    async def reply(_chat: int, _thread: int, message: int, _text: str) -> None:
+        if message == 100:
+            raise ConnectionError("first Telegram response failed")
+        replies.append(message)
+        answered.set()
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "inbox.json"), answer, reply)
+    owner = LiveOwner(1, 10, "/sessions/a.jsonl", Main(), "write tests")
+    assert svc.register(owner)
+    async with anyio.create_task_group() as tg:
+        svc.attach_workers(tg)
+        await svc.handle(1, 10, 100, owner.session_key, "How is progress?")
+        await svc.handle(1, 10, 101, owner.session_key, "How is progress now?")
+        with anyio.fail_after(1):
+            await answered.wait()
+        assert replies == [101]
+        svc.unregister(owner)
+        svc.stop_workers()
+
+
+@pytest.mark.anyio
+async def test_recovery_notice_and_scoped_ambiguous_deferral_refusal_after_restart(
+    tmp_path: Path,
+):
     path = tmp_path / "inbox.json"
     inbox = LiveInbox(path)
     receipt = await inbox.receive(1, 10, 33, "exact-a", "private update")
@@ -178,7 +209,8 @@ async def test_recovery_notice_and_scoped_user_deferral_after_restart(tmp_path: 
     assert await restarted.recover_receipt(
         1, 10, 99, "exact-a", "defer 33 user chose skip"
     )
-    assert (await inbox.get(receipt.id)).state == "deferred"
+    assert (await inbox.get(receipt.id)).state == "uncertain"
+    assert "refused" in replies[-1][3].lower()
 
 
 @pytest.mark.anyio

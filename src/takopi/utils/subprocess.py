@@ -71,9 +71,13 @@ async def manage_subprocess(
     cmd: Sequence[str], **kwargs: Any
 ) -> AsyncIterator[Process]:
     """Ensure subprocesses receive SIGTERM, then SIGKILL after a 2s timeout."""
+    shield_start = kwargs.pop("shield_start", False)
     if os.name == "posix":
         kwargs.setdefault("start_new_session", True)
-    proc = await anyio.open_process(cmd, **kwargs)
+    # Do not release a session claim while cancellation can strand a newly
+    # spawned child before its process handle is available for reaping.
+    with anyio.CancelScope(shield=shield_start):
+        proc = await anyio.open_process(cmd, **kwargs)
     try:
         yield proc
     finally:

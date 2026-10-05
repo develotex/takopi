@@ -19,7 +19,9 @@ This document captures current behavior so transport changes stay intentional.
 ## Pi live conversation (opt-in)
 
 Set `pi_live_conversation = true` under `[transports.telegram]` and enable Telegram
-`topics`. New Pi tasks in a bound topic use one owned Pi RPC session. Existing
+`topics`. New Pi tasks in a bound topic use one owned Pi RPC session. Pi RPC and
+one-shot subprocesses in this Takopi process share a canonical pre-spawn claim;
+this does **not** fence independent external Pi/Takopi processes. Existing
 topics with an absolute JSONL Pi session path can resume live when that exact
 path is bound to the topic and the file exists. Abbreviated legacy Pi IDs can
 migrate in the same topic: resolve one header-matched session in the current
@@ -31,7 +33,11 @@ Other engines and inactive topics without unresolved live receipts keep their
 current queue behavior. This requires a writable Takopi config directory for
 `telegram_live_inbox.json` and `pi-live-sessions/`. A new topic's initial Pi prompt
 and provisional canonical path are stored before forward debounce or any follow-up
-acknowledgement, so rapid messages cannot replace the original instruction. Pi can
+acknowledgement, so rapid messages cannot replace the original instruction. An
+eligible forwarded-message burst is switched to legacy one-shot **before** submitting
+the initial Pi prompt, only if no dependent live updates were accepted; otherwise
+the forward is explicitly refused. Document-caption and voice prompts use legacy
+one-shot routing rather than claiming an incomplete live initial intent. Pi can
 return a canonical ID/path from `get_state` before it creates the new JSONL;
 that identity is provisional until the full ID and project header match. Takopi
 will not bind the topic, attest delivery, or publish a successful final result
@@ -55,12 +61,17 @@ command accepted it, not that Pi read it. **Delivered** requires observation of
 the exact user message in the main Pi stream. **Considered/deferred** requires an
 explicit main-agent marker and explanation; no marker means no consideration claim.
 If a command response is lost, the receipt stays **uncertain** and blocks later
-submissions in that session. Locally queued follow-ups also remain uncertain until
-the continuation prompt starts; a successful final answer is not published while
+submissions in that session. A queued steer can still execute later (for example,
+after a tool returns), so `/update defer` refuses submitted receipts and uncertain
+receipts whose Pi acceptance cannot be disproved. Only a provably local follow-up
+still queued in this running owner can be withdrawn; after restart that proof is
+lost and explicit deferral is refused. Locally queued follow-ups also remain
+uncertain until the continuation prompt starts; a successful final answer is not published while
 any receipt remains unresolved. On restart, a scoped notice lists the receipt ID
-and state without repeating private text. No automatic retry occurs. To explicitly
-skip a receipt, use `/update defer <original-message-id> <reason>` in its topic;
-this does not prove Pi never applied it. To retry, use
+and state without repeating private text. No automatic retry occurs. To withdraw a
+not-yet-submitted receipt, use `/update defer <original-message-id> <reason>` in its
+topic; refusal means Pi may already have accepted it, and no local status change
+can retract Pi's queue. To retry, use
 `/update retry <original-message-id> confirm` in that same bound topic. If idle,
 Takopi claims the canonical RPC owner, verifies session identity and project, and
 inspects the main-session messages before submitting the exact original marked
@@ -79,7 +90,8 @@ project/topic to inspect the canonical session, then explicitly restart the orig
 prompt if absent or continue from its observed state if present. Explicit retry can
 repeat tool effects; an unknown outcome is never treated as proof of non-acceptance.
 Use `/update defer-initial <original-message-id> <reason>` to abandon that initial
-task; any dependent receipts still require separate reconciliation or deferral.
+task; any dependent receipts still require separate reconciliation. An uncertain
+receipt cannot be marked deferred without proof that Pi never accepted it.
 Wrong project, conflicting topic owner, or unverifiable session refuses retry.
 
 ## Incoming messages

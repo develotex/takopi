@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import re
 import tempfile
 
 import anyio
+from anyio.abc import TaskGroup
 from pathlib import Path
 from uuid import uuid4
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -20,8 +19,13 @@ from ..model import ActionEvent, CompletedEvent, ResumeToken, StartedEvent, Tako
 from ..runner_bridge import RunningTask
 from ..transport import MessageRef
 from ..runners.pi_rpc import PiRpcClient, PiRpcRun
-from ..runners.pi import _default_session_dir
+from ..runners.pi_identity import (
+    session_header as _session_header,
+    resolve_legacy_session,
+)
 from .live_inbox import InitialIntent, LiveInbox, Receipt
+
+__all__ = ["resolve_legacy_session"]
 
 logger = logging.getLogger(__name__)
 
@@ -32,55 +36,6 @@ def live_session_path(config_path: Path, chat_id: int, thread_id: int) -> Path:
         / "pi-live-sessions"
         / f"{chat_id}-{thread_id}-{uuid4().hex}.jsonl"
     ).resolve()
-
-
-def _session_header(path: Path) -> dict | None:
-    try:
-        with path.open("rb") as handle:
-            line = handle.readline(8193)
-        if len(line) > 8192 or not line.endswith(b"\n"):
-            return None
-        header = json.loads(line)
-        return (
-            header
-            if isinstance(header, dict) and header.get("type") == "session"
-            else None
-        )
-    except (OSError, UnicodeError, ValueError):
-        return None
-
-
-def resolve_legacy_session(partial_id: str, cwd: Path) -> Path:
-    """Find one local project session without launching an alias-keyed writer.
-
-    The selected canonical path is only a candidate. The RPC owner's get_state
-    must validate the actual identity under its canonical-path lock before prompt.
-    """
-    if re.fullmatch(r"[a-fA-F0-9-]{8,36}", partial_id) is None:
-        raise ValueError("Invalid Pi session ID prefix")
-    project = cwd.resolve()
-    configured = os.environ.get("PI_CODING_AGENT_SESSION_DIR")
-    directory = (
-        Path(configured).expanduser() if configured else _default_session_dir(project)
-    ).resolve()
-    matches: set[Path] = set()
-    if directory.is_dir():
-        for file in directory.glob("*.jsonl"):
-            path = file.resolve()
-            if path.parent != directory or not file.is_file():
-                continue
-            header = _session_header(path)
-            if (
-                header is not None
-                and isinstance(header.get("id"), str)
-                and header["id"].lower().startswith(partial_id.lower())
-                and isinstance(header.get("cwd"), str)
-                and Path(header["cwd"]).resolve() == project
-            ):
-                matches.add(path)
-    if len(matches) != 1:
-        raise ValueError("Pi session ID not uniquely found in this project")
-    return matches.pop()
 
 
 def legacy_session_busy(
@@ -327,13 +282,19 @@ class LiveRunner:
             self._inflight_followup = queued_text
             next_resume = None
 
-    async def steer(self, text: str) -> str:
+    async def steer(
+        self,
+        text: str,
+        before_rpc: Callable[[], Awaitable[None]] | None = None,
+    ) -> str:
         # Never await StartedEvent here: the Telegram poller must remain responsive
         # while the initial RPC prompt is still acquiring its session identity.
-        if not self.rpc._active:
+        if not self.rpc._active or not getattr(self.rpc, "_prompt_started", True):
             # The streaming owner, not this caller, renders the continuation.
             self._followups.append(text)
             return "local_pending"
+        if before_rpc is not None:
+            await before_rpc()
         return await self.rpc.steer(text)
 
     async def get_messages(self) -> list[dict]:
@@ -359,6 +320,16 @@ class LiveOwner:
     task: str
     progress: str = "The main task is still running; a pending tool or child has no observed result."
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    accept_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    ack_queue: asyncio.Queue[tuple[int, str]] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=64)
+    )
+    quick_queue: asyncio.Queue[tuple[int, str]] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=16)
+    )
+    ack_event: asyncio.Event = field(default_factory=asyncio.Event)
+    quick_event: asyncio.Event = field(default_factory=asyncio.Event)
+    drain_event: asyncio.Event = field(default_factory=asyncio.Event)
     quick_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
     closing: bool = False
     public_output: str = ""
@@ -479,6 +450,94 @@ class LiveConversationService:
         self._reply = reply
         self._timeout = quick_timeout
         self._owners: dict[tuple[int, int, str], LiveOwner] = {}
+        self._quick_global = asyncio.Semaphore(4)
+        self._worker_tg: TaskGroup | None = None
+        self._startup_notices: asyncio.Queue[tuple[int, int, int, str]] = asyncio.Queue(
+            maxsize=128
+        )
+        self._startup_notify = asyncio.Event()
+        self._worker_stopping = False
+
+    def stop_workers(self) -> None:
+        self._worker_stopping = True
+        self._startup_notify.set()
+
+    def attach_workers(self, task_group: TaskGroup) -> None:
+        self._worker_tg = task_group
+        task_group.start_soon(self._startup_ack_worker)
+        for owner in self._owners.values():
+            self._start_workers(owner)
+
+    async def _startup_reply(
+        self, chat: int, thread: int, message: int, text: str
+    ) -> None:
+        if self._worker_tg is None:
+            await self._reply(chat, thread, message, text)
+            return
+        try:
+            self._startup_notices.put_nowait((chat, thread, message, text))
+            self._startup_notify.set()
+        except asyncio.QueueFull:
+            logger.warning("Startup ACK queue full; receipt remains durable")
+
+    async def _startup_ack_worker(self) -> None:
+        while True:
+            await self._startup_notify.wait()
+            self._startup_notify.clear()
+            while not self._startup_notices.empty():
+                chat, thread, message, text = self._startup_notices.get_nowait()
+                try:
+                    with anyio.fail_after(5):
+                        await self._reply(chat, thread, message, text)
+                except Exception:  # noqa: BLE001 - intake and notification stay independent
+                    logger.warning("Startup ACK failed; receipt remains durable")
+            if self._worker_stopping:
+                return
+
+    def _start_workers(self, owner: LiveOwner) -> None:
+        if self._worker_tg is None:
+            return
+        self._worker_tg.start_soon(self._ack_worker, owner)
+        self._worker_tg.start_soon(self._drain_worker, owner)
+        self._worker_tg.start_soon(self._quick_worker, owner)
+
+    async def _ack_worker(self, owner: LiveOwner) -> None:
+        while self.owner(owner.chat_id, owner.thread_id, owner.session_key) is owner:
+            await owner.ack_event.wait()
+            owner.ack_event.clear()
+            while not owner.ack_queue.empty():
+                message, text = owner.ack_queue.get_nowait()
+                try:
+                    with anyio.fail_after(5):
+                        await self._reply(owner.chat_id, owner.thread_id, message, text)
+                except Exception:  # noqa: BLE001 - receipt remains durable if ACK fails
+                    logger.warning("Live receipt ACK failed; receipt remains durable")
+
+    async def _quick_worker(self, owner: LiveOwner) -> None:
+        while self.owner(owner.chat_id, owner.thread_id, owner.session_key) is owner:
+            await owner.quick_event.wait()
+            owner.quick_event.clear()
+            while not owner.quick_queue.empty():
+                message, question = owner.quick_queue.get_nowait()
+                try:
+                    with anyio.fail_after(self._timeout + 5):
+                        await self._answer_question(
+                            owner, owner.chat_id, owner.thread_id, message, question
+                        )
+                except Exception:  # noqa: BLE001 - later questions remain available
+                    logger.warning(
+                        "Live quick-answer reply failed; later questions remain queued"
+                    )
+
+    async def _drain_worker(self, owner: LiveOwner) -> None:
+        while self.owner(owner.chat_id, owner.thread_id, owner.session_key) is owner:
+            await owner.drain_event.wait()
+            owner.drain_event.clear()
+            try:
+                async with owner.lock:
+                    await self._drain_locked(owner)
+            except Exception:  # noqa: BLE001 - uncertain receipts are never replayed silently
+                logger.warning("Live delivery worker failed; receipts remain durable")
 
     def register(self, owner: LiveOwner) -> bool:
         key = (owner.chat_id, owner.thread_id, owner.session_key)
@@ -488,12 +547,16 @@ class LiveConversationService:
         ):
             return False
         self._owners[key] = owner
+        self._start_workers(owner)
         return True
 
     def unregister(self, owner: LiveOwner) -> None:
         key = (owner.chat_id, owner.thread_id, owner.session_key)
         if self._owners.get(key) is owner:
             del self._owners[key]
+            owner.ack_event.set()
+            owner.quick_event.set()
+            owner.drain_event.set()
 
     def owner(self, chat: int, thread: int, session: str) -> LiveOwner | None:
         return self._owners.get((chat, thread, session))
@@ -513,21 +576,21 @@ class LiveConversationService:
         question, update = _classify(text)
         if update:
             receipt = await self.inbox.receive(chat, thread, message, session, update)
-            await self._reply(
+            await self._startup_reply(
                 chat,
                 thread,
                 message,
                 f"Instruction stored ({receipt.state}); Pi startup pending, not yet considered.",
             )
         if question:
-            await self._reply(
+            await self._startup_reply(
                 chat,
                 thread,
                 message,
                 "Pi is starting; no main-task progress has been observed yet.",
             )
         if question is None and update is None:
-            await self._reply(
+            await self._startup_reply(
                 chat,
                 thread,
                 message,
@@ -670,7 +733,7 @@ class LiveConversationService:
                     receipt.message_id,
                     f"Receipt #{receipt.message_id}: {receipt.state}; outcome not confirmed after restart. "
                     "Pi may have applied it. No automatic retry. Duplicate effects possible. "
-                    f"In this topic use /update defer {receipt.message_id} <reason> to explicitly skip; "
+                    "Uncertain Pi-accepted instructions cannot be deferred without proof they stayed local. "
                     f"/update retry {receipt.message_id} confirm starts a canonical-owner inspection before any retry prompt.",
                 )
             except Exception as exc:  # noqa: BLE001 - one topic must not stop polling others
@@ -708,12 +771,22 @@ class LiveConversationService:
             owner = self.owner(chat, thread, session)
 
             async def do_defer() -> bool:
+                latest = await self.inbox.get(receipt_id)
+                if latest.state == "submitted":
+                    return False  # Pi accepted this steer; its queue is not locally removable.
+                if latest.state == "uncertain" and (
+                    latest.ever_attempted is not False
+                    or latest.reason != "Only locally queued; not submitted to Pi"
+                    or owner is None
+                    or not isinstance(owner.main, LiveRunner)
+                    or (await self.inbox.delivery_text(receipt_id))
+                    not in owner.main._followups
+                ):
+                    return False  # An uncertain RPC outcome cannot be withdrawn safely.
                 if owner is not None and isinstance(owner.main, LiveRunner):
                     delivery = await self.inbox.delivery_text(receipt_id)
                     if owner.main._inflight_followup == delivery:
-                        return (
-                            False  # Prompt may be in-flight; cannot promise deferral.
-                        )
+                        return False  # Prompt may already be in flight.
                     owner.main._followups = [
                         item for item in owner.main._followups if item != delivery
                     ]
@@ -738,7 +811,7 @@ class LiveConversationService:
                     chat,
                     thread,
                     message,
-                    "Pi prompt is in flight; deferral refused. Check observed receipt before acting.",
+                    "Pi may already have accepted this instruction; deferral refused. Reconcile the exact main-session receipt first.",
                 )
                 return True
             await self._reply(
@@ -835,6 +908,33 @@ class LiveConversationService:
                 "Уточните вопрос или передайте инструкцию через /update <текст>. (Please clarify.)",
             )
             return True
+        if self._worker_tg is not None:
+            if update:
+                async with owner.accept_lock:
+                    if owner.closing:
+                        return False
+                    receipt = await self.inbox.receive(
+                        chat, thread, message, session, update
+                    )
+                    status = (
+                        "Инструкция получена и сохранена (received); not yet confirmed delivered or considered."
+                        if receipt.state == "received"
+                        else f"Статус инструкции: {receipt.state}; это не означает, что она учтена."
+                    )
+                    try:
+                        owner.ack_queue.put_nowait((message, status))
+                        owner.ack_event.set()
+                    except asyncio.QueueFull:
+                        logger.warning("Live ACK queue full; receipt remains durable")
+                    if receipt.state == "received":
+                        owner.drain_event.set()
+            if question:
+                try:
+                    owner.quick_queue.put_nowait((message, question))
+                    owner.quick_event.set()
+                except asyncio.QueueFull:
+                    logger.warning("Live quick-answer queue full; main task unchanged")
+            return True
         receipt: Receipt | None = None
         if update:
             async with owner.lock:
@@ -872,7 +972,7 @@ class LiveConversationService:
     ) -> None:
         try:
             async with asyncio.timeout(self._timeout):
-                async with owner.quick_slots:
+                async with self._quick_global, owner.quick_slots:
                     statuses = await self.inbox.for_session(owner.session_key)
                     counts = ", ".join(
                         f"{state}: {sum(r.state == state for r in statuses)}"
@@ -909,7 +1009,16 @@ class LiveConversationService:
             receipt.id, "RPC outcome may be unknown until main-session observation"
         )
         try:
-            result = await owner.main.steer(await self.inbox.delivery_text(receipt.id))
+            delivery = await self.inbox.delivery_text(receipt.id)
+            if isinstance(owner.main, LiveRunner):
+                result = await owner.main.steer(
+                    delivery, before_rpc=lambda: self.inbox.mark_attempted(receipt.id)
+                )
+            else:
+                await self.inbox.mark_attempted(receipt.id)
+                result = await owner.main.steer(delivery)
+            if result == "local_pending":
+                await self.inbox.mark_local_pending(receipt.id)
             if result not in ("queued", "handled", "local_pending"):
                 raise RuntimeError("invalid RPC disposition")
             if result != "local_pending":
@@ -949,6 +1058,10 @@ class LiveConversationService:
             await self._drain_locked(owner)
 
     async def finalize(self, owner: LiveOwner) -> bool:
+        # Establish the intake boundary before a long RPC observation. Never
+        # hold the acceptance mutex while waiting for Pi or Telegram network.
+        async with owner.accept_lock:
+            owner.closing = True
         async with owner.lock:
             try:
                 await self._reconcile_locked(owner)
@@ -958,6 +1071,10 @@ class LiveConversationService:
                 return False
             await self._drain_locked(owner)
             if isinstance(owner.main, LiveRunner) and owner.main._followups:
+                async with owner.accept_lock:
+                    owner.closing = (
+                        False  # The same owner must drain local continuations.
+                    )
                 return True
             pending = await self.inbox.pending(owner.session_key)
             owner.closing = True

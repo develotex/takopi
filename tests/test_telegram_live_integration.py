@@ -7,7 +7,7 @@ from takopi.telegram.live_conversation import (
     LiveOwner,
     LiveRunner,
 )
-from takopi.telegram.live_inbox import LiveInbox
+from takopi.telegram.live_inbox import LiveInbox, Receipt
 from pathlib import Path
 from typing import cast
 
@@ -273,6 +273,229 @@ async def test_idle_retry_reconciles_canonical_owner_before_explicit_replay(
 
 
 @pytest.mark.anyio
+async def test_final_boundary_cannot_miss_receipt_accepted_during_pending_snapshot(
+    tmp_path: Path,
+):
+    class SnapshotInbox(LiveInbox):
+        def __init__(self, path):
+            super().__init__(path)
+            self.calls = 0
+            self.entered = anyio.Event()
+            self.release = anyio.Event()
+
+        async def pending(self, session_key: str) -> list[Receipt]:
+            self.calls += 1
+            result = await super().pending(session_key)
+            if self.calls == 3:
+                self.entered.set()
+                await self.release.wait()
+            return result
+
+    inbox = SnapshotInbox(tmp_path / "i.json")
+    rpc = FakeRun()
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+
+    async def reply(*_):
+        pass
+
+    async def answer(*_):
+        return "answer"
+
+    svc = LiveConversationService(inbox, answer, reply)
+    owner = LiveOwner(1, 10, str(tmp_path / "s.jsonl"), runner, "task")
+    svc.register(owner)
+    finalized: list[bool] = []
+
+    async def finish():
+        finalized.append(await svc.finalize(owner))
+
+    async with anyio.create_task_group() as tg:
+        svc.attach_workers(tg)
+        tg.start_soon(finish)
+        with anyio.fail_after(1):
+            await inbox.entered.wait()
+        accepted = await svc.handle(1, 10, 33, owner.session_key, "/update Use green")
+        inbox.release.set()
+        with anyio.fail_after(1):
+            while not finalized:
+                await anyio.sleep(0.01)
+        assert not accepted or not finalized[0], (
+            "accepted instruction must not be omitted from a successful final"
+        )
+        svc.unregister(owner)
+        svc.stop_workers()
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_startup_buffer_persists_later_receipts_while_ack_network_is_held(
+    tmp_path: Path,
+):
+    entered = anyio.Event()
+    release = anyio.Event()
+
+    async def reply(*_):
+        entered.set()
+        await release.wait()
+
+    async def answer(*_):
+        return "answer"
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    try:
+        async with anyio.create_task_group() as tg:
+            if hasattr(svc, "attach_workers"):
+                svc.attach_workers(tg)
+            tg.start_soon(svc.buffer_starting, 1, 10, 33, "session", "/update First")
+            with anyio.fail_after(1):
+                await entered.wait()
+            with anyio.fail_after(0.2):
+                await svc.buffer_starting(1, 10, 34, "session", "/update Second")
+            assert [r.text for r in await svc.inbox.pending("session")] == [
+                "First",
+                "Second",
+            ]
+            release.set()
+            tg.cancel_scope.cancel()
+    finally:
+        release.set()
+
+
+@pytest.mark.anyio
+async def test_live_poll_accepts_second_receipt_while_first_steer_is_held(
+    tmp_path: Path,
+):
+    class HeldRun(FakeRun):
+        def __init__(self):
+            super().__init__()
+            self.first_entered = anyio.Event()
+            self.release = anyio.Event()
+
+        async def steer(self, text: str) -> str:
+            self.first_entered.set()
+            await self.release.wait()
+            return "queued"
+
+    rpc = HeldRun()
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+
+    async def reply(_chat, _thread, _msg, _text):
+        pass
+
+    async def answer(*_):
+        return "answer"
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, str(tmp_path / "s.jsonl"), runner, "task")
+    svc.register(owner)
+    try:
+        async with anyio.create_task_group() as tg:
+            if hasattr(svc, "attach_workers"):
+                svc.attach_workers(tg)
+            tg.start_soon(svc.handle, 1, 10, 33, owner.session_key, "/update First")
+            with anyio.fail_after(1):
+                await rpc.first_entered.wait()
+            with anyio.fail_after(0.2):
+                assert await svc.handle(1, 10, 34, owner.session_key, "/update Second")
+            assert (await svc.inbox.get((1, 10, 34))).state == "received"
+            rpc.release.set()
+            tg.cancel_scope.cancel()
+    finally:
+        rpc.release.set()
+        svc.unregister(owner)
+
+
+@pytest.mark.anyio
+async def test_early_rpc_active_flag_does_not_steer_before_initial_prompt_started():
+    class EarlyRpc(FakeRun):
+        def __init__(self):
+            super().__init__()
+            self._active = True
+            self._prompt_started = False
+
+    rpc = EarlyRpc()
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+    assert await runner.steer("first update") == "local_pending"
+    assert runner._followups == ["first update"]
+    assert not rpc.sent
+
+
+@pytest.mark.anyio
+async def test_local_retry_queue_cannot_erase_an_earlier_pi_accepted_submission(
+    tmp_path: Path,
+):
+    rpc = FakeRun()
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+    replies: list[str] = []
+
+    async def reply(_chat, _thread, _msg, text):
+        replies.append(text)
+
+    async def answer(*_):
+        return "answer"
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, str(tmp_path / "s.jsonl"), runner, "task")
+    svc.register(owner)
+    assert await svc.handle(1, 10, 33, owner.session_key, "/update Do X")
+    receipt = await svc.inbox.get((1, 10, 33))
+    assert receipt.state == "submitted" and rpc.sent
+    await svc.inbox.confirm_retry(receipt.id, owner.session_key)
+    rpc._active = False
+    await svc.flush(owner)
+    assert (await svc.inbox.get(receipt.id)).state == "uncertain"
+    assert runner._followups == [await svc.inbox.delivery_text(receipt.id)]
+    assert await svc.recover_receipt(
+        1, 10, 50, owner.session_key, "defer 33 changed mind"
+    )
+    assert (await svc.inbox.get(receipt.id)).state == "uncertain"
+    assert any("refused" in text.lower() for text in replies)
+
+
+@pytest.mark.anyio
+async def test_defer_refuses_pi_accepted_queued_steer_even_before_tool_releases(
+    tmp_path: Path,
+):
+    class QueuedRpc(FakeRun):
+        def __init__(self):
+            super().__init__()
+            self.queued: list[str] = []
+            self.executed: list[str] = []
+
+        async def steer(self, text: str) -> str:
+            self.queued.append(text)
+            return "queued"
+
+        def release_tool(self) -> None:
+            self.executed.extend(self.queued)
+            self.queued.clear()
+
+    rpc = QueuedRpc()
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+    replies: list[str] = []
+
+    async def reply(_chat, _thread, _msg, text):
+        replies.append(text)
+
+    async def answer(*_):
+        return "answer"
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, str(tmp_path / "s.jsonl"), runner, "task")
+    svc.register(owner)
+    assert await svc.handle(1, 10, 33, owner.session_key, "/update Do X")
+    receipt = await svc.inbox.get((1, 10, 33))
+    assert receipt.state == "submitted" and len(rpc.queued) == 1
+    assert await svc.recover_receipt(
+        1, 10, 50, owner.session_key, "defer 33 changed mind"
+    )
+    assert (await svc.inbox.get(receipt.id)).state == "submitted"
+    assert any("refused" in text.lower() for text in replies)
+    rpc.release_tool()
+    assert rpc.executed == [await svc.inbox.delivery_text(receipt.id)]
+
+
+@pytest.mark.anyio
 async def test_explicit_deferral_removes_locally_queued_followup(tmp_path: Path):
     rpc = FakeRun()
     rpc._active = False
@@ -352,7 +575,19 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("mode", ["bound", "legacy", "unbound", "unbound_predebounce"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "bound",
+        "legacy",
+        "unbound",
+        "unbound_predebounce",
+        "unbound_directive_first",
+        "unbound_directive_after",
+        "unbound_forward_after_update",
+        "bound_held_steer_cancel",
+    ],
+)
 @pytest.mark.parametrize("command_first", [False, True])
 async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
     tmp_path: Path,
@@ -361,8 +596,22 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
     command_first: bool,
 ):
     legacy = mode == "legacy"
-    unbound = mode in ("unbound", "unbound_predebounce")
-    predebounce = mode == "unbound_predebounce"
+    unbound = mode in (
+        "unbound",
+        "unbound_predebounce",
+        "unbound_directive_first",
+        "unbound_directive_after",
+        "unbound_forward_after_update",
+    )
+    predebounce = mode in (
+        "unbound_predebounce",
+        "unbound_directive_first",
+        "unbound_directive_after",
+        "unbound_forward_after_update",
+    )
+    held_steer = mode == "bound_held_steer_cancel"
+    steer_entered = anyio.Event()
+    steer_release = anyio.Event()
 
     class HeldRpc(FakeRun):
         def __init__(self, path: Path):
@@ -417,6 +666,12 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             finally:
                 self._active = False
 
+        async def steer(self, text):
+            if held_steer:
+                steer_entered.set()
+                await steer_release.wait()
+            return await super().steer(text)
+
         async def close(self):
             return None
 
@@ -438,13 +693,15 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
     quick_entered = anyio.Event()
     quick_release = anyio.Event()
     cancel_entered = anyio.Event()
+    cancel_finished = anyio.Event()
     original_cancel = loop.handle_cancel
 
     async def trace_cancel(*args):
         cancel_entered.set()
         await original_cancel(*args)
+        cancel_finished.set()
 
-    if slow_quick:
+    if slow_quick or held_steer:
         monkeypatch.setattr(loop, "handle_cancel", trace_cancel)
 
     async def quick(_question: str, _snapshot: str) -> str:
@@ -523,13 +780,13 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             chat_id=-100,
             thread_id=77,
             message_id=1,
-            text="start",
+            text="/test start" if mode == "unbound_directive_first" else "start",
             reply_to_message_id=None,
             reply_to_text=None,
             sender_id=123,
         )
         if not predebounce:
-            if unbound:
+            if unbound or held_steer:
                 await rpc.run_started.wait()
             else:
                 await progress_ready.wait()
@@ -538,22 +795,34 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             chat_id=-100,
             thread_id=77,
             message_id=2,
-            text="/update Используй синий"
+            text="/test Change goal"
+            if mode == "unbound_directive_after"
+            else "/update Используй синий"
             if command_first
             else "Не трогай авторизацию",
             reply_to_message_id=None,
             reply_to_text=None,
             sender_id=123,
         )
+        if held_steer:
+            with anyio.fail_after(2):
+                await steer_entered.wait()
         yield TelegramIncomingMessage(
             transport="telegram",
             chat_id=-100,
             thread_id=77,
             message_id=3,
-            text="Не трогай авторизацию" if command_first else "Как дела?",
+            text="Forwarded source content"
+            if mode == "unbound_forward_after_update"
+            else "Не трогай авторизацию"
+            if command_first
+            else "Как дела?",
             reply_to_message_id=None,
             reply_to_text=None,
             sender_id=123,
+            raw={"forward_origin": {"type": "user"}}
+            if mode == "unbound_forward_after_update"
+            else {},
         )
         if command_first:
             yield TelegramIncomingMessage(
@@ -566,7 +835,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 reply_to_text=None,
                 sender_id=123,
             )
-        if slow_quick:
+        if slow_quick or held_steer:
             yield TelegramIncomingMessage(
                 transport="telegram",
                 chat_id=-100,
@@ -587,20 +856,47 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 await emitted.wait()
                 if predebounce:
                     await rpc.run_started.wait()
-            if slow_quick:
+            if slow_quick or held_steer:
                 with anyio.fail_after(1):
-                    await quick_entered.wait()
+                    if slow_quick:
+                        await quick_entered.wait()
                     await cancel_entered.wait()
-                assert not quick_release.is_set(), (
-                    "cancel must pass a blocked quick responder"
-                )
+                    if held_steer:
+                        await cancel_finished.wait()
+                if slow_quick:
+                    assert not quick_release.is_set(), (
+                        "cancel must pass a blocked quick responder"
+                    )
+                if held_steer:
+                    assert not steer_release.is_set(), (
+                        "cancel must pass a held Pi steer response"
+                    )
             pending = await LiveInbox(resolve_inbox_path(config)).pending(str(rpc.path))
             assert [item.text for item in pending] == (
-                ["Используй синий", "Не трогай авторизацию"]
+                (["Используй синий"] if command_first else ["Не трогай авторизацию"])
+                if mode == "unbound_forward_after_update"
+                else (["Не трогай авторизацию"] if command_first else [])
+                if mode == "unbound_directive_after"
+                else ["Используй синий", "Не трогай авторизацию"]
                 if command_first
                 else ["Не трогай авторизацию"]
             )
-            if predebounce:
+            if mode == "unbound_forward_after_update":
+                assert any(
+                    "forwarded message not accepted" in call["message"].text.lower()
+                    for call in transport.send_calls
+                )
+                assert rpc.prompts[0].endswith("start")
+            elif held_steer:
+                assert pending[0].state in ("uncertain", "received")
+                assert len(rpc.prompts) == 1
+            elif mode == "unbound_directive_after":
+                assert any(
+                    "not accepted" in call["message"].text.lower()
+                    for call in transport.send_calls
+                )
+                assert rpc.prompts[0].endswith("start")
+            elif predebounce:
                 assert [item.state for item in pending] == (
                     ["uncertain", "received"] if command_first else ["uncertain"]
                 )
@@ -636,6 +932,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 assert rpc.sent[1].endswith("Не трогай авторизацию")
         finally:
             quick_release.set()
+            steer_release.set()
             rpc.start_gate.set()
             rpc.release.set()
             tg.cancel_scope.cancel()
