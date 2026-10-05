@@ -14,7 +14,7 @@ from takopi.context import RunContext
 from takopi.markdown import MarkdownPresenter
 from takopi.model import CompletedEvent, ResumeToken, StartedEvent
 from takopi.router import AutoRouter, RunnerEntry
-from takopi.runner_bridge import ExecBridgeConfig
+from takopi.runner_bridge import ExecBridgeConfig, RunningTask
 from takopi.runners.pi import PiRunner
 from takopi.runners.pi_rpc import PiRpcRun
 from takopi.settings import TelegramTopicsSettings
@@ -23,7 +23,7 @@ from takopi.telegram.live_conversation import LiveConversationService
 from takopi.telegram.live_inbox import LiveInbox, resolve_inbox_path
 from takopi.telegram.topic_state import TopicStateStore, resolve_state_path
 from takopi.telegram.types import TelegramIncomingMessage
-from takopi.transport import Transport
+from takopi.transport import MessageRef, Transport
 from takopi.transport_runtime import TransportRuntime
 from tests.telegram_fakes import FakeBot, FakeTransport
 
@@ -47,6 +47,7 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "cancel_root_reply",
         "cancel_original_reply",
         "cancel_verify_fresh_original",
+        "cancel_ambiguous",
     ],
 )
 async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent_fifo(
@@ -56,6 +57,22 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
 ) -> None:
     config = tmp_path / "takopi.toml"
     entered, release = anyio.Event(), anyio.Event()
+    other_task = RunningTask(
+        context=RunContext(project="test"), thread_id=77, user_message_id=999
+    )
+    if case == "cancel_ambiguous":
+        import takopi.telegram.loop as telegram_loop
+
+        original_state = telegram_loop.TelegramLoopState
+
+        def capture_state(*args, **kwargs):
+            state = original_state(*args, **kwargs)
+            state.running_tasks[
+                MessageRef(channel_id=-100, message_id=999, thread_id=77)
+            ] = other_task
+            return state
+
+        monkeypatch.setattr(telegram_loop, "TelegramLoopState", capture_state)
     path = tmp_path / "pi-live-sessions" / f"-100-77-{uuid4().hex}.jsonl"
     ident = uuid4().hex
     inbox = LiveInbox(resolve_inbox_path(config))
@@ -89,6 +106,7 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         "cancel_after_file",
         "cancel_root_reply",
         "cancel_original_reply",
+        "cancel_ambiguous",
     ):
         path.parent.mkdir()
         path.write_text(
@@ -264,6 +282,14 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
     await run_main_loop(cfg, poller)
     current = await inbox.initial_by_id(initial.id)
     assert current is not None
+    if case == "cancel_ambiguous":
+        assert rpc.prompts, "Ambiguous bare /cancel must not select the Pi retry"
+        assert not other_task.cancel_requested.is_set()
+        assert any(
+            "multiple runs are active" in item["message"].text
+            for item in transport.send_calls
+        )
+        return
     if case.startswith("cancel_"):
         assert not rpc.prompts, "Cancelling inspection must not submit a retry prompt"
         assert current.state == "uncertain"

@@ -241,26 +241,8 @@ class PiRpcClient:
         group_safe = os.name != "posix" or proc is None
         try:
             if proc is not None:
-                if proc.stdin is not None:
-                    with suppress(OSError, anyio.ClosedResourceError):
-                        await proc.stdin.aclose()
-                if proc.returncode is None:
-                    try:
-                        with anyio.fail_after(2):
-                            await proc.wait()
-                    except TimeoutError:
-                        if proc.returncode is None:
-                            proc.terminate()
-                        try:
-                            with anyio.fail_after(2):
-                                await proc.wait()
-                        except TimeoutError:
-                            if proc.returncode is None:
-                                proc.kill()
-                            await proc.wait()
-                # Pi can exit while a tool/subagent still holds its session
-                # file open. The RPC claim is not safe to release until its
-                # dedicated POSIX process group is terminated too.
+                # Reap the whole dedicated Pi group before waiting on a parent
+                # whose inherited pipes may be held by a TERM-ignoring tool.
                 if os.name == "posix":
                     with suppress(ProcessLookupError):
                         os.killpg(proc.pid, signal.SIGTERM)
@@ -268,6 +250,20 @@ class PiRpcClient:
                     with suppress(ProcessLookupError):
                         os.killpg(proc.pid, signal.SIGKILL)
                     group_safe = True
+                if proc.stdin is not None:
+                    with suppress(OSError, anyio.ClosedResourceError):
+                        await proc.stdin.aclose()
+                try:
+                    with anyio.fail_after(2):
+                        await proc.wait()
+                except TimeoutError:
+                    # Do not await wait() indefinitely if an escaped child
+                    # retained the pipe: the ownership claim must stay held.
+                    group_safe = False
+                    if proc.returncode is None:
+                        proc.kill()
+                        with anyio.fail_after(2):
+                            await proc.wait()
         finally:
             for task in self._tasks:
                 task.cancel()

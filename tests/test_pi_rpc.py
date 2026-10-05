@@ -387,6 +387,33 @@ async def test_close_reaps_tool_descendants_before_releasing_session(
 
 @pytest.mark.anyio
 @pytest.mark.skipif(os.name != "posix", reason="POSIX inherited pipe")
+async def test_rpc_close_reaps_term_ignoring_parent_and_inherited_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.setattr(pi_rpc, "_PI_COMMAND", sys.executable)
+    script = (
+        "import signal,subprocess,sys,time\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'], "
+        "stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=subprocess.DEVNULL)\n"
+        "while True:time.sleep(.1)\n"
+    )
+    path = tmp_path / "session.jsonl"
+    client = PiRpcClient(path, tmp_path, ["-c", script])
+    await client.start()
+    await asyncio.sleep(0.1)
+    async with asyncio.timeout(3):
+        await client.close()
+    assert client._proc is not None and client._proc.returncode is not None
+    replacement = PiRpcClient(path, tmp_path, ["-c", "pass"])
+    await replacement.start()  # Released only after the group was reaped.
+    await replacement.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX inherited pipe")
 async def test_rpc_parent_exit_detected_while_tool_inherits_stdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

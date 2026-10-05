@@ -699,6 +699,8 @@ class ForwardCoalescer:
                 await self._sleep(self._debounce_s)
         except anyio.get_cancelled_exc_class():
             return
+        if pending.forward_barrier is not None:
+            await pending.forward_barrier.wait()
         if self._pending.get(key) is not pending:
             return
         self._pending.pop(key, None)
@@ -2854,6 +2856,22 @@ async def _run_main_loop_impl(
                             )
                         ):
                             candidates.append(owner.running_task)
+                        if (
+                            cancel_reply_id is None
+                            and candidates
+                            and any(
+                                ref.channel_id == chat_id
+                                and task.thread_id == topic_key[1]
+                                and all(
+                                    task is not candidate for candidate in candidates
+                                )
+                                for ref, task in state.running_tasks.items()
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the progress message to cancel one."
+                            )
+                            return
                         if len(candidates) == 1:
                             candidates[0].cancel_requested.set()
                             await reply(
@@ -2943,6 +2961,19 @@ async def _run_main_loop_impl(
                                 or cancel_reply_id in (command, original)
                             )
                         ]
+                        if (
+                            cancel_reply_id is None
+                            and recovery_pending
+                            and any(
+                                ref.channel_id == chat_id
+                                and task.thread_id == topic_key[1]
+                                for ref, task in state.running_tasks.items()
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the progress message to cancel one."
+                            )
+                            return
                         if len(recovery_pending) == 1:
                             recovery_pending[0].set()
                             for (chat, thread, command), task in startup_cancel.items():
@@ -3464,12 +3495,10 @@ async def _run_main_loop_impl(
 
                         async def run_idle_retry(receipt: Receipt) -> None:
                             rpc: PiRpcRun | None = None
+                            token = ResumeToken(engine="pi", value=receipt.session_key)
                             try:
                                 if idle_cancel.is_set():
                                     return
-                                token = ResumeToken(
-                                    engine="pi", value=receipt.session_key
-                                )
                                 entry = cfg.runtime.resolve_runner(
                                     resume_token=token, engine_override="pi"
                                 )
@@ -3904,10 +3933,14 @@ async def _run_main_loop_impl(
                             provisional = live_session_path(
                                 config_path, chat_id, topic_key[1]
                             )
-                            cwd = (
-                                cfg.runtime.resolve_run_cwd(resolved_live.context)
-                                or Path.cwd()
-                            )
+                            try:
+                                cwd = (
+                                    cfg.runtime.resolve_run_cwd(resolved_live.context)
+                                    or Path.cwd()
+                                )
+                            except ConfigError as exc:
+                                await reply(text=f"error: {exc}")
+                                return
                             await live.inbox.receive_initial(
                                 chat_id,
                                 topic_key[1],
