@@ -103,12 +103,12 @@ async def test_forward_debounce_keeps_prompt_available_until_durable_transition(
 
     async with anyio.create_task_group() as tg:
         coalescer = ForwardCoalescer(
-            task_group=tg, debounce_s=0.01, dispatch=dispatch, pending=queued
+            task_group=tg, debounce_s=0.05, dispatch=dispatch, pending=queued
         )
         coalescer.schedule(pending)
         barrier = anyio.Event()
         pending.forward_barrier = barrier
-        await anyio.sleep(0.04)  # Debounce expired during durable rerouting.
+        await anyio.sleep(0.07)  # Old debounce expired during durable rerouting.
         assert queued.get(_forward_key(original)) is pending
         for message_id, text in ((2, "first"), (3, "second")):
             coalescer.attach_forward(
@@ -124,8 +124,12 @@ async def test_forward_debounce_keeps_prompt_available_until_durable_transition(
                     raw={"forward_date": 1},
                 )
             )
-        assert not dispatched
-        barrier.set()
+            if message_id == 2:
+                barrier.set()
+                await anyio.sleep(0.005)
+                assert not dispatched, (
+                    "old barrier waiter must not dispatch first forward early"
+                )
         with anyio.fail_after(1):
             await done.wait()
         assert dispatched == [[(2, "first"), (3, "second")]]

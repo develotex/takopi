@@ -172,6 +172,8 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
         "cancel_queued_resume",
         "two_forward_queued",
         "forward_cancel_callback",
+        "forward_cancel_reply",
+        "dispatching_cancel_peer",
         "queued_progress_fail",
     ],
 )
@@ -208,7 +210,37 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         store = TopicStateStore(resolve_state_path(config))
         await store.set_context(-100, 77, RunContext(project="test"))
         await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
-    if mode == "queued_progress_fail":
+    if mode == "dispatching_cancel_peer":
+        progress_entered, release_progress = anyio.Event(), anyio.Event()
+        peer_forward_attached, release_peer_timer = anyio.Event(), anyio.Event()
+        original_timer = loop.ForwardCoalescer._debounce_prompt_run
+
+        async def held_peer_timer(self, key, pending):
+            if pending.msg.sender_id == 456:
+                await release_peer_timer.wait()
+            await original_timer(self, key, pending)
+
+        monkeypatch.setattr(
+            loop.ForwardCoalescer, "_debounce_prompt_run", held_peer_timer
+        )
+        original_attach = loop.ForwardCoalescer.attach_forward
+
+        def observed_attach(self, msg):
+            original_attach(self, msg)
+            if msg.message_id == 11:
+                peer_forward_attached.set()
+
+        monkeypatch.setattr(loop.ForwardCoalescer, "attach_forward", observed_attach)
+        original_progress = loop._send_queued_progress
+
+        async def held_progress(*args, **kwargs):
+            if kwargs.get("user_msg_id") == 1:
+                progress_entered.set()
+                await release_progress.wait()
+            return await original_progress(*args, **kwargs)
+
+        monkeypatch.setattr(loop, "_send_queued_progress", held_progress)
+    if mode in ("queued_progress_fail", "dispatching_cancel_peer"):
         bound = tmp_path / "legacy.jsonl"
         bound.write_text(
             json.dumps({"type": "session", "id": "abc", "cwd": str(tmp_path)}) + "\n"
@@ -217,10 +249,12 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         await store.set_context(-100, 77, RunContext(project="test"))
         await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
 
-        async def fail_progress(*_args, **_kwargs):
-            raise RuntimeError("synthetic progress transport failure")
+        if mode == "queued_progress_fail":
 
-        monkeypatch.setattr(loop, "_send_queued_progress", fail_progress)
+            async def fail_progress(*_args, **_kwargs):
+                raise RuntimeError("synthetic progress transport failure")
+
+            monkeypatch.setattr(loop, "_send_queued_progress", fail_progress)
     dispatches: list[str] = []
     monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
 
@@ -258,6 +292,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 "forwarded_legacy_callback",
                 "forwarded_queued_callback",
                 "two_forward_queued",
+                "dispatching_cancel_peer",
             ):
                 yield StartedEvent(
                     engine="pi",
@@ -305,21 +340,69 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
         forward_coalesce_s=5
-        if mode == "forward_cancel_callback"
+        if mode in ("forward_cancel_callback", "forward_cancel_reply")
         else 0.05
         if mode
         in (
             "forwarded_legacy_callback",
             "forwarded_queued_callback",
             "two_forward_queued",
+            "dispatching_cancel_peer",
             "forward_cancel_callback",
+            "forward_cancel_reply",
         )
         else 0,
     )
     transport = cast(FakeTransport, cfg.exec_cfg.transport)
 
     async def poller(_cfg):
-        if mode == "two_forward_queued":
+        if mode == "dispatching_cancel_peer":
+            for message_id, text, forwarded in (
+                (1, "Task A", False),
+                (10, "Task B", False),
+                (2, "Forward A", True),
+                (11, "Forward B", True),
+            ):
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=message_id,
+                    text=text,
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=123 if message_id in (1, 2) else 456,
+                    raw={"forward_date": 1} if forwarded else None,
+                )
+            with anyio.fail_after(2):
+                await progress_entered.wait()
+                await peer_forward_attached.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=12,
+                text="/cancel",
+                reply_to_message_id=10,
+                reply_to_text="Task B",
+                sender_id=456,
+            )
+            with anyio.fail_after(2):
+                while not any(
+                    "Pending forwarded task cancelled" in call["message"].text
+                    for call in transport.send_calls
+                ):
+                    await anyio.sleep(0.01)
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=30,
+                callback_query_id="during-dispatch",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "two_forward_queued":
             for message_id, sender_id, text in (
                 (1, 123, "Task A"),
                 (10, 456, "Task B"),
@@ -370,6 +453,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
             "forwarded_legacy_callback",
             "forwarded_queued_callback",
             "forward_cancel_callback",
+            "forward_cancel_reply",
         ):
             yield TelegramIncomingMessage(
                 transport="telegram",
@@ -393,7 +477,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 sender_id=123,
                 raw={"forward_date": 1},
             )
-            if mode == "forward_cancel_callback":
+            if mode in ("forward_cancel_callback", "forward_cancel_reply"):
                 with anyio.fail_after(2):
                     while True:
                         intent = await LiveInbox(
@@ -408,7 +492,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                     thread_id=77,
                     message_id=4,
                     text="/cancel",
-                    reply_to_message_id=None,
+                    reply_to_message_id=2 if mode == "forward_cancel_reply" else None,
                     reply_to_text=None,
                     sender_id=123,
                 )
@@ -537,6 +621,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 "forwarded_legacy_callback",
                 "forwarded_queued_callback",
                 "two_forward_queued",
+                "dispatching_cancel_peer",
             ):
                 assert dispatches == [], (
                     "plugin callback with unproven topic must fail closed"
@@ -552,6 +637,9 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                     is None
                 )
         finally:
+            if mode == "dispatching_cancel_peer":
+                release_progress.set()
+                release_peer_timer.set()
             release_worker.set()
             release.set()
     if mode in ("forwarded_queued_callback", "two_forward_queued"):

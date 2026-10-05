@@ -707,6 +707,8 @@ class ForwardCoalescer:
             return  # CancelScope suppresses its own cancellation on exit.
         if pending.forward_barrier is not None:
             await pending.forward_barrier.wait()
+        if scope.cancel_called:
+            return  # Rescheduled while the old debounce waited on the barrier.
         if self._pending.get(key) is not pending:
             return
         self._pending.pop(key, None)
@@ -2012,6 +2014,8 @@ async def _run_main_loop_impl(
                             starting_live.discard(start_key)
 
             def release_legacy_topic_if_idle(topic: tuple[int, int]) -> None:
+                if any(key[:2] == topic for key in legacy_dispatching):
+                    return
                 if any(key[:2] == topic for key in legacy_queued):
                     return
                 if any(
@@ -2140,6 +2144,7 @@ async def _run_main_loop_impl(
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
             legacy_pending: set[tuple[int, int]] = set()
             legacy_queued: set[tuple[int, int, int]] = set()
+            legacy_dispatching: set[tuple[int, int, int]] = set()
             recovery_queue: asyncio.Queue[Callable[[], Awaitable[None]]] = (
                 asyncio.Queue(maxsize=32)
             )
@@ -2649,9 +2654,18 @@ async def _run_main_loop_impl(
                 )
 
             async def _dispatch_pending_prompt(pending: _PendingPrompt) -> None:
+                dispatch_key = (
+                    (pending.topic_key[0], pending.topic_key[1], pending.msg.message_id)
+                    if pending.topic_key is not None and pending.forwards
+                    else None
+                )
+                if dispatch_key is not None:
+                    legacy_dispatching.add(dispatch_key)
                 try:
                     await _dispatch_pending_prompt_impl(pending)
                 finally:
+                    if dispatch_key is not None:
+                        legacy_dispatching.discard(dispatch_key)
                     if (
                         pending.topic_key is not None
                         and pending.forwards
@@ -3040,6 +3054,10 @@ async def _run_main_loop_impl(
                             and (
                                 cancel_reply_id is None
                                 or pending.msg.message_id == cancel_reply_id
+                                or any(
+                                    forwarded_id == cancel_reply_id
+                                    for forwarded_id, _ in pending.forwards
+                                )
                             )
                         ]
                         if (
