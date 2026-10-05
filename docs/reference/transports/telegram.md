@@ -27,13 +27,21 @@ project, claim its canonical file, verify Pi `get_state` before any prompt, then
 update the topic binding. Missing/ambiguous IDs, project mismatch, and locally
 running one-shot aliases fail closed without prompt; retry after the active run
 settles. Already-running external Pi processes cannot be attached retroactively.
-Other engines and inactive topics keep their current queue behavior. This requires a writable
-Takopi config directory for `telegram_live_inbox.json` and `pi-live-sessions/`.
+Other engines and inactive topics without unresolved live receipts keep their
+current queue behavior. This requires a writable Takopi config directory for
+`telegram_live_inbox.json` and `pi-live-sessions/`. A new topic's initial Pi prompt
+and provisional canonical path are stored before forward debounce or any follow-up
+acknowledgement, so rapid messages cannot replace the original instruction. Pi can
+return a canonical ID/path from `get_state` before it creates the new JSONL;
+that identity is provisional until the full ID and project header match. Takopi
+will not bind the topic, attest delivery, or publish a successful final result
+without that later verification.
 
 During an active Pi task, ask a status question in the same topic for an isolated,
-short-lived no-tools Pi answer. It sees only a bounded public task description and
-recorded progress, same-topic receipt status and explicit acknowledgements,
-not the private main-session transcript or pending tool/subagent results. Use
+short-lived no-tools Pi answer. Its snapshot includes only a validated public
+progress phase and aggregate same-session receipt-state counts. Raw task and update
+text, receipt reasons, assistant transcript, and tool/subagent output are never
+sent to the isolated process. Use
 `/update <instruction>` to unambiguously send a constraint to the main task.
 Ordinary Russian messages such as «Как дела?», «Не трогай авторизацию» and
 «Как дела? И ещё — не трогай авторизацию» are supported, as are English status
@@ -46,10 +54,33 @@ An update is persisted before the **received** reply. **Submitted** means the RP
 command accepted it, not that Pi read it. **Delivered** requires observation of
 the exact user message in the main Pi stream. **Considered/deferred** requires an
 explicit main-agent marker and explanation; no marker means no consideration claim.
-If a command response is lost, the receipt stays **uncertain** instead of being
-blindly re-sent; recovery needs main-session inspection. The isolated quick answer
+If a command response is lost, the receipt stays **uncertain** and blocks later
+submissions in that session. Locally queued follow-ups also remain uncertain until
+the continuation prompt starts; a successful final answer is not published while
+any receipt remains unresolved. On restart, a scoped notice lists the receipt ID
+and state without repeating private text. No automatic retry occurs. To explicitly
+skip a receipt, use `/update defer <original-message-id> <reason>` in its topic;
+this does not prove Pi never applied it. To retry, use
+`/update retry <original-message-id> confirm` in that same bound topic. If idle,
+Takopi claims the canonical RPC owner, verifies session identity and project, and
+inspects the main-session messages before submitting the exact original marked
+update as the first cancellable continuation prompt. A missing marker does **not**
+prove Pi never applied the update: an explicit retry may duplicate effects. A
+conflicting owner, different topic/session, or prior unresolved receipt refuses
+the retry. Other topics are unaffected. The isolated quick answer
 is never fed into the writable main session. Replies remain in the same topic and
 are associated with the original user message.
+
+If Takopi restarts while a **new topic's initial Pi task** is uncertain (including
+before its JSONL file exists), it sends a scoped notice with the original message ID
+but no prompt text. Neither the original task nor dependent updates are automatically
+replayed. Use `/update retry-initial <original-message-id> confirm` in that exact
+project/topic to inspect the canonical session, then explicitly restart the original
+prompt if absent or continue from its observed state if present. Explicit retry can
+repeat tool effects; an unknown outcome is never treated as proof of non-acceptance.
+Use `/update defer-initial <original-message-id> <reason>` to abandon that initial
+task; any dependent receipts still require separate reconciliation or deferral.
+Wrong project, conflicting topic owner, or unverifiable session refuses retry.
 
 ## Incoming messages
 

@@ -9,6 +9,28 @@ from takopi.settings import TelegramTransportSettings
 from takopi.telegram.live_conversation import live_session_path, live_route_key
 
 
+@pytest.mark.anyio
+async def test_scheduler_identifies_queued_job_in_exact_topic() -> None:
+    from takopi.scheduler import ThreadScheduler, ThreadJob
+
+    class TaskGroup:
+        def start_soon(self, *_args):
+            pass
+
+    async def run(_job):
+        pass
+
+    scheduler = ThreadScheduler(task_group=TaskGroup(), run_job=run)
+    token = ResumeToken(engine="pi", value="/session.jsonl")
+    await scheduler.enqueue(
+        ThreadJob(
+            chat_id=1, user_msg_id=4, text="next", resume_token=token, thread_id=10
+        )
+    )
+    assert await scheduler.has_pending_for_topic(token, 1, 10)
+    assert not await scheduler.has_pending_for_topic(token, 1, 11)
+
+
 def test_live_opt_in_defaults_off_and_exact_topic_paths(tmp_path: Path) -> None:
     cfg = TelegramTransportSettings(bot_token="test", chat_id=1)
     assert not cfg.pi_live_conversation

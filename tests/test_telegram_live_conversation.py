@@ -127,6 +127,93 @@ async def test_failed_steer_reports_uncertain_without_retry(tmp_path: Path) -> N
 
 
 @pytest.mark.anyio
+async def test_initial_intent_restart_notice_has_id_but_never_replays_prompt(
+    tmp_path: Path,
+):
+    path = tmp_path / "new.jsonl"
+    inbox = LiveInbox(tmp_path / "i.json")
+    initial = await inbox.receive_initial(
+        1, 10, 1, str(path), "PRIVATE_INITIAL_PROMPT", str(tmp_path)
+    )
+    await inbox.mark_initial_uncertain(initial.id, initial.session_key)
+    replies: list[tuple[int, int, int, str]] = []
+
+    async def reply(chat: int, thread: int, msg: int, text: str) -> None:
+        replies.append((chat, thread, msg, text))
+
+    async def answer(*_args: object) -> str:
+        raise AssertionError("No auto prompt or quick answer")
+
+    restarted = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    await restarted.notify_recovery()
+    assert replies[-1][:3] == (1, 10, 1)
+    assert "retry-initial 1 confirm" in replies[-1][3]
+    assert "PRIVATE_INITIAL_PROMPT" not in replies[-1][3]
+    assert not path.exists()
+
+
+@pytest.mark.anyio
+async def test_recovery_notice_and_scoped_user_deferral_after_restart(tmp_path: Path):
+    path = tmp_path / "inbox.json"
+    inbox = LiveInbox(path)
+    receipt = await inbox.receive(1, 10, 33, "exact-a", "private update")
+    await inbox.mark_uncertain(receipt.id, "response lost")
+    replies: list[tuple[int, int, int, str]] = []
+
+    async def reply(chat: int, thread: int, msg: int, text: str) -> None:
+        replies.append((chat, thread, msg, text))
+
+    async def answer(*_args: object) -> str:
+        return "answer"
+
+    restarted = LiveConversationService(LiveInbox(path), answer, reply)
+    await restarted.notify_recovery()
+    assert replies[-1][:3] == (1, 10, 33)
+    assert "33" in replies[-1][3] and "duplicate" in replies[-1][3].lower()
+    assert "private update" not in replies[-1][3]
+    assert not await restarted.recover_receipt(
+        1, 11, 99, "exact-a", "defer 33 user chose skip"
+    )
+    assert (await inbox.get(receipt.id)).state == "uncertain"
+    assert await restarted.recover_receipt(
+        1, 10, 99, "exact-a", "defer 33 user chose skip"
+    )
+    assert (await inbox.get(receipt.id)).state == "deferred"
+
+
+@pytest.mark.anyio
+async def test_uncertain_first_blocks_later_update_and_successful_final(tmp_path: Path):
+    main = Main()
+    attempted: list[str] = []
+
+    async def maybe_accepted(text: str) -> str:
+        attempted.append(text)
+        if len(attempted) == 1:
+            raise TimeoutError("response lost")
+        return "queued"
+
+    main.steer = maybe_accepted  # type: ignore[method-assign]
+
+    async def answer(*_args: object) -> str:
+        return "answer"
+
+    replies: list[str] = []
+
+    async def reply(_chat: int, _thread: int, _msg: int, text: str) -> None:
+        replies.append(text)
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "task")
+    svc.register(owner)
+    await svc.handle(1, 10, 10, "a", "/update first")
+    await svc.handle(1, 10, 11, "a", "/update second")
+    assert [r.state for r in await svc.inbox.pending("a")] == ["uncertain", "received"]
+    assert len(attempted) == 1
+    assert await svc.finalize(owner) is False
+    assert any("uncertain" in text.lower() for text in replies)
+
+
+@pytest.mark.anyio
 async def test_clear_imperative_is_stored_without_explicit_command(
     tmp_path: Path,
 ) -> None:
@@ -232,10 +319,94 @@ async def test_quick_snapshot_reports_observed_receipt_evidence(tmp_path: Path) 
     ]
     await svc.reconcile(owner)
     await svc.handle(1, 10, 8, "a", "Как дела?")
-    assert "Не трогай авторизацию" in snapshots[-1]
+    assert "Не трогай авторизацию" not in snapshots[-1]
     assert "considered" in snapshots[-1]
-    assert "Не меняю авторизацию" in snapshots[-1]
+    assert "Не меняю авторизацию" not in snapshots[-1]
     assert "TOKEN_PRIVATE_INTERNAL_TRANSCRIPT" not in snapshots[-1]
+
+
+@pytest.mark.anyio
+async def test_ordinary_instructions_and_question_shaped_instruction_are_durable(
+    tmp_path: Path,
+):
+    main = Main()
+    answers: list[str] = []
+
+    async def answer(question: str, _snapshot: str) -> str:
+        answers.append(question)
+        return "status"
+
+    async def reply(*_args: object) -> None:
+        pass
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "task")
+    svc.register(owner)
+    for ident, text in [
+        (1, "Добавь тест на отмену"),
+        (2, "Fix the timeout"),
+        (3, "Can you use green?"),
+    ]:
+        assert await svc.handle(1, 10, ident, "a", text)
+    assert [r.text for r in await svc.inbox.pending("a")] == [
+        "Добавь тест на отмену",
+        "Fix the timeout",
+        "Can you use green?",
+    ]
+    assert not answers
+
+
+@pytest.mark.anyio
+async def test_quick_snapshot_excludes_raw_task_updates_and_reasons(tmp_path: Path):
+    main = Main()
+    seen: list[str] = []
+
+    async def answer(_question: str, snapshot: str) -> str:
+        seen.append(snapshot)
+        return "status"
+
+    async def reply(*_args: object) -> None:
+        pass
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "PRIVATE_TASK_SECRET", progress="tool: started")
+    svc.register(owner)
+    await svc.handle(1, 10, 1, "a", "/update PRIVATE_USER_SECRET")
+    await svc.handle(1, 10, 2, "a", "Как дела?")
+    assert seen and "tool: started" in seen[-1]
+    assert "PRIVATE_TASK_SECRET" not in seen[-1]
+    assert "PRIVATE_USER_SECRET" not in seen[-1]
+    assert "submitted" in seen[-1]
+
+
+@pytest.mark.anyio
+async def test_slow_quick_answer_does_not_block_next_message(tmp_path: Path):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def answer(_question: str, _snapshot: str) -> str:
+        entered.set()
+        await release.wait()
+        return "working"
+
+    async def reply(*_args: object) -> None:
+        pass
+
+    main = Main()
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    owner = LiveOwner(1, 10, "a", main, "task")
+    svc.register(owner)
+    tasks: list[asyncio.Task[None]] = []
+
+    def spawn(coro):
+        tasks.append(asyncio.create_task(coro))
+
+    assert await svc.handle(1, 10, 1, "a", "status?", spawn_quick=spawn)
+    await asyncio.wait_for(entered.wait(), 1)
+    assert await svc.handle(1, 10, 2, "a", "/update Use blue", spawn_quick=spawn)
+    assert [r.text for r in await svc.inbox.pending("a")] == ["Use blue"]
+    release.set()
+    await asyncio.gather(*tasks)
 
 
 @pytest.mark.anyio

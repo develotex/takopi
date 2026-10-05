@@ -174,6 +174,22 @@ class TopicStateStore(JsonStateStore[_TopicState]):
                 return None
             return ResumeToken(engine=engine, value=entry.resume)
 
+    async def session_owners(self, engine: str, resume: str) -> set[tuple[int, int]]:
+        """Return persisted topic bindings to one exact engine session value."""
+        async with self._lock:
+            self._reload_locked_if_needed()
+            owners: set[tuple[int, int]] = set()
+            for key, thread in self._state.threads.items():
+                entry = thread.sessions.get(engine)
+                if entry is None or entry.resume != resume:
+                    continue
+                try:
+                    chat, topic = key.split(":", 1)
+                    owners.add((int(chat), int(topic)))
+                except ValueError:
+                    raise ValueError("Invalid persisted topic key") from None
+            return owners
+
     async def get_default_engine(self, chat_id: int, thread_id: int) -> str | None:
         async with self._lock:
             self._reload_locked_if_needed()

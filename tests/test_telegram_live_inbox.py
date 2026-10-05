@@ -9,6 +9,45 @@ from takopi.telegram.live_inbox import LiveInbox, resolve_inbox_path
 
 
 @pytest.mark.anyio
+async def test_initial_intent_is_durable_before_file_or_prompt_and_scoped(
+    tmp_path: Path,
+):
+    path = tmp_path / "new.jsonl"
+    inbox = LiveInbox(tmp_path / "i.json")
+    intent = await inbox.receive_initial(
+        1, 10, 1, str(path), "start task", str(tmp_path)
+    )
+    assert intent.state == "scheduled"
+    assert not path.exists(), "durable intent precedes Pi process/file creation"
+    reopened = LiveInbox(tmp_path / "i.json")
+    restored = await reopened.initial_for_topic(1, 10)
+    assert restored is not None and restored.prompt == "start task"
+    assert await reopened.initial_for_topic(1, 11) is None
+    with pytest.raises(ValueError):
+        await reopened.receive_initial(1, 10, 2, str(path), "overwrite", str(tmp_path))
+    await reopened.mark_initial_uncertain((1, 10, 1), str(path))
+    uncertain = await inbox.initial_for_topic(1, 10)
+    assert uncertain is not None and uncertain.state == "uncertain"
+
+
+@pytest.mark.anyio
+async def test_explicit_recovery_requires_scope(tmp_path: Path):
+    inbox = LiveInbox(tmp_path / "i.json")
+    receipt = await inbox.receive(1, 10, 33, "exact-a", "Use green")
+    await inbox.mark_uncertain(receipt.id, "unknown RPC acceptance")
+    assert [r.id for r in await inbox.unresolved_for_topic(1, 10, "exact-a")] == [
+        receipt.id
+    ]
+    with pytest.raises(ValueError):
+        await inbox.confirm_retry(receipt.id, "other-session")
+    assert (await inbox.get(receipt.id)).state == "uncertain"
+    await inbox.confirm_retry(receipt.id, "exact-a")
+    assert (await inbox.get(receipt.id)).state == "received"
+    await inbox.mark_deferred(receipt.id, "Explicit user decision")
+    assert await inbox.unresolved_for_topic(1, 10, "exact-a") == []
+
+
+@pytest.mark.anyio
 async def test_duplicate_telegram_message_is_one_receipt_and_preserves_original(
     tmp_path: Path,
 ) -> None:

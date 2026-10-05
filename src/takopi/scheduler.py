@@ -133,6 +133,16 @@ class ThreadScheduler:
         async with self._lock:
             return self._queued_by_progress.get(progress_key)
 
+    async def has_pending_for_topic(
+        self, token: ResumeToken, chat_id: ChannelId, thread_id: ThreadId
+    ) -> bool:
+        key = self.thread_key(token)
+        async with self._lock:
+            return any(
+                job.chat_id == chat_id and job.thread_id == thread_id
+                for job in self._pending_by_thread.get(key, ())
+            )
+
     async def is_busy(self, token: ResumeToken) -> bool:
         key = self.thread_key(token)
         async with self._lock:

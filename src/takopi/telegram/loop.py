@@ -18,6 +18,7 @@ from ..logging import get_logger
 from ..model import EngineId, ResumeToken
 from ..runners.run_options import EngineRunOptions, apply_run_options
 from ..runners.pi import PiRunner
+from ..runners.pi_rpc import PiRpcRun
 from .live_conversation import (
     LiveConversationService,
     LiveOwner,
@@ -27,9 +28,12 @@ from .live_conversation import (
     live_session_path,
     quick_pi_answer,
     resolve_legacy_session,
+    verify_bound_session,
+    verify_fresh_session,
     verify_legacy_session,
+    verify_provisional_header,
 )
-from .live_inbox import LiveInbox, resolve_inbox_path
+from .live_inbox import InitialIntent, LiveInbox, Receipt, resolve_inbox_path
 from ..scheduler import ThreadJob, ThreadScheduler
 from ..progress import ProgressTracker
 from ..settings import TelegramTransportSettings
@@ -1206,13 +1210,14 @@ async def run_main_loop(
                 topic_key: tuple[int, int] | None,
                 chat_session_key: tuple[int, int | None] | None,
                 running_task: RunningTask | None = None,
+                done_override: anyio.Event | None = None,
             ) -> Callable[[ResumeToken, anyio.Event], Awaitable[None]] | None:
                 if base_cb is None and topic_key is None and chat_session_key is None:
                     return None
 
                 async def _wrapped(token: ResumeToken, done: anyio.Event) -> None:
                     if base_cb is not None:
-                        await base_cb(token, done)
+                        await base_cb(token, done_override or done)
                     if state.topic_store is not None and topic_key is not None:
                         await state.topic_store.set_session_resume(
                             topic_key[0], topic_key[1], token
@@ -1265,6 +1270,7 @@ async def run_main_loop(
                 | None = None,
                 engine_override: EngineId | None = None,
                 progress_ref: MessageRef | None = None,
+                recovery_rpc: PiRpcRun | None = None,
             ) -> None:
                 topic_key = (
                     (chat_id, thread_id)
@@ -1304,6 +1310,7 @@ async def run_main_loop(
                 running_task = RunningTask(context=context)
                 live_runner: LiveRunner | None = None
                 owner: LiveOwner | None = None
+                owner_done = anyio.Event()
                 if (
                     live is not None
                     and topic_key is not None
@@ -1317,7 +1324,8 @@ async def run_main_loop(
                     path = (
                         Path(resume_token.value).resolve()
                         if resume_token is not None
-                        else live_session_path(config_path, chat_id, topic_key[1])
+                        else fresh_pending.get(topic_key, (None, 0))[0]
+                        or live_session_path(config_path, chat_id, topic_key[1])
                     )
                     # A short ID is only a lookup hint. Resolve to one local
                     # project file before claiming the canonical RPC owner.
@@ -1331,7 +1339,7 @@ async def run_main_loop(
                     fresh = (
                         path.parent == root
                         and path.name.startswith(f"{chat_id}-{topic_key[1]}-")
-                        and (resume_token is None or bound == resume_token)
+                        and resume_token is None
                     )
                     existing = (
                         resume_token is not None
@@ -1370,18 +1378,60 @@ async def run_main_loop(
                                 text="Эта Pi-сессия уже выполняется; дождитесь завершения текущего запуска.",
                             )
                             return
+                    if resume_token is not None and not existing and legacy_id is None:
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Bound Pi session is missing or mismatched; no prompt submitted. Verify this exact topic before retrying.",
+                        )
+                        return
                     if (
                         isinstance(entry.runner, PiRunner)
                         and entry.available
                         and (fresh or existing or legacy_id is not None)
                     ):
-                        with apply_run_options(run_options):
-                            rpc = entry.runner.rpc_run(path, cwd=cwd)
+                        if recovery_rpc is not None:
+                            if Path(recovery_rpc.client.session_path).resolve() != path:
+                                raise ValueError("Retry RPC owner path mismatch")
+                            rpc = recovery_rpc
+                        else:
+                            with apply_run_options(run_options):
+                                rpc = entry.runner.rpc_run(path, cwd=cwd)
+                        provisional_id: str | None = None
+                        if resume_token is None or existing:
+                            try:
+                                if existing:
+                                    await verify_bound_session(rpc, path, cwd)
+                                else:
+                                    provisional_id = await verify_fresh_session(
+                                        rpc, path, cwd
+                                    )
+                            except Exception as exc:  # noqa: BLE001 - canonical identity required before prompt
+                                await rpc.client.close()
+                                await send_plain(
+                                    cfg.exec_cfg.transport,
+                                    chat_id=chat_id,
+                                    user_msg_id=user_msg_id,
+                                    thread_id=thread_id,
+                                    text=f"Pi session identity could not be verified ({type(exc).__name__}); no prompt submitted. Confirm recovery in this topic.",
+                                )
+                                return
                         live_runner = LiveRunner(
-                            entry.runner, rpc, running_task.resume_ready
+                            entry.runner,
+                            rpc,
+                            running_task.resume_ready,
+                            initial_recovery=recovery_rpc is not None,
                         )
                         owner = LiveOwner(
-                            chat_id, topic_key[1], str(path), live_runner, text[:1500]
+                            chat_id,
+                            topic_key[1],
+                            str(path),
+                            live_runner,
+                            text[:1500],
+                            running_task=running_task,
+                            identity_verified=provisional_id is None,
                         )
                         if not live.register(owner):
                             await send_plain(
@@ -1415,9 +1465,50 @@ async def run_main_loop(
                                     text="Идентичность Pi-сессии не подтверждена. Работа не запущена; привязка темы сохранена.",
                                 )
                                 return
-                        live_runner.before_final = partial(live.finalize, owner)
+                        starting_live.discard(
+                            (chat_id, topic_key[1], owner.session_key)
+                        )
+                        if fresh_pending.get(topic_key, (None, 0))[0] == path:
+                            fresh_pending.pop(topic_key, None)
+                        await live.flush(owner)
+                        initial_intent = await live.inbox.initial_for_topic(
+                            chat_id, topic_key[1]
+                        )
+                        if (
+                            initial_intent is not None
+                            and initial_intent.session_key == owner.session_key
+                        ):
+                            await live.inbox.mark_initial_uncertain(
+                                initial_intent.id, owner.session_key
+                            )
+
+                        owned_live = live
+                        assert owned_live is not None
+
+                        async def finalize_owned() -> bool:
+                            if not await verify_owned_header():
+                                owner.closing = True
+                                live_runner.final_failure = "New Pi session header missing/mismatched; task result incomplete. Initial task and updates require scoped recovery."
+                                return False
+                            result = await owned_live.finalize(owner)
+                            if (
+                                result
+                                and not live_runner._followups
+                                and live_runner.settlement_ok
+                                and initial_intent is not None
+                                and initial_intent.session_key == owner.session_key
+                            ):
+                                await owned_live.inbox.mark_initial_completed(
+                                    initial_intent.id, owner.session_key
+                                )
+                            return result
+
+                        live_runner.before_final = finalize_owned
                         live_runner.on_progress = lambda status: setattr(
                             owner, "progress", status
+                        )
+                        live_runner.on_followup_started = partial(
+                            live.followup_started, owner
                         )
                     elif resume_token is not None:
                         await send_plain(
@@ -1429,11 +1520,53 @@ async def run_main_loop(
                         )
                         return
 
+                known_callback = wrap_on_thread_known(
+                    on_thread_known,
+                    topic_key,
+                    chat_session_key,
+                    running_task,
+                    owner_done if owner is not None else None,
+                )
+
+                async def guarded_thread_known(
+                    token: ResumeToken, done: anyio.Event
+                ) -> None:
+                    if owner is not None and not owner.identity_verified:
+                        if token.engine != "pi" or token.value != owner.session_key:
+                            raise ValueError(
+                                "Provisional Pi owner produced a different session"
+                            )
+                        return
+                    if known_callback is not None:
+                        await known_callback(token, done)
+
+                async def verify_owned_header() -> bool:
+                    if owner is None:
+                        return True
+                    async with owner.lock:
+                        if owner.identity_verified:
+                            return True
+                        if provisional_id is None or not path.is_file():
+                            return False
+                        try:
+                            verify_provisional_header(path, provisional_id, cwd)
+                        except ValueError:
+                            return False
+                        if known_callback is not None:
+                            await known_callback(
+                                ResumeToken(engine="pi", value=owner.session_key),
+                                owner_done,
+                            )
+                        owner.identity_verified = True
+                        return True
+
                 async def monitor() -> None:
                     assert live is not None and owner is not None
                     while not running_task.done.is_set():
                         await anyio.sleep(1)
                         try:
+                            if not await verify_owned_header():
+                                continue
                             await live.reconcile(owner)
                         except Exception as exc:  # noqa: BLE001 - RPC can exit while observed
                             logger.debug("live.reconcile.failed", error=str(exc))
@@ -1453,12 +1586,7 @@ async def run_main_loop(
                             context=context,
                             reply_ref=reply_ref,
                             running_task=running_task,
-                            on_thread_known=wrap_on_thread_known(
-                                on_thread_known,
-                                topic_key,
-                                chat_session_key,
-                                running_task,
-                            ),
+                            on_thread_known=guarded_thread_known,
                             engine_override=engine_override,
                             thread_id=thread_id,
                             show_resume_line=show_resume_line,
@@ -1475,27 +1603,71 @@ async def run_main_loop(
                                 "live.final_reconcile.failed", error=str(exc)
                             )
                 finally:
-                    if live is not None and owner is not None:
-                        live.unregister(owner)
-                    if live_runner is not None:
-                        await live_runner.client.close()
+                    try:
+                        if live_runner is not None:
+                            await live_runner.client.close()
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                if (
+                                    live is not None
+                                    and owner is not None
+                                    and topic_key is not None
+                                ):
+                                    token = ResumeToken(
+                                        engine="pi", value=owner.session_key
+                                    )
+                                    if await scheduler.has_pending_for_topic(
+                                        token, chat_id, topic_key[1]
+                                    ):
+                                        starting_live.add(
+                                            (chat_id, topic_key[1], owner.session_key)
+                                        )
+                            finally:
+                                if live is not None and owner is not None:
+                                    live.unregister(owner)
+                                owner_done.set()
 
             async def run_thread_job(job: ThreadJob) -> None:
-                await run_job(
-                    cast(int, job.chat_id),
-                    cast(int, job.user_msg_id),
-                    job.text,
-                    job.resume_token,
-                    job.context,
-                    cast(int | None, job.thread_id),
-                    job.session_key,
-                    None,
-                    scheduler.note_thread_known,
-                    None,
-                    job.progress_ref,
-                )
+                try:
+                    await run_job(
+                        cast(int, job.chat_id),
+                        cast(int, job.user_msg_id),
+                        job.text,
+                        job.resume_token,
+                        job.context,
+                        cast(int | None, job.thread_id),
+                        job.session_key,
+                        None,
+                        scheduler.note_thread_known,
+                        None,
+                        job.progress_ref,
+                    )
+                finally:
+                    if isinstance(job.chat_id, int) and isinstance(job.thread_id, int):
+                        start_key = live_route_key(
+                            job.chat_id, job.thread_id, job.resume_token
+                        )
+                        if (
+                            start_key is not None
+                            and start_key not in retry_starting
+                            and not await scheduler.has_pending_for_topic(
+                                job.resume_token, job.chat_id, job.thread_id
+                            )
+                        ):
+                            starting_live.discard(start_key)
 
             scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
+            starting_live: set[tuple[int, int, str]] = set()
+            retry_starting: set[tuple[int, int, str]] = set()
+            fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
+
+            async def _run_quick(coro: Awaitable[None]) -> None:
+                await coro
+
+            def spawn_quick(coro: Awaitable[None]) -> None:
+                tg.start_soon(_run_quick, coro)
+
             live: LiveConversationService | None = None
             if cfg.pi_live_conversation:
                 if config_path is None:
@@ -1520,6 +1692,7 @@ async def run_main_loop(
                     quick_pi_answer,
                     live_reply,
                 )
+                tg.start_soon(live.notify_recovery)
 
             def resolve_topic_key(
                 msg: TelegramIncomingMessage,
@@ -1689,14 +1862,75 @@ async def run_main_loop(
                             chat_id, topic_key[1], "pi"
                         )
                     key = live_route_key(chat_id, msg.thread_id, candidate)
+                    initial_fresh = False
+                    if candidate is None and topic_key in fresh_pending:
+                        provisional, first_id = fresh_pending[topic_key]
+                        key = (chat_id, topic_key[1], str(provisional))
+                        initial_fresh = user_msg_id == first_id
                     replied_task = (
                         state.running_tasks.get(reply_ref) if reply_ref else None
                     )
-                    active = live.owner(*key) if key is not None else None
+                    active = (
+                        live.owner(*key)
+                        if key is not None
+                        else (
+                            live.owner_for_topic(chat_id, topic_key[1])
+                            if candidate is None
+                            else None
+                        )
+                    )
+                    if active is not None and key is None:
+                        key = (chat_id, topic_key[1], active.session_key)
+                    if (
+                        key is not None
+                        and active is None
+                        and key in starting_live
+                        and not initial_fresh
+                    ):
+                        await live.buffer_starting(
+                            chat_id, key[1], user_msg_id, key[2], prompt_text
+                        )
+                        return
+                    if key is not None and active is None and not initial_fresh:
+                        unresolved = await live.inbox.unresolved_for_topic(*key)
+                        if unresolved:
+                            ids = ", ".join(str(r.message_id) for r in unresolved[:10])
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=topic_key[1],
+                                text=f"Pi has unresolved receipts #{ids}; no new prompt sent. "
+                                "Check the scoped recovery notice and explicitly defer or reconcile first.",
+                            )
+                            return
+                    if active is not None and active.closing and key is not None:
+                        token = ResumeToken(engine="pi", value=active.session_key)
+                        progress_ref = await _send_queued_progress(
+                            cfg,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=msg.thread_id,
+                            resume_token=token,
+                            context=context,
+                            steerable=False,
+                        )
+                        await scheduler.enqueue_resume(
+                            chat_id,
+                            user_msg_id,
+                            prompt_text,
+                            token,
+                            context,
+                            msg.thread_id,
+                            chat_session_key,
+                            progress_ref,
+                        )
+                        return
                     if (
                         active is not None
                         and (
                             replied_task is None
+                            or replied_task is active.running_task
                             or (
                                 replied_task.resume is not None
                                 and replied_task.resume.value == active.session_key
@@ -1704,7 +1938,12 @@ async def run_main_loop(
                         )
                         and key is not None
                         and await live.handle(
-                            chat_id, key[1], user_msg_id, key[2], prompt_text
+                            chat_id,
+                            key[1],
+                            user_msg_id,
+                            key[2],
+                            prompt_text,
+                            spawn_quick=spawn_quick,
                         )
                     ):
                         return
@@ -1725,23 +1964,40 @@ async def run_main_loop(
                 if live_eligible and live is not None and resume_token is not None:
                     key = live_route_key(chat_id, msg.thread_id, resume_token)
                     if key is not None and await live.handle(
-                        chat_id, key[1], user_msg_id, key[2], prompt_text
+                        chat_id,
+                        key[1],
+                        user_msg_id,
+                        key[2],
+                        prompt_text,
+                        spawn_quick=spawn_quick,
                     ):
                         return
                 if resume_token is None:
-                    await run_job(
-                        chat_id,
-                        user_msg_id,
-                        prompt_text,
-                        None,
-                        context,
-                        msg.thread_id,
-                        chat_session_key,
-                        reply_ref,
-                        scheduler.note_thread_known,
-                        engine_override,
-                    )
+                    try:
+                        await run_job(
+                            chat_id,
+                            user_msg_id,
+                            prompt_text,
+                            None,
+                            context,
+                            msg.thread_id,
+                            chat_session_key,
+                            reply_ref,
+                            scheduler.note_thread_known,
+                            engine_override,
+                        )
+                    finally:
+                        if topic_key is not None and topic_key in fresh_pending:
+                            provisional, first_id = fresh_pending[topic_key]
+                            if first_id == user_msg_id:
+                                fresh_pending.pop(topic_key, None)
+                                starting_live.discard(
+                                    (chat_id, topic_key[1], str(provisional))
+                                )
                     return
+                start_key = live_route_key(chat_id, msg.thread_id, resume_token)
+                if live_eligible and live is not None and start_key is not None:
+                    starting_live.add(start_key)
                 progress_ref = await _send_queued_progress(
                     cfg,
                     chat_id=chat_id,
@@ -1979,7 +2235,39 @@ async def run_main_loop(
                 command_id = classification.command_id
                 args_text = classification.args_text
                 if command_id == "new":
+                    if topic_key is not None and live is not None:
+                        initial = await live.inbox.initial_for_topic(
+                            chat_id, topic_key[1]
+                        )
+                        if initial is not None:
+                            await reply(
+                                text=f"Cannot /new while initial Pi task #{initial.message_id} is unresolved. Explicitly retry or defer it first."
+                            )
+                            return
+                    if topic_key is not None and live is not None:
+                        provisional = fresh_pending.get(topic_key, (None, 0))[0]
+                        if (
+                            provisional is not None
+                            and await live.inbox.unresolved_for_topic(
+                                chat_id, topic_key[1], str(provisional)
+                            )
+                        ):
+                            await reply(
+                                text="Cannot /new while startup has unresolved live updates. Wait for Pi or explicitly defer the receipt first."
+                            )
+                            return
+                        if any(
+                            r.chat_id == chat_id and r.thread_id == topic_key[1]
+                            for r in await live.inbox.unresolved_all()
+                        ):
+                            await reply(
+                                text="Cannot /new with unresolved live receipts in this topic. Reconcile/retry or explicitly defer them first."
+                            )
+                            return
                     forward_coalescer.cancel(forward_key)
+                    if topic_key is not None and topic_key in fresh_pending:
+                        provisional, _ = fresh_pending.pop(topic_key)
+                        starting_live.discard((chat_id, topic_key[1], str(provisional)))
                     if state.topic_store is not None and topic_key is not None:
                         tg.start_soon(
                             partial(
@@ -2096,14 +2384,326 @@ async def run_main_loop(
                         else None
                     )
                     key = live_route_key(chat_id, msg.thread_id, candidate)
-                    if key is not None and live.owner(*key) is not None:
-                        tg.start_soon(
-                            live.handle,
+                    if key is None and candidate is None and topic_key in fresh_pending:
+                        provisional, _ = fresh_pending[topic_key]
+                        key = (chat_id, topic_key[1], str(provisional))
+                    active = (
+                        live.owner(*key)
+                        if key is not None
+                        else (
+                            live.owner_for_topic(chat_id, topic_key[1])
+                            if topic_key is not None and candidate is None
+                            else None
+                        )
+                    )
+                    parts = args_text.strip().split(" ", 2)
+                    if (
+                        key is None
+                        and candidate is None
+                        and topic_key is not None
+                        and parts[0] in ("defer", "retry")
+                        and len(parts) >= 2
+                        and parts[1].isdigit()
+                    ):
+                        try:
+                            orphan = await live.inbox.get(
+                                (chat_id, topic_key[1], int(parts[1]))
+                            )
+                        except KeyError:
+                            orphan = None
+                        if orphan is not None:
+                            key = (chat_id, topic_key[1], orphan.session_key)
+                            if (
+                                parts[0] == "retry"
+                                and await live.inbox.initial_for_topic(
+                                    chat_id, topic_key[1]
+                                )
+                                is not None
+                            ):
+                                await reply(
+                                    text="Initial Pi task must be reconciled before retrying its dependent update."
+                                )
+                                return
+                    if (
+                        topic_key is not None
+                        and parts[0] in ("retry-initial", "defer-initial")
+                        and len(parts) >= 2
+                        and parts[1].isdigit()
+                    ):
+                        initial = await live.inbox.initial_by_id(
+                            (chat_id, topic_key[1], int(parts[1]))
+                        )
+                        if initial is None or initial.state not in (
+                            "scheduled",
+                            "uncertain",
+                        ):
+                            await reply(
+                                text="Initial Pi task ID is not unresolved in this exact topic; nothing changed."
+                            )
+                            return
+                        intent_key = (chat_id, topic_key[1], initial.session_key)
+                        if parts[0] == "defer-initial":
+                            if len(parts) < 3 or not parts[2].strip():
+                                await reply(
+                                    text="Explicit initial-task deferral requires a reason."
+                                )
+                            elif (
+                                intent_key in starting_live
+                                or live.owner(*intent_key) is not None
+                            ):
+                                await reply(
+                                    text="Initial Pi task is in flight; deferral refused until ownership settles."
+                                )
+                            else:
+                                await live.inbox.mark_initial_deferred(
+                                    initial.id, initial.session_key, parts[2].strip()
+                                )
+                                await reply(
+                                    text=f"Initial Pi task #{initial.message_id} explicitly deferred. Pi may already have acted; dependent updates must be resolved separately."
+                                )
+                            return
+                        if len(parts) != 3 or parts[2] != "confirm":
+                            await reply(
+                                text=f"Retry may duplicate tool effects. Confirm with /update retry-initial {initial.message_id} confirm."
+                            )
+                            return
+                        if (
+                            intent_key in starting_live
+                            or live.owner(*intent_key) is not None
+                        ):
+                            await reply(
+                                text="Initial Pi owner already starting; no duplicate retry scheduled."
+                            )
+                            return
+                        if candidate is not None and (
+                            live_route_key(chat_id, msg.thread_id, candidate)
+                            != intent_key
+                        ):
+                            await reply(
+                                text="Topic is bound to another Pi session; initial retry refused."
+                            )
+                            return
+
+                        async def run_initial_retry(intent: InitialIntent) -> None:
+                            rpc: PiRpcRun | None = None
+                            try:
+                                if config_path is None:
+                                    raise ValueError("Live config path unavailable")
+                                cwd = (
+                                    cfg.runtime.resolve_run_cwd(ambient_context)
+                                    or Path.cwd()
+                                )
+                                if str(cwd.resolve()) != intent.cwd:
+                                    raise ValueError("Initial task project changed")
+                                path = Path(intent.session_key)
+                                assert state.topic_store is not None
+                                owners = await state.topic_store.session_owners(
+                                    "pi", str(path)
+                                )
+                                if owners - {(chat_id, topic_key[1])}:
+                                    raise ValueError(
+                                        "Initial Pi session is bound to another topic"
+                                    )
+                                token: ResumeToken | None = None
+                                if path.exists():
+                                    entry = cfg.runtime.resolve_runner(
+                                        resume_token=ResumeToken(
+                                            engine="pi", value=str(path)
+                                        ),
+                                        engine_override="pi",
+                                    )
+                                    if (
+                                        not isinstance(entry.runner, PiRunner)
+                                        or not entry.available
+                                    ):
+                                        raise ValueError("Pi runner unavailable")
+                                    opts = await _resolve_engine_run_options(
+                                        chat_id,
+                                        topic_key[1],
+                                        "pi",
+                                        chat_prefs=state.chat_prefs,
+                                        topic_store=state.topic_store,
+                                    )
+                                    with apply_run_options(opts):
+                                        rpc = entry.runner.rpc_run(path, cwd=cwd)
+                                decision = await live.inspect_initial_retry(
+                                    intent, rpc, cwd, config_path.parent
+                                )
+                                if decision == "fresh":
+                                    prompt = intent.prompt
+                                else:
+                                    token = ResumeToken(
+                                        engine="pi", value=intent.session_key
+                                    )
+                                    assert state.topic_store is not None
+                                    await state.topic_store.set_session_resume(
+                                        chat_id, topic_key[1], token
+                                    )
+                                    prompt = (
+                                        intent.prompt
+                                        if decision == "retry"
+                                        else "Continue the original task from its observed main-session state; do not redo finished tool effects. Consider queued updates before finalizing."
+                                    )
+                                await run_job(
+                                    chat_id,
+                                    msg.message_id,
+                                    prompt,
+                                    token,
+                                    ambient_context,
+                                    topic_key[1],
+                                    chat_session_key,
+                                    None,
+                                    scheduler.note_thread_known,
+                                    "pi",
+                                    None,
+                                    recovery_rpc=rpc,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - preserve ambiguous initial task
+                                logger.warning(
+                                    "live.initial_retry.failed",
+                                    error_type=type(exc).__name__,
+                                )
+                                await reply(
+                                    text=f"Initial Pi task #{intent.message_id}: retry failed/owner conflicted; no success claimed. Inspect the scoped state before another explicit retry."
+                                )
+                            finally:
+                                if rpc is not None:
+                                    await rpc.client.close()
+                                retry_starting.discard(intent_key)
+                                if fresh_pending.get(topic_key, (None, 0))[0] == Path(
+                                    intent.session_key
+                                ):
+                                    fresh_pending.pop(topic_key, None)
+                                if not await scheduler.has_pending_for_topic(
+                                    ResumeToken(engine="pi", value=intent.session_key),
+                                    chat_id,
+                                    topic_key[1],
+                                ):
+                                    starting_live.discard(intent_key)
+
+                        fresh_pending[topic_key] = (
+                            Path(initial.session_key),
+                            initial.message_id,
+                        )
+                        starting_live.add(intent_key)
+                        retry_starting.add(intent_key)
+                        tg.start_soon(run_initial_retry, initial)
+                        await reply(
+                            text=f"Initial Pi task #{initial.message_id}: canonical inspection scheduled. Your explicit confirmation permits a duplicate-risk prompt only if unobserved; no automatic replay."
+                        )
+                        return
+                    if key is not None and args_text.startswith(("defer ", "retry ")):
+                        recovery_key = key
+                        if (
+                            args_text.startswith("retry ")
+                            and recovery_key in starting_live
+                        ):
+                            await reply(
+                                text="Pi owner is starting; retry already pending. No second replay started."
+                            )
+                            return
+
+                        async def run_idle_retry(receipt: Receipt) -> None:
+                            rpc: PiRpcRun | None = None
+                            try:
+                                token = ResumeToken(
+                                    engine="pi", value=receipt.session_key
+                                )
+                                entry = cfg.runtime.resolve_runner(
+                                    resume_token=token, engine_override="pi"
+                                )
+                                if (
+                                    not isinstance(entry.runner, PiRunner)
+                                    or not entry.available
+                                ):
+                                    raise ValueError(
+                                        "Pi runner unavailable for recovery"
+                                    )
+                                cwd = (
+                                    cfg.runtime.resolve_run_cwd(ambient_context)
+                                    or Path.cwd()
+                                )
+                                opts = await _resolve_engine_run_options(
+                                    chat_id,
+                                    recovery_key[1],
+                                    "pi",
+                                    chat_prefs=state.chat_prefs,
+                                    topic_store=state.topic_store,
+                                )
+                                with apply_run_options(opts):
+                                    rpc = entry.runner.rpc_run(
+                                        Path(receipt.session_key), cwd=cwd
+                                    )
+                                if not await live.begin_idle_retry(receipt, rpc, cwd):
+                                    return
+                                await run_job(
+                                    chat_id,
+                                    msg.message_id,
+                                    await live.inbox.delivery_text(receipt.id),
+                                    token,
+                                    ambient_context,
+                                    recovery_key[1],
+                                    chat_session_key,
+                                    None,
+                                    scheduler.note_thread_known,
+                                    "pi",
+                                    None,
+                                    recovery_rpc=rpc,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - unknown RPC outcome stays durable
+                                logger.warning(
+                                    "live.retry.failed", error_type=type(exc).__name__
+                                )
+                                await reply(
+                                    text=f"Receipt #{receipt.message_id}: retry failed or owner conflicted; no success claimed. Inspect state before confirming again."
+                                )
+                            finally:
+                                if rpc is not None:
+                                    await rpc.client.close()
+                                retry_starting.discard(recovery_key)
+                                if not await scheduler.has_pending_for_topic(
+                                    token, chat_id, recovery_key[1]
+                                ):
+                                    starting_live.discard(recovery_key)
+
+                        def spawn_idle_retry(receipt: Receipt) -> None:
+                            starting_live.add(recovery_key)
+                            retry_starting.add(recovery_key)
+                            tg.start_soon(run_idle_retry, receipt)
+
+                        if await live.recover_receipt(
+                            chat_id,
+                            key[1],
+                            msg.message_id,
+                            key[2],
+                            args_text,
+                            spawn_idle_retry=spawn_idle_retry,
+                        ):
+                            return
+                        await reply(
+                            text="Receipt not found in this exact topic/session; nothing changed."
+                        )
+                        return
+                    if active is None and key is not None and key in starting_live:
+                        await live.buffer_starting(
                             chat_id,
                             key[1],
                             msg.message_id,
                             key[2],
                             f"/update {args_text}",
+                        )
+                    elif active is not None and not active.closing:
+                        await live.handle(
+                            chat_id,
+                            active.thread_id,
+                            msg.message_id,
+                            active.session_key,
+                            f"/update {args_text}",
+                            spawn_quick=spawn_quick,
+                        )
+                    elif active is not None:
+                        await reply(
+                            text="Pi is finalizing; update was not accepted. Please resend after the final reply."
                         )
                     else:
                         tg.start_soon(
@@ -2223,16 +2823,56 @@ async def run_main_loop(
                             )
                         )
                         key = live_route_key(chat_id, msg.thread_id, candidate)
-                        active = live.owner(*key) if key is not None else None
+                        if (
+                            key is None
+                            and candidate is None
+                            and topic_key in fresh_pending
+                        ):
+                            provisional, _ = fresh_pending[topic_key]
+                            key = (chat_id, topic_key[1], str(provisional))
+                        active = (
+                            live.owner(*key)
+                            if key is not None
+                            else (
+                                live.owner_for_topic(chat_id, topic_key[1])
+                                if candidate is None
+                                else None
+                            )
+                        )
+                        if active is not None and key is None:
+                            key = (chat_id, topic_key[1], active.session_key)
                         replied_task = (
                             state.running_tasks.get(reply_ref) if reply_ref else None
                         )
                         if (
                             engine_live.engine == "pi"
                             and key is not None
+                            and active is None
+                            and key in starting_live
+                        ):
+                            await live.buffer_starting(
+                                chat_id,
+                                key[1],
+                                msg.message_id,
+                                key[2],
+                                resolved_live.prompt,
+                            )
+                            return
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is not None
+                            and active.closing
+                        ):
+                            await _dispatch_pending_prompt(pending)
+                            return
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
                             and active is not None
                             and (
                                 replied_task is None
+                                or replied_task is active.running_task
                                 or (
                                     replied_task.resume is not None
                                     and replied_task.resume.value == active.session_key
@@ -2244,9 +2884,42 @@ async def run_main_loop(
                                 msg.message_id,
                                 key[2],
                                 resolved_live.prompt,
+                                spawn_quick=spawn_quick,
                             )
                         ):
                             return
+                        if (
+                            engine_live.engine == "pi"
+                            and candidate is None
+                            and active is None
+                            and topic_key not in fresh_pending
+                            and config_path is not None
+                        ):
+                            existing_initial = await live.inbox.initial_for_topic(
+                                chat_id, topic_key[1]
+                            )
+                            if existing_initial is not None:
+                                await reply(
+                                    text=f"Initial Pi task #{existing_initial.message_id} is unresolved after restart; no new prompt started. Use scoped retry-initial or defer-initial."
+                                )
+                                return
+                            provisional = live_session_path(
+                                config_path, chat_id, topic_key[1]
+                            )
+                            cwd = (
+                                cfg.runtime.resolve_run_cwd(resolved_live.context)
+                                or Path.cwd()
+                            )
+                            await live.inbox.receive_initial(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                str(provisional),
+                                resolved_live.prompt,
+                                str(cwd.resolve()),
+                            )
+                            fresh_pending[topic_key] = (provisional, msg.message_id)
+                            starting_live.add((chat_id, topic_key[1], str(provisional)))
                 forward_coalescer.schedule(pending)
 
             allowed_user_ids = set(cfg.allowed_user_ids)

@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 STATE_VERSION = 1
 STATE_FILENAME = "telegram_live_inbox.json"
 type ReceiptId = tuple[int, int, int]
+type InitialState = Literal["scheduled", "uncertain", "completed", "deferred"]
 type ReceiptState = Literal[
     "received", "uncertain", "submitted", "delivered", "considered", "deferred"
 ]
@@ -48,6 +49,33 @@ class Receipt:
         return (self.chat_id, self.thread_id, self.message_id)
 
 
+@dataclass(frozen=True, slots=True)
+class InitialIntent:
+    chat_id: int
+    thread_id: int
+    message_id: int
+    session_key: str
+    prompt: str
+    cwd: str
+    state: InitialState = "scheduled"
+    reason: str | None = None
+
+    @property
+    def id(self) -> ReceiptId:
+        return (self.chat_id, self.thread_id, self.message_id)
+
+
+class _InitialRecord(msgspec.Struct):
+    chat_id: int
+    thread_id: int
+    message_id: int
+    session_key: str
+    prompt: str
+    cwd: str
+    state: InitialState
+    reason: str | None = None
+
+
 class _Record(msgspec.Struct):
     chat_id: int
     thread_id: int
@@ -64,6 +92,7 @@ class _State(msgspec.Struct):
     version: int
     next_sequence: int
     receipts: list[_Record]
+    initial_intents: list[_InitialRecord] = msgspec.field(default_factory=list)
 
 
 def _fresh_state() -> _State:
@@ -141,6 +170,27 @@ class LiveInbox(JsonStateStore[_State]):
                     markers.add(item.marker)
                 if state.next_sequence <= max(sequences, default=0):
                     raise ValueError("invalid sequence cursor")
+                seen_intents: set[ReceiptId] = set()
+                active_topics: set[tuple[int, int]] = set()
+                for intent in state.initial_intents:
+                    ident = (intent.chat_id, intent.thread_id, intent.message_id)
+                    topic = (intent.chat_id, intent.thread_id)
+                    if (
+                        ident in seen_intents
+                        or not intent.session_key
+                        or not intent.prompt
+                        or not intent.cwd
+                        or intent.state
+                        not in ("scheduled", "uncertain", "completed", "deferred")
+                        or (
+                            intent.state in ("scheduled", "uncertain")
+                            and topic in active_topics
+                        )
+                    ):
+                        raise ValueError("invalid or conflicting initial Pi intent")
+                    seen_intents.add(ident)
+                    if intent.state in ("scheduled", "uncertain"):
+                        active_topics.add(topic)
             except (OSError, ValueError, msgspec.DecodeError) as exc:
                 raise ValueError(f"Cannot load live inbox {self._path}: {exc}") from exc
             self._state = state
@@ -179,6 +229,119 @@ class LiveInbox(JsonStateStore[_State]):
         finally:
             if name is not None:
                 Path(name).unlink(missing_ok=True)
+
+    async def receive_initial(
+        self,
+        chat: int,
+        thread: int,
+        message: int,
+        session_key: str,
+        prompt: str,
+        cwd: str,
+    ) -> InitialIntent:
+        if not session_key or not prompt.strip() or not cwd:
+            raise ValueError("Initial Pi intent needs path, prompt and project cwd")
+        async with self._lock:
+            self._reload_locked_if_needed()
+            for item in self._state.initial_intents:
+                if (item.chat_id, item.thread_id, item.message_id) == (
+                    chat,
+                    thread,
+                    message,
+                ):
+                    if (item.session_key, item.prompt, item.cwd) != (
+                        session_key,
+                        prompt,
+                        cwd,
+                    ):
+                        raise ValueError("Initial Pi intent identity mismatch")
+                    return InitialIntent(**msgspec.to_builtins(item))
+                if (item.chat_id, item.thread_id) == (chat, thread) and item.state in (
+                    "scheduled",
+                    "uncertain",
+                ):
+                    raise ValueError("Topic already has unresolved initial Pi intent")
+            item = _InitialRecord(
+                chat, thread, message, session_key, prompt, cwd, "scheduled"
+            )
+            self._state.initial_intents.append(item)
+            self._save_locked()
+            return InitialIntent(**msgspec.to_builtins(item))
+
+    async def initial_for_topic(self, chat: int, thread: int) -> InitialIntent | None:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            for item in reversed(self._state.initial_intents):
+                if (item.chat_id, item.thread_id) == (chat, thread) and item.state in (
+                    "scheduled",
+                    "uncertain",
+                ):
+                    return InitialIntent(**msgspec.to_builtins(item))
+            return None
+
+    async def initial_by_id(self, ident: ReceiptId) -> InitialIntent | None:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            for item in self._state.initial_intents:
+                if (item.chat_id, item.thread_id, item.message_id) == ident:
+                    return InitialIntent(**msgspec.to_builtins(item))
+            return None
+
+    async def initial_unresolved(self) -> list[InitialIntent]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                InitialIntent(**msgspec.to_builtins(item))
+                for item in self._state.initial_intents
+                if item.state in ("scheduled", "uncertain")
+            ]
+
+    async def _initial_transition(
+        self,
+        ident: ReceiptId,
+        session_key: str,
+        state: InitialState,
+        reason: str | None = None,
+    ) -> InitialIntent:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = next(
+                (
+                    v
+                    for v in self._state.initial_intents
+                    if (v.chat_id, v.thread_id, v.message_id) == ident
+                ),
+                None,
+            )
+            if (
+                item is None
+                or item.session_key != session_key
+                or item.state not in ("scheduled", "uncertain")
+            ):
+                raise ValueError("Initial Pi intent scope or state mismatch")
+            item.state = state
+            item.reason = reason
+            self._save_locked()
+            return InitialIntent(**msgspec.to_builtins(item))
+
+    async def mark_initial_uncertain(
+        self, ident: ReceiptId, session_key: str
+    ) -> InitialIntent:
+        return await self._initial_transition(
+            ident, session_key, "uncertain", "Pi prompt outcome may be unknown"
+        )
+
+    async def mark_initial_completed(
+        self, ident: ReceiptId, session_key: str
+    ) -> InitialIntent:
+        return await self._initial_transition(ident, session_key, "completed")
+
+    async def mark_initial_deferred(
+        self, ident: ReceiptId, session_key: str, reason: str
+    ) -> InitialIntent:
+        if not reason.strip():
+            raise ValueError("Deferral needs explicit reason")
+        return await self._initial_transition(ident, session_key, "deferred", reason)
 
     async def receive(
         self,
@@ -239,6 +402,45 @@ class LiveInbox(JsonStateStore[_State]):
                 for r in self._state.receipts
                 if r.session_key == session_key
             ]
+
+    async def unresolved_for_topic(
+        self, chat: int, thread: int, session_key: str
+    ) -> list[Receipt]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                _receipt(r)
+                for r in self._state.receipts
+                if r.chat_id == chat
+                and r.thread_id == thread
+                and r.session_key == session_key
+                and r.state not in ("considered", "deferred")
+            ]
+
+    async def unresolved_all(self) -> list[Receipt]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                _receipt(r)
+                for r in self._state.receipts
+                if r.state not in ("considered", "deferred")
+            ]
+
+    async def confirm_retry(self, receipt_id: ReceiptId, session_key: str) -> Receipt:
+        """Explicit user-authorized retry only; absence is never evidence of failure."""
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = self._required(receipt_id)
+            if item.session_key != session_key or item.state not in (
+                "uncertain",
+                "submitted",
+                "received",
+            ):
+                raise ValueError("Receipt scope or state does not permit retry")
+            item.state = "received"
+            item.reason = "Explicit user retry; duplicate effects possible"
+            self._save_locked()
+            return _receipt(item)
 
     async def pending(self, session_key: str) -> list[Receipt]:
         async with self._lock:
