@@ -169,6 +169,8 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
         "callback_race",
         "forwarded_legacy_callback",
         "forwarded_queued_callback",
+        "cancel_queued_resume",
+        "two_forward_queued",
     ],
 )
 async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
@@ -180,12 +182,18 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
     entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
     legacy_started = anyio.Event()
     worker_queued, release_worker = anyio.Event(), anyio.Event()
-    if mode == "forwarded_queued_callback":
+    scheduler_ref = {}
+    if mode in (
+        "forwarded_queued_callback",
+        "cancel_queued_resume",
+        "two_forward_queued",
+    ):
         from takopi.scheduler import ThreadScheduler
 
         original_worker = ThreadScheduler._thread_worker
 
         async def delayed_worker(self, key):
+            scheduler_ref["scheduler"] = self
             worker_queued.set()
             await release_worker.wait()
             await original_worker(self, key)
@@ -231,7 +239,11 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
             raise AssertionError("live start must wait for delayed plugin")
 
         async def run(self, *_args):
-            if mode in ("forwarded_legacy_callback", "forwarded_queued_callback"):
+            if mode in (
+                "forwarded_legacy_callback",
+                "forwarded_queued_callback",
+                "two_forward_queued",
+            ):
                 yield StartedEvent(
                     engine="pi",
                     resume=ResumeToken("pi", str(tmp_path / "legacy.jsonl")),
@@ -278,12 +290,64 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
         forward_coalesce_s=0.05
-        if mode in ("forwarded_legacy_callback", "forwarded_queued_callback")
+        if mode
+        in (
+            "forwarded_legacy_callback",
+            "forwarded_queued_callback",
+            "two_forward_queued",
+        )
         else 0,
     )
 
     async def poller(_cfg):
-        if mode in ("forwarded_legacy_callback", "forwarded_queued_callback"):
+        if mode == "two_forward_queued":
+            for message_id, sender_id, text in (
+                (1, 123, "Task A"),
+                (10, 456, "Task B"),
+            ):
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=message_id,
+                    text=text,
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=sender_id,
+                )
+            for message_id, sender_id in ((2, 123), (11, 456)):
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=message_id,
+                    text="Forward details",
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=sender_id,
+                    raw={"forward_date": 1},
+                )
+            with anyio.fail_after(2):
+                await worker_queued.wait()
+                while len(scheduler_ref["scheduler"]._queued_by_progress) != 2:
+                    await anyio.sleep(0.01)
+            scheduler = scheduler_ref["scheduler"]
+            progress_id = next(
+                key[1]
+                for key, job in scheduler._queued_by_progress.items()
+                if job.user_msg_id == 1
+            )
+            assert await scheduler.cancel_queued(-100, progress_id) is not None
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=30,
+                callback_query_id="remaining-forward",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode in ("forwarded_legacy_callback", "forwarded_queued_callback"):
             yield TelegramIncomingMessage(
                 transport="telegram",
                 chat_id=-100,
@@ -316,6 +380,31 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 chat_id=-100,
                 message_id=3,
                 callback_query_id="legacy-topic",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "cancel_queued_resume":
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            with anyio.fail_after(2):
+                await worker_queued.wait()
+            scheduler = scheduler_ref["scheduler"]
+            progress_id = next(iter(scheduler._queued_by_progress))[1]
+            assert await scheduler.cancel_queued(-100, progress_id) is not None
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=3,
+                callback_query_id="cancelled-queue",
                 data="spy:run",
                 sender_id=123,
                 raw={"message": {"message_thread_id": 77}},
@@ -377,6 +466,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 "callback_race",
                 "forwarded_legacy_callback",
                 "forwarded_queued_callback",
+                "two_forward_queued",
             ):
                 assert dispatches == [], (
                     "plugin callback with unproven topic must fail closed"
@@ -392,6 +482,8 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         finally:
             release_worker.set()
             release.set()
+    if mode in ("forwarded_queued_callback", "two_forward_queued"):
+        assert legacy_started.is_set(), "Remaining forwarded one-shot must run"
 
 
 @pytest.mark.anyio

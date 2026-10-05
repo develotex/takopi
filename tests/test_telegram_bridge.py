@@ -899,7 +899,7 @@ async def test_cancel_queued_forwarded_fallback_releases_topic_reservation() -> 
     async def _noop_run_job(_) -> None:
         return None
 
-    def on_cancel(job) -> None:
+    async def on_cancel(job) -> None:
         assert job.legacy_fallback
         released.append((job.chat_id, job.thread_id, job.user_msg_id))
 

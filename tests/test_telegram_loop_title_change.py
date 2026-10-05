@@ -16,6 +16,51 @@ class _Edits:
 
 
 @pytest.mark.anyio
+async def test_unanswered_interrupt_is_bounded_even_after_runner_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import takopi.runner_bridge as bridge
+
+    monkeypatch.setattr(bridge, "_INTERRUPT_TIMEOUT_S", 0.02)
+    token = ResumeToken(engine="codex", value="test-session")
+    started, settled = anyio.Event(), anyio.Event()
+
+    class Control:
+        async def interrupt(self):
+            started.set()
+            await anyio.sleep_forever()
+
+    class FakeRunner:
+        async def run(self, _prompt, _resume):
+            yield StartedEvent(
+                engine="codex", resume=token, meta={"control": Control()}
+            )
+            await settled.wait()
+            yield CompletedEvent(
+                engine="codex", ok=True, answer="settled", resume=token
+            )
+
+    running = RunningTask()
+    run = asyncio.create_task(
+        run_runner_with_cancel(
+            cast(Runner, FakeRunner()),
+            prompt="task",
+            resume_token=None,
+            edits=cast(ProgressEdits, _Edits()),
+            running_task=running,
+            on_thread_known=None,
+        )
+    )
+    await running.resume_ready.wait()
+    running.cancel_requested.set()
+    with anyio.fail_after(1):
+        await started.wait()
+    settled.set()
+    outcome = await asyncio.wait_for(run, 1)
+    assert outcome.cancelled and outcome.cancel_unconfirmed
+
+
+@pytest.mark.anyio
 async def test_cancelled_completion_waits_for_interrupt_and_never_reports_success() -> (
     None
 ):

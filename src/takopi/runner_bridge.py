@@ -323,8 +323,12 @@ async def send_initial_progress(
 @dataclass(slots=True)
 class RunOutcome:
     cancelled: bool = False
+    cancel_unconfirmed: bool = False
     completed: CompletedEvent | None = None
     resume: ResumeToken | None = None
+
+
+_INTERRUPT_TIMEOUT_S = 35.0
 
 
 async def run_runner_with_cancel(
@@ -386,7 +390,7 @@ async def run_runner_with_cancel(
                     outcome.cancelled = True
                     # The stream may settle while clear_queue is awaiting an ACK.
                     # Do not cancel the abort worker or report success here.
-                    with anyio.move_on_after(35, shield=True):
+                    with anyio.move_on_after(_INTERRUPT_TIMEOUT_S + 1, shield=True):
                         await cancel_done.wait()
                 tg.cancel_scope.cancel()
 
@@ -396,8 +400,15 @@ async def run_runner_with_cancel(
             with anyio.CancelScope(shield=True):
                 try:
                     if task.control is not None:
-                        await task.control.interrupt()
+                        with anyio.move_on_after(
+                            _INTERRUPT_TIMEOUT_S, shield=True
+                        ) as timeout:
+                            await task.control.interrupt()
+                        if timeout.cancel_called:
+                            outcome.cancel_unconfirmed = True
+                            logger.warning("runner.control_interrupt_timed_out")
                 except Exception as exc:  # noqa: BLE001
+                    outcome.cancel_unconfirmed = True
                     logger.warning(
                         "runner.control_interrupt_failed",
                         error=str(exc),
@@ -627,7 +638,11 @@ async def handle_message(
         final_rendered = cfg.presenter.render_progress(
             state,
             elapsed_s=elapsed,
-            label="`cancelled`",
+            label=(
+                "`cancel requested; interrupt unconfirmed`"
+                if outcome.cancel_unconfirmed
+                else "`cancelled`"
+            ),
         )
         await send_result_message(
             cfg,

@@ -44,7 +44,7 @@ class ThreadScheduler:
         *,
         task_group: TaskGroup,
         run_job: RunJob,
-        on_cancel_queued: Callable[[ThreadJob], None] | None = None,
+        on_cancel_queued: Callable[[ThreadJob], Awaitable[None]] | None = None,
     ) -> None:
         self._task_group = task_group
         self._run_job = run_job
@@ -117,7 +117,7 @@ class ThreadScheduler:
         async with self._lock:
             job = self._pop_queued_locked(chat_id, progress_msg_id)
         if job is not None and self._on_cancel_queued is not None:
-            self._on_cancel_queued(job)
+            await self._on_cancel_queued(job)
         return job
 
     async def claim_queued(

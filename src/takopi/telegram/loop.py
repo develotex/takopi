@@ -2005,6 +2005,16 @@ async def _run_main_loop_impl(
                         ):
                             starting_live.discard(start_key)
 
+            def release_legacy_topic_if_idle(topic: tuple[int, int]) -> None:
+                if any(key[:2] == topic for key in legacy_queued):
+                    return
+                if any(
+                    pending.topic_key == topic and pending.forwards
+                    for pending in state.pending_prompts.values()
+                ):
+                    return
+                legacy_pending.discard(topic)
+
             def release_legacy_queued(job: ThreadJob) -> None:
                 if (
                     isinstance(job.chat_id, int)
@@ -2012,14 +2022,46 @@ async def _run_main_loop_impl(
                     and isinstance(job.user_msg_id, int)
                 ):
                     legacy_queued.discard((job.chat_id, job.thread_id, job.user_msg_id))
-                    legacy_pending.discard((job.chat_id, job.thread_id))
+                    release_legacy_topic_if_idle((job.chat_id, job.thread_id))
+
+            async def on_cancel_queued(job: ThreadJob) -> None:
+                if job.legacy_fallback:
+                    release_legacy_queued(job)
+                if (
+                    job.allow_live
+                    and job.resume_token.engine == "pi"
+                    and isinstance(job.chat_id, int)
+                    and isinstance(job.thread_id, int)
+                ):
+                    start_key = reserved_pi_start_key(
+                        job.chat_id, job.thread_id, job.resume_token, job.context
+                    )
+                    if (
+                        start_key is not None
+                        and start_key not in retry_starting
+                        and (
+                            live is None
+                            or not live.has_topic_owner(job.chat_id, job.thread_id)
+                        )
+                        and not await scheduler.has_pending_for_topic(
+                            job.resume_token, job.chat_id, job.thread_id
+                        )
+                        and not any(
+                            key[:2] == (job.chat_id, job.thread_id)
+                            for key in startup_cancel
+                        )
+                        and not any(
+                            ref.channel_id == job.chat_id
+                            and task.thread_id == job.thread_id
+                            for ref, task in state.running_tasks.items()
+                        )
+                    ):
+                        starting_live.discard(start_key)
 
             scheduler = ThreadScheduler(
                 task_group=tg,
                 run_job=run_thread_job,
-                on_cancel_queued=lambda job: release_legacy_queued(job)
-                if job.legacy_fallback
-                else None,
+                on_cancel_queued=on_cancel_queued,
             )
             starting_live: set[tuple[int, int, str]] = set()
 
@@ -2566,7 +2608,7 @@ async def _run_main_loop_impl(
                         )
                         not in legacy_queued
                     ):
-                        legacy_pending.discard(pending.topic_key)
+                        release_legacy_topic_if_idle(pending.topic_key)
 
             async def _dispatch_pending_prompt_impl(pending: _PendingPrompt) -> None:
                 if pending.forward_barrier is not None:
@@ -2615,7 +2657,7 @@ async def _run_main_loop_impl(
                 )
                 if not ok:
                     if pending.topic_key is not None and pending.forwards:
-                        legacy_pending.discard(pending.topic_key)
+                        release_legacy_topic_if_idle(pending.topic_key)
                     return
                 initial_directive = False
                 if (
@@ -2664,7 +2706,7 @@ async def _run_main_loop_impl(
                         )
                         not in legacy_queued
                     ):
-                        legacy_pending.discard(pending.topic_key)
+                        release_legacy_topic_if_idle(pending.topic_key)
 
             forward_coalescer = ForwardCoalescer(
                 task_group=tg,
