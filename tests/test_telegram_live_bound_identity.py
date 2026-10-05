@@ -171,6 +171,8 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
         "forwarded_queued_callback",
         "cancel_queued_resume",
         "two_forward_queued",
+        "forward_cancel_callback",
+        "queued_progress_fail",
     ],
 )
 async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
@@ -206,6 +208,19 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         store = TopicStateStore(resolve_state_path(config))
         await store.set_context(-100, 77, RunContext(project="test"))
         await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
+    if mode == "queued_progress_fail":
+        bound = tmp_path / "legacy.jsonl"
+        bound.write_text(
+            json.dumps({"type": "session", "id": "abc", "cwd": str(tmp_path)}) + "\n"
+        )
+        store = TopicStateStore(resolve_state_path(config))
+        await store.set_context(-100, 77, RunContext(project="test"))
+        await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
+
+        async def fail_progress(*_args, **_kwargs):
+            raise RuntimeError("synthetic progress transport failure")
+
+        monkeypatch.setattr(loop, "_send_queued_progress", fail_progress)
     dispatches: list[str] = []
     monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
 
@@ -289,15 +304,19 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         ),
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
-        forward_coalesce_s=0.05
+        forward_coalesce_s=5
+        if mode == "forward_cancel_callback"
+        else 0.05
         if mode
         in (
             "forwarded_legacy_callback",
             "forwarded_queued_callback",
             "two_forward_queued",
+            "forward_cancel_callback",
         )
         else 0,
     )
+    transport = cast(FakeTransport, cfg.exec_cfg.transport)
 
     async def poller(_cfg):
         if mode == "two_forward_queued":
@@ -347,7 +366,11 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 sender_id=123,
                 raw={"message": {"message_thread_id": 77}},
             )
-        elif mode in ("forwarded_legacy_callback", "forwarded_queued_callback"):
+        elif mode in (
+            "forwarded_legacy_callback",
+            "forwarded_queued_callback",
+            "forward_cancel_callback",
+        ):
             yield TelegramIncomingMessage(
                 transport="telegram",
                 chat_id=-100,
@@ -370,16 +393,63 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 sender_id=123,
                 raw={"forward_date": 1},
             )
-            with anyio.fail_after(2):
-                if mode == "forwarded_queued_callback":
-                    await worker_queued.wait()
-                else:
-                    await legacy_started.wait()
+            if mode == "forward_cancel_callback":
+                with anyio.fail_after(2):
+                    while True:
+                        intent = await LiveInbox(
+                            resolve_inbox_path(config)
+                        ).initial_by_id((-100, 77, 1))
+                        if intent is not None and intent.state == "deferred":
+                            break
+                        await anyio.sleep(0.01)
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=4,
+                    text="/cancel",
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=123,
+                )
+                await anyio.sleep(0.05)
+            else:
+                with anyio.fail_after(2):
+                    if mode == "forwarded_queued_callback":
+                        await worker_queued.wait()
+                    else:
+                        await legacy_started.wait()
             yield TelegramCallbackQuery(
                 transport="telegram",
                 chat_id=-100,
                 message_id=3,
                 callback_query_id="legacy-topic",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "queued_progress_fail":
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            with anyio.fail_after(2):
+                while not any(
+                    "Could not queue task" in call["message"].text
+                    for call in transport.send_calls
+                ):
+                    await anyio.sleep(0.01)
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=3,
+                callback_query_id="failed-queue",
                 data="spy:run",
                 sender_id=123,
                 raw={"message": {"message_thread_id": 77}},
@@ -472,7 +542,9 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                     "plugin callback with unproven topic must fail closed"
                 )
             else:
-                assert dispatches == ["started"]
+                assert dispatches == ["started"], [
+                    call["message"].text for call in transport.send_calls
+                ]
                 assert (
                     await LiveInbox(resolve_inbox_path(config)).initial_for_topic(
                         -100, 77

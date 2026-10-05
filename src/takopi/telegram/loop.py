@@ -560,8 +560,10 @@ class ForwardCoalescer:
         sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
         dispatch: Callable[[_PendingPrompt], Awaitable[None]],
         pending: dict[ForwardKey, _PendingPrompt],
+        on_cancel: Callable[[_PendingPrompt], None] | None = None,
     ) -> None:
         self._task_group = task_group
+        self._on_cancel = on_cancel
         self._debounce_s = debounce_s
         self._sleep = sleep
         self._dispatch = dispatch
@@ -573,6 +575,8 @@ class ForwardCoalescer:
             return
         if pending.cancel_scope is not None:
             pending.cancel_scope.cancel()
+        if self._on_cancel is not None:
+            self._on_cancel(pending)
         logger.debug(
             "forward.prompt.cancelled",
             chat_id=pending.msg.chat_id,
@@ -699,6 +703,8 @@ class ForwardCoalescer:
                 await self._sleep(self._debounce_s)
         except anyio.get_cancelled_exc_class():
             return
+        if scope.cancel_called:
+            return  # CancelScope suppresses its own cancellation on exit.
         if pending.forward_barrier is not None:
             await pending.forward_barrier.wait()
         if self._pending.get(key) is not pending:
@@ -2530,15 +2536,29 @@ async def _run_main_loop_impl(
                 )
                 if live_eligible and live is not None and start_key is not None:
                     starting_live.add(start_key)
-                progress_ref = await _send_queued_progress(
-                    cfg,
-                    chat_id=chat_id,
-                    user_msg_id=user_msg_id,
-                    thread_id=msg.thread_id,
-                    resume_token=resume_token,
-                    context=context,
-                    steerable=await scheduler.is_busy(resume_token),
-                )
+                try:
+                    progress_ref = await _send_queued_progress(
+                        cfg,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=msg.thread_id,
+                        resume_token=resume_token,
+                        context=context,
+                        steerable=await scheduler.is_busy(resume_token),
+                    )
+                except BaseException as exc:
+                    if live_eligible and start_key is not None:
+                        starting_live.discard(start_key)
+                    if not isinstance(exc, Exception):
+                        raise
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=msg.thread_id,
+                        text="Could not queue task; no prompt submitted. Resend after checking the topic.",
+                    )
+                    return
                 legacy_key = (
                     (chat_id, topic_key[1], user_msg_id)
                     if legacy_fallback and topic_key is not None
@@ -2559,10 +2579,44 @@ async def _run_main_loop_impl(
                         allow_live=live_eligible,
                         legacy_fallback=legacy_fallback,
                     )
-                except BaseException:
-                    if legacy_key is not None:
-                        legacy_queued.discard(legacy_key)
-                    raise
+                except BaseException as exc:
+                    with anyio.CancelScope(shield=True):
+                        if progress_ref is not None:
+                            queued = (
+                                await scheduler.get_queued(
+                                    chat_id, progress_ref.message_id
+                                )
+                                is not None
+                            )
+                        elif msg.thread_id is not None:
+                            queued = await scheduler.has_pending_for_topic(
+                                resume_token, chat_id, msg.thread_id
+                            )
+                        else:
+                            queued = True  # No scoped proof that enqueue failed.
+                    if (
+                        not queued
+                        and topic_key is not None
+                        and not any(
+                            ref.channel_id == chat_id and task.thread_id == topic_key[1]
+                            for ref, task in state.running_tasks.items()
+                        )
+                    ):
+                        if live_eligible and start_key is not None:
+                            starting_live.discard(start_key)
+                        if legacy_key is not None:
+                            legacy_queued.discard(legacy_key)
+                            release_legacy_topic_if_idle(topic_key)
+                    if not isinstance(exc, Exception):
+                        raise
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=msg.thread_id,
+                        text="Task queue outcome could not be confirmed; check this topic before retrying.",
+                    )
+                    return
 
             async def run_prompt_from_upload(
                 msg: TelegramIncomingMessage,
@@ -2714,6 +2768,11 @@ async def _run_main_loop_impl(
                 sleep=sleep,
                 dispatch=_dispatch_pending_prompt,
                 pending=state.pending_prompts,
+                on_cancel=lambda pending: release_legacy_topic_if_idle(
+                    pending.topic_key
+                )
+                if pending.topic_key is not None and pending.forwards
+                else None,
             )
 
             async def handle_prompt_upload(
@@ -2909,7 +2968,7 @@ async def _run_main_loop_impl(
                                     )
                                     return
                             current = forward_coalescer._pending.get(_forward_key(msg))
-                            if current is not None and current is not pending_forward:
+                            if current is not pending_forward:
                                 await live._startup_reply(
                                     msg.chat_id,
                                     forward_topic[1],
@@ -2917,14 +2976,7 @@ async def _run_main_loop_impl(
                                     "Forwarded composition changed; resend this forward.",
                                 )
                                 return
-                            if current is pending_forward:
-                                forward_coalescer.attach_forward(msg)
-                            else:
-                                # Its debounce already fired, but dispatch waits
-                                # on this barrier; attach to that exact prompt.
-                                pending_forward.forwards.append(
-                                    (msg.message_id, msg.text)
-                                )
+                            forward_coalescer.attach_forward(msg)
                             legacy_pending.add(forward_topic)
                             if (
                                 intent is not None
@@ -2980,6 +3032,39 @@ async def _run_main_loop_impl(
                         cancel_reply_id = (
                             None if reply_id == topic_key[1] else reply_id
                         )  # Telegram's implicit topic-root reply is not a run target.
+                        forwarded_pending = [
+                            key
+                            for key, pending in state.pending_prompts.items()
+                            if pending.topic_key == topic_key
+                            and pending.forwards
+                            and (
+                                cancel_reply_id is None
+                                or pending.msg.message_id == cancel_reply_id
+                            )
+                        ]
+                        if (
+                            cancel_reply_id is None
+                            and forwarded_pending
+                            and (
+                                len(forwarded_pending) != 1
+                                or any(
+                                    ref.channel_id == chat_id
+                                    and task.thread_id == topic_key[1]
+                                    for ref, task in state.running_tasks.items()
+                                )
+                                or any(key[:2] == topic_key for key in legacy_queued)
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the original prompt or progress message to cancel one."
+                            )
+                            return
+                        if len(forwarded_pending) == 1:
+                            forward_coalescer.cancel(forwarded_pending[0])
+                            await reply(
+                                text="Pending forwarded task cancelled before submission; no prompt sent."
+                            )
+                            return
                         candidates = [
                             task
                             for (chat, thread, first), task in startup_cancel.items()

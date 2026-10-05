@@ -8,6 +8,66 @@ from takopi.telegram.types import TelegramIncomingMessage
 
 
 @pytest.mark.anyio
+async def test_forward_reschedule_cannot_dispatch_cancelled_debounce_early() -> None:
+    original = TelegramIncomingMessage(
+        transport="telegram",
+        chat_id=-100,
+        thread_id=77,
+        message_id=1,
+        text="Build task",
+        reply_to_message_id=None,
+        reply_to_text=None,
+        sender_id=123,
+    )
+    pending = _PendingPrompt(
+        msg=original,
+        text="Build task",
+        ambient_context=None,
+        chat_project=None,
+        topic_key=(-100, 77),
+        chat_session_key=None,
+        reply_ref=None,
+        reply_id=None,
+        is_voice_transcribed=False,
+        forwards=[],
+    )
+    queued = {}
+    dispatched: list[list[tuple[int, str]]] = []
+    done = anyio.Event()
+
+    async def dispatch(item: _PendingPrompt) -> None:
+        dispatched.append(list(item.forwards))
+        done.set()
+
+    async with anyio.create_task_group() as tg:
+        coalescer = ForwardCoalescer(
+            task_group=tg, debounce_s=0.15, dispatch=dispatch, pending=queued
+        )
+        coalescer.schedule(pending)
+        await anyio.sleep(0.02)  # Initial debounce has entered its CancelScope.
+        coalescer.attach_forward(
+            TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="Forward",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+                raw={"forward_date": 1},
+            )
+        )
+        await anyio.sleep(0.04)
+        assert not dispatched, (
+            "cancelled old timer must not dispatch before the new timer"
+        )
+        with anyio.fail_after(1):
+            await done.wait()
+        assert dispatched == [[(2, "Forward")]]
+
+
+@pytest.mark.anyio
 async def test_forward_debounce_keeps_prompt_available_until_durable_transition() -> (
     None
 ):
