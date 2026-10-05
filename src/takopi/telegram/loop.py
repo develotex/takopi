@@ -1694,6 +1694,17 @@ async def _run_main_loop_impl(
                             running_task=running_task,
                             identity_verified=provisional_id is None,
                         )
+                        if topic_key in plugin_inflight or topic_key in legacy_pending:
+                            startup_cancel.pop(startup_key, None)
+                            await rpc.client.close()
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Plugin or forwarded task became active during Pi startup; no prompt submitted. Resend after it completes.",
+                            )
+                            return
                         if not live.register(owner):
                             startup_cancel.pop(startup_key, None)
                             await rpc.client.close()
@@ -1980,7 +1991,7 @@ async def _run_main_loop_impl(
                     )
                 finally:
                     if isinstance(job.chat_id, int) and isinstance(job.thread_id, int):
-                        start_key = scoped_live_key(
+                        start_key = reserved_pi_start_key(
                             job.chat_id, job.thread_id, job.resume_token, job.context
                         )
                         if (
@@ -2035,6 +2046,24 @@ async def _run_main_loop_impl(
                             return None
                         token = ResumeToken(engine="pi", value=str(path))
                 return live_route_key(chat, thread, token)
+
+            def reserved_pi_start_key(
+                chat: int,
+                thread: int | None,
+                token: ResumeToken | None,
+                context: RunContext | None,
+            ) -> tuple[int, int, str] | None:
+                key = scoped_live_key(chat, thread, token, context)
+                if (
+                    key is None
+                    and token is not None
+                    and token.engine == "pi"
+                    and thread is not None
+                ):
+                    # Short IDs have no canonical path until identity inspection.
+                    # Reserve the topic itself before that asynchronous migration.
+                    return (chat, thread, f"unresolved-pi-id:{token.value}")
+                return key
 
             startup_cancel: dict[tuple[int, int, int], RunningTask] = {}
             cancelled_initial_ids: set[tuple[int, int, int]] = set()
@@ -2435,7 +2464,7 @@ async def _run_main_loop_impl(
                                     (chat_id, topic_key[1], str(provisional))
                                 )
                     return
-                start_key = scoped_live_key(
+                start_key = reserved_pi_start_key(
                     chat_id, msg.thread_id, resume_token, context
                 )
                 if live_eligible and live is not None and start_key is not None:
@@ -2696,7 +2725,16 @@ async def _run_main_loop_impl(
             async def live_plugin_blocked(topic_key: tuple[int, int] | None) -> bool:
                 if live is None or topic_key is None:
                     return False
-                if topic_key in plugin_inflight or live_topic_running(topic_key):
+                if (
+                    topic_key in plugin_inflight
+                    or topic_key in legacy_pending
+                    or live_topic_running(topic_key)
+                    or any(
+                        ref.channel_id == topic_key[0]
+                        and task.thread_id == topic_key[1]
+                        for ref, task in state.running_tasks.items()
+                    )
+                ):
                     return True
                 if await live.inbox.initial_for_topic(*topic_key) is not None:
                     return True
@@ -2705,7 +2743,13 @@ async def _run_main_loop_impl(
                 # plugin_inflight; owner registration may have raced either await.
                 return (
                     topic_key in plugin_inflight
+                    or topic_key in legacy_pending
                     or live_topic_running(topic_key)
+                    or any(
+                        ref.channel_id == topic_key[0]
+                        and task.thread_id == topic_key[1]
+                        for ref, task in state.running_tasks.items()
+                    )
                     or any(
                         receipt.chat_id == topic_key[0]
                         and receipt.thread_id == topic_key[1]

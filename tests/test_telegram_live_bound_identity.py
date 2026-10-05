@@ -162,7 +162,13 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    "mode", ["delayed_plugin", "unknown_callback", "callback_race"]
+    "mode",
+    [
+        "delayed_plugin",
+        "unknown_callback",
+        "callback_race",
+        "forwarded_legacy_callback",
+    ],
 )
 async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
@@ -171,6 +177,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
 
     config = tmp_path / "takopi.toml"
     entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
+    legacy_started = anyio.Event()
     dispatches: list[str] = []
     monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
 
@@ -204,8 +211,16 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
             raise AssertionError("live start must wait for delayed plugin")
 
         async def run(self, *_args):
+            if mode == "forwarded_legacy_callback":
+                yield StartedEvent(
+                    engine="pi",
+                    resume=ResumeToken("pi", str(tmp_path / "legacy.jsonl")),
+                )
+                legacy_started.set()
+                await release.wait()
+                yield CompletedEvent(engine="pi", ok=True, answer="done")
+                return
             raise AssertionError("plugin/initial must not start Pi concurrently")
-            yield  # pragma: no cover
 
     runtime = TransportRuntime(
         router=AutoRouter(
@@ -242,11 +257,45 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         ),
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
-        forward_coalesce_s=0,
+        forward_coalesce_s=0.05 if mode == "forwarded_legacy_callback" else 0,
     )
 
     async def poller(_cfg):
-        if mode == "callback_race":
+        if mode == "forwarded_legacy_callback":
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            await anyio.sleep(0.01)
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="Forward details",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+                raw={"forward_date": 1},
+            )
+            with anyio.fail_after(2):
+                await legacy_started.wait()
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=3,
+                callback_query_id="legacy-topic",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "callback_race":
             raced["armed"] = True
             yield TelegramCallbackQuery(
                 transport="telegram",
@@ -298,7 +347,11 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
             with anyio.fail_after(2):
                 await emitted.wait()
             await anyio.sleep(0.05)
-            if mode in ("unknown_callback", "callback_race"):
+            if mode in (
+                "unknown_callback",
+                "callback_race",
+                "forwarded_legacy_callback",
+            ):
                 assert dispatches == [], (
                     "plugin callback with unproven topic must fail closed"
                 )
