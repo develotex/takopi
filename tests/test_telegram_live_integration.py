@@ -67,6 +67,40 @@ class FakeRun:
 
 
 @pytest.mark.anyio
+async def test_finalizing_owner_still_excludes_another_session_in_same_topic(
+    tmp_path: Path,
+):
+    async def answer(*_):
+        return "answer"
+
+    async def reply(*_):
+        return None
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), answer, reply)
+    first = LiveOwner(
+        1,
+        10,
+        str(tmp_path / "first.jsonl"),
+        LiveRunner(FakePi(), cast(PiRpcRun, FakeRun())),
+        "task",
+    )
+    second = LiveOwner(
+        1,
+        10,
+        str(tmp_path / "second.jsonl"),
+        LiveRunner(FakePi(), cast(PiRpcRun, FakeRun())),
+        "task",
+    )
+    assert svc.register(first)
+    first.closing = True
+    assert svc.has_topic_owner(1, 10)
+    assert not svc.register(second)
+    svc.unregister(first)
+    assert svc.register(second)
+    svc.unregister(second)
+
+
+@pytest.mark.anyio
 async def test_adapter_uses_same_rpc_owner_and_observed_messages(tmp_path: Path):
     rpc = FakeRun()
     runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
@@ -589,6 +623,10 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "bound_held_steer_cancel",
         "bound_other_project",
         "unbound_other_project",
+        "bound_plugin_command",
+        "bound_plugin_callback",
+        "bound_new_during_active",
+        "bound_update_after_branch_rebind",
     ],
 )
 @pytest.mark.parametrize("command_first", [False, True])
@@ -617,6 +655,8 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
         "unbound_other_project",
     )
     held_steer = mode == "bound_held_steer_cancel"
+    plugin_mode = mode in ("bound_plugin_command", "bound_plugin_callback")
+    plugin_calls: list[str] = []
     steer_entered = anyio.Event()
     steer_release = anyio.Event()
 
@@ -695,6 +735,14 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             return cast(PiRpcRun, rpc)
 
     import takopi.telegram.loop as loop
+
+    if plugin_mode:
+        monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
+
+        async def fake_dispatch(*_args, **_kwargs):
+            plugin_calls.append("dispatched")
+
+        monkeypatch.setattr(loop, "dispatch_command", fake_dispatch)
 
     slow_quick = mode == "bound" and not command_first
     quick_entered = anyio.Event()
@@ -805,26 +853,51 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             sender_id=123,
         )
         if not predebounce:
-            if unbound or held_steer or mode == "bound_other_project":
+            if (
+                unbound
+                or held_steer
+                or mode in ("bound_other_project", "bound_update_after_branch_rebind")
+            ):
                 await rpc.run_started.wait()
             else:
                 await progress_ready.wait()
-        yield TelegramIncomingMessage(
-            transport="telegram",
-            chat_id=-100,
-            thread_id=77,
-            message_id=2,
-            text="/test Change goal"
-            if mode == "unbound_directive_after"
-            else "/other Please deploy change"
-            if mode in ("bound_other_project", "unbound_other_project")
-            else "/update Используй синий"
-            if command_first
-            else "Не трогай авторизацию",
-            reply_to_message_id=None,
-            reply_to_text=None,
-            sender_id=123,
-        )
+        if mode == "bound_update_after_branch_rebind":
+            await store.set_context(-100, 77, RunContext(project="test", branch="dev"))
+        if mode == "bound_plugin_callback":
+            from takopi.telegram.types import TelegramCallbackQuery
+
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=2,
+                callback_query_id="spy-2",
+                data="spy:change",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        else:
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="/spy change"
+                if mode == "bound_plugin_command"
+                else "/new"
+                if mode == "bound_new_during_active"
+                else "/update Please deploy branch changes"
+                if mode == "bound_update_after_branch_rebind"
+                else "/test Change goal"
+                if mode == "unbound_directive_after"
+                else "/other Please deploy change"
+                if mode in ("bound_other_project", "unbound_other_project")
+                else "/update Используй синий"
+                if command_first
+                else "Не трогай авторизацию",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
         if held_steer:
             with anyio.fail_after(2):
                 await steer_entered.wait()
@@ -893,6 +966,32 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                         "cancel must pass a held Pi steer response"
                     )
             pending = await LiveInbox(resolve_inbox_path(config)).pending(str(rpc.path))
+            if plugin_mode or mode in (
+                "bound_new_during_active",
+                "bound_update_after_branch_rebind",
+            ):
+                assert not plugin_calls, (
+                    "plugin cannot bypass live receipt and session binding"
+                )
+                if mode == "bound_update_after_branch_rebind":
+                    assert all(
+                        "Please deploy branch changes" not in text for text in rpc.sent
+                    )
+                    assert all(r.message_id != 2 for r in pending)
+                elif mode == "bound_new_during_active":
+                    assert (
+                        await store.get_session_resume(-100, 77, "pi")
+                    ) == ResumeToken("pi", str(path))
+                    assert all(r.message_id != 2 for r in pending)
+                    assert [(r.message_id, r.text) for r in pending] == (
+                        [(3, "Не трогай авторизацию")] if command_first else []
+                    ), "message after rejected /new must retain the old live owner"
+                else:
+                    assert all(r.message_id != 2 for r in pending)
+                    assert (
+                        await store.get_session_resume(-100, 77, "pi")
+                    ) == ResumeToken("pi", str(path))
+                return
             if mode in ("bound_other_project", "unbound_other_project"):
                 assert [(r.message_id, r.text) for r in pending] == (
                     [(3, "Не трогай авторизацию")] if command_first else []

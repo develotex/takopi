@@ -543,6 +543,8 @@ class LiveConversationService:
         key = (owner.chat_id, owner.thread_id, owner.session_key)
         if key in self._owners or any(
             registered.session_key == owner.session_key
+            or (registered.chat_id, registered.thread_id)
+            == (owner.chat_id, owner.thread_id)
             for registered in self._owners.values()
         ):
             return False
@@ -560,6 +562,20 @@ class LiveConversationService:
 
     def owner(self, chat: int, thread: int, session: str) -> LiveOwner | None:
         return self._owners.get((chat, thread, session))
+
+    def topic_owner(self, chat: int, thread: int) -> LiveOwner | None:
+        """Include finalizing owners, which still own the session and topic."""
+        matches = [
+            o
+            for o in self._owners.values()
+            if o.chat_id == chat and o.thread_id == thread
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def has_topic_owner(self, chat: int, thread: int) -> bool:
+        return any(
+            o.chat_id == chat and o.thread_id == thread for o in self._owners.values()
+        )
 
     def owner_for_topic(self, chat: int, thread: int) -> LiveOwner | None:
         matches = [

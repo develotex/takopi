@@ -1253,6 +1253,23 @@ async def _run_main_loop_impl(
                     return None
 
                 async def _wrapped(token: ResumeToken, done: anyio.Event) -> None:
+                    if (
+                        state.topic_store is not None
+                        and topic_key is not None
+                        and live is not None
+                        and token.engine == "pi"
+                    ):
+                        active_owner = live.topic_owner(*topic_key)
+                        if (
+                            active_owner is not None
+                            and token.value != active_owner.session_key
+                        ) or (
+                            active_owner is None
+                            and any(key[:2] == topic_key for key in starting_live)
+                        ):
+                            raise ValueError(
+                                "Pi session token cannot replace a live topic owner"
+                            )
                     if base_cb is not None:
                         await base_cb(token, done_override or done)
                     if state.topic_store is not None and topic_key is not None:
@@ -1592,8 +1609,10 @@ async def _run_main_loop_impl(
                                     provisional_id = await verify_fresh_session(
                                         rpc, path, cwd
                                     )
-                            except Exception as exc:  # noqa: BLE001 - canonical identity required before prompt
+                            except BaseException as exc:  # noqa: BLE001 - cancellation must close the claimed RPC too
                                 await rpc.client.close()
+                                if not isinstance(exc, Exception):
+                                    raise
                                 await send_plain(
                                     cfg.exec_cfg.transport,
                                     chat_id=chat_id,
@@ -1618,6 +1637,7 @@ async def _run_main_loop_impl(
                             identity_verified=provisional_id is None,
                         )
                         if not live.register(owner):
+                            await rpc.client.close()
                             await send_plain(
                                 cfg.exec_cfg.transport,
                                 chat_id=chat_id,
@@ -1642,9 +1662,11 @@ async def _run_main_loop_impl(
                                     chat_id, topic_key[1], canonical
                                 )
                                 resume_token = canonical
-                            except Exception as exc:  # noqa: BLE001 - no prompt on failed identity
+                            except BaseException as exc:  # noqa: BLE001 - no prompt on failed identity or cancellation
                                 live.unregister(owner)
                                 await rpc.client.close()
+                                if not isinstance(exc, Exception):
+                                    raise
                                 logger.warning(
                                     "live.legacy_identity.failed", error=str(exc)
                                 )
@@ -1661,17 +1683,22 @@ async def _run_main_loop_impl(
                         )
                         if fresh_pending.get(topic_key, (None, 0))[0] == path:
                             fresh_pending.pop(topic_key, None)
-                        await live.flush(owner)
-                        initial_intent = await live.inbox.initial_for_topic(
-                            chat_id, topic_key[1]
-                        )
-                        if (
-                            initial_intent is not None
-                            and initial_intent.session_key == owner.session_key
-                        ):
-                            await live.inbox.mark_initial_uncertain(
-                                initial_intent.id, owner.session_key
+                        try:
+                            await live.flush(owner)
+                            initial_intent = await live.inbox.initial_for_topic(
+                                chat_id, topic_key[1]
                             )
+                            if (
+                                initial_intent is not None
+                                and initial_intent.session_key == owner.session_key
+                            ):
+                                await live.inbox.mark_initial_uncertain(
+                                    initial_intent.id, owner.session_key
+                                )
+                        except BaseException:
+                            live.unregister(owner)
+                            await rpc.client.close()
+                            raise
 
                         owned_live = live
                         assert owned_live is not None
@@ -2481,6 +2508,29 @@ async def _run_main_loop_impl(
                     ambient_context=ambient_context,
                 )
 
+            def live_topic_running(topic_key: tuple[int, int] | None) -> bool:
+                return (
+                    live is not None
+                    and topic_key is not None
+                    and (
+                        live.has_topic_owner(*topic_key)
+                        or any(key[:2] == topic_key for key in starting_live)
+                    )
+                )
+
+            async def live_plugin_blocked(topic_key: tuple[int, int] | None) -> bool:
+                if live is None or topic_key is None:
+                    return False
+                if live_topic_running(topic_key):
+                    return True
+                if await live.inbox.initial_for_topic(*topic_key) is not None:
+                    return True
+                return any(
+                    receipt.chat_id == topic_key[0]
+                    and receipt.thread_id == topic_key[1]
+                    for receipt in await live.inbox.unresolved_all()
+                )
+
             async def route_message(msg: TelegramIncomingMessage) -> None:
                 reply = make_reply(cfg, msg)
                 classification = _classify_message(msg, files_enabled=cfg.files.enabled)
@@ -2591,6 +2641,11 @@ async def _run_main_loop_impl(
                                 "Project/branch command cannot target the active Pi task; use another topic or wait for completion.",
                             )
                             return
+                if command_id in ("new", "ctx") and live_topic_running(topic_key):
+                    await reply(
+                        text=f"/{command_id} cannot change a topic with an active or starting Pi task. Wait for completion."
+                    )
+                    return
                 if command_id == "new":
                     if topic_key is not None and live is not None:
                         initial = await live.inbox.initial_for_topic(
@@ -3080,6 +3135,14 @@ async def _run_main_loop_impl(
                                 "Pi recovery queue full; nothing submitted. Please retry later.",
                             )
                         return
+                    if active is not None and (
+                        active.running_task is None
+                        or ambient_context != active.running_task.context
+                    ):
+                        await reply(
+                            text="/update was not sent: topic context differs from the active Pi task. Restore its project/branch or wait for completion."
+                        )
+                        return
                     if active is None and key is not None and key in starting_live:
                         await live.buffer_starting(
                             chat_id,
@@ -3112,6 +3175,11 @@ async def _run_main_loop_impl(
                     if command_id not in state.command_ids:
                         refresh_commands()
                     if command_id in state.command_ids:
+                        if await live_plugin_blocked(topic_key):
+                            await reply(
+                                text="Plugin command not accepted while this Pi live topic has active or unresolved work. Use another topic or resolve the task first."
+                            )
+                            return
                         engine_resolution = await resolve_engine_defaults(
                             explicit_engine=None,
                             context=ambient_context,
@@ -3445,6 +3513,12 @@ async def _run_main_loop_impl(
                         if command_id in state.command_ids:
                             callback_msg = _callback_message(update)
                             ctx = await build_message_context(callback_msg)
+                            if await live_plugin_blocked(ctx.topic_key):
+                                await cfg.bot.answer_callback_query(
+                                    callback_query_id=update.callback_query_id,
+                                    text="Pi live task active or unresolved; command not accepted.",
+                                )
+                                return
                             engine_resolution = await resolve_engine_defaults(
                                 explicit_engine=None,
                                 context=ctx.ambient_context,
