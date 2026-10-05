@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import anyio
 import pytest
@@ -15,6 +16,7 @@ import pytest
 from takopi.model import CompletedEvent, ResumeToken, StartedEvent
 from takopi.runners.pi import PiRunner
 from takopi.runners.pi_rpc import PiRpcClient, PiRpcRun
+from takopi.telegram.live_conversation import verify_bound_session, verify_fresh_session
 from takopi.runners.run_options import EngineRunOptions, apply_run_options
 
 
@@ -381,6 +383,56 @@ async def test_close_reaps_tool_descendants_before_releasing_session(
             and Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
         ):
             os.kill(pid, signal.SIGKILL)  # Only the synthetic test child.
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["fresh", "bound"])
+async def test_identity_change_after_verification_refuses_prompt(
+    tmp_path: Path, mode: str
+) -> None:
+    path = tmp_path / "session.jsonl"
+    if mode == "bound":
+        path.write_text(
+            json.dumps({"type": "session", "id": "aaa11111", "cwd": str(tmp_path)})
+            + "\n"
+        )
+
+    class Client:
+        def __init__(self):
+            self.cwd = tmp_path
+            self.session_path = path
+            self.states = 0
+            self.prompts = 0
+
+        async def start(self):
+            pass
+
+        async def request(self, typ: str, **_fields):
+            if typ == "get_state":
+                self.states += 1
+                return {
+                    "data": {
+                        "sessionId": "aaa11111" if self.states == 1 else "bbb22222",
+                        "sessionFile": str(path),
+                        "isStreaming": False,
+                    }
+                }
+            assert typ == "prompt"
+            self.prompts += 1
+            return {"data": {"disposition": "started"}}
+
+        async def events(self):
+            yield {"type": "agent_start"}
+
+    fake_client = Client()
+    rpc = PiRpcRun(cast(PiRpcClient, fake_client))
+    if mode == "fresh":
+        await verify_fresh_session(rpc, path, tmp_path)
+    else:
+        await verify_bound_session(rpc, path, tmp_path)
+    with pytest.raises(RuntimeError, match=r"session.*mismatch"):
+        await anext(rpc.run("Do not send this", None))
+    assert fake_client.prompts == 0
 
 
 @pytest.mark.anyio

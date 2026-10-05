@@ -149,6 +149,23 @@ async def test_relative_jsonl_resume_claims_against_runner_cwd(
 
 
 @pytest.mark.anyio
+async def test_new_one_shot_session_may_claim_unique_future_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "sessions"))
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    state = runner.new_state("New task", None)
+    path = Path(state.resume.value)
+    assert not path.exists()
+    with pi_rpc.enable_live_claims():
+        async with runner.pre_spawn_scope(state, None):
+            assert not path.exists(), "Pi writes the fresh header after prompt"
+
+
+@pytest.mark.anyio
 async def test_absolute_jsonl_from_foreign_project_cannot_spawn_one_shot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

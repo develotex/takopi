@@ -12,7 +12,7 @@ import pytest
 from takopi.config import ProjectConfig, ProjectsConfig
 from takopi.context import RunContext
 from takopi.markdown import MarkdownPresenter
-from takopi.model import ResumeToken
+from takopi.model import CompletedEvent, ResumeToken, StartedEvent
 from takopi.router import AutoRouter, RunnerEntry
 from takopi.runner_bridge import ExecBridgeConfig
 from takopi.runners.pi import PiRunner
@@ -28,16 +28,22 @@ from tests.telegram_fakes import FakeBot, FakeTransport
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("case", ["missing", "foreign_project"])
+@pytest.mark.parametrize("case", ["missing", "foreign_project", "relative"])
 async def test_bound_pi_session_fails_closed_before_any_prompt(
     tmp_path: Path, case: str
 ):
     config = tmp_path / "takopi.toml"
     path = tmp_path / "pi-live-sessions" / "-100-77-existing.jsonl"
-    if case == "foreign_project":
+    if case in ("foreign_project", "relative"):
         path.parent.mkdir()
         path.write_text(
-            json.dumps({"type": "session", "id": "abc", "cwd": str(tmp_path / "other")})
+            json.dumps(
+                {
+                    "type": "session",
+                    "id": "abc",
+                    "cwd": str(tmp_path if case == "relative" else tmp_path / "other"),
+                }
+            )
             + "\n"
         )
 
@@ -46,6 +52,10 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
             self.client = self
             self.session_path = path
             self.requests = []
+            self.prompts = []
+            self.cwd = tmp_path
+            self._active = False
+            self._prompt_started = False
 
         async def request(self, typ):
             self.requests.append(typ)
@@ -58,9 +68,12 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
                 }
             }
 
-        async def run(self, *_):
-            raise AssertionError("Unverified bound Pi prompt forbidden")
-            yield  # pragma: no cover
+        async def run(self, prompt, _resume):
+            if case != "relative":
+                raise AssertionError("Unverified bound Pi prompt forbidden")
+            self.prompts.append(prompt)
+            yield StartedEvent(engine="pi", resume=ResumeToken("pi", str(path)))
+            yield CompletedEvent(engine="pi", ok=True, answer="done")
 
         async def close(self):
             pass
@@ -95,7 +108,16 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
     )
     store = TopicStateStore(resolve_state_path(config))
     await store.set_context(-100, 77, RunContext(project="test"))
-    await store.set_session_resume(-100, 77, ResumeToken(engine="pi", value=str(path)))
+    await store.set_session_resume(
+        -100,
+        77,
+        ResumeToken(
+            engine="pi",
+            value="pi-live-sessions/-100-77-existing.jsonl"
+            if case == "relative"
+            else str(path),
+        ),
+    )
     transport = FakeTransport()
     cfg = TelegramBridgeConfig(
         bot=FakeBot(),
@@ -125,6 +147,12 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
         )
 
     await run_main_loop(cfg, poller)
+    if case == "relative":
+        assert rpc.prompts and rpc.prompts[0].endswith("Perform task")
+        assert await store.get_session_resume(-100, 77, "pi") == ResumeToken(
+            "pi", str(path)
+        )
+        return
     assert rpc.requests == ([] if case == "missing" else ["get_state"])
     assert any(
         "no prompt submitted" in item["message"].text.lower()

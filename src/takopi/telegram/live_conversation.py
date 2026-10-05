@@ -92,6 +92,7 @@ async def verify_legacy_session(
         raise ValueError(
             "Pi session identity/project mismatch; no prompt was submitted"
         )
+    rpc.expected_session_id = data["sessionId"]
 
 
 def session_header_id(session_path: Path) -> str:
@@ -130,6 +131,7 @@ async def verify_fresh_session(rpc: PiRpcRun, session_path: Path, cwd: Path) -> 
         raise ValueError(
             "Fresh Pi session identity/project mismatch; no prompt was submitted"
         )
+    rpc.expected_session_id = data["sessionId"]
     return data["sessionId"]
 
 

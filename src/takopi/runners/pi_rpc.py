@@ -278,6 +278,7 @@ class PiRpcRun:
     def __init__(self, client: PiRpcClient) -> None:
         self.client = client
         self.session_key: str | None = None
+        self.expected_session_id: str | None = None
         self._active = False
         self._prompt_started = False
         self._unsettled = False
@@ -315,8 +316,14 @@ class PiRpcRun:
                 raise RuntimeError(
                     "Pi RPC get_state returned no persistent session identity"
                 )
-            self.session_key = data["sessionId"]
             session_file = str(Path(data["sessionFile"]).resolve())
+            if session_file != str(self.client.session_path.resolve()) or (
+                self.expected_session_id is not None
+                and data["sessionId"] != self.expected_session_id
+            ):
+                raise RuntimeError("Pi RPC session identity mismatch before prompt")
+            self.session_key = data["sessionId"]
+            self.expected_session_id = self.session_key
             if resume is not None:
                 if resume.engine != ENGINE:
                     raise RuntimeError("Pi RPC resume engine mismatch")

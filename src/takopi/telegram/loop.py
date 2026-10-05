@@ -19,6 +19,7 @@ from ..logging import get_logger
 from ..model import EngineId, ResumeToken
 from ..runners.run_options import EngineRunOptions, apply_run_options
 from ..runners.pi import PiRunner
+from ..runners.pi_identity import session_header as pi_session_header
 from ..runners.pi_rpc import PiRpcRun, enable_live_claims
 from .live_conversation import (
     LiveConversationService,
@@ -1483,8 +1484,9 @@ async def _run_main_loop_impl(
                         resume_token=resume_token, engine_override=engine_override
                     )
                     root = (config_path.parent / "pi-live-sessions").resolve()
+                    cwd = cfg.runtime.resolve_run_cwd(context) or Path.cwd()
                     path = (
-                        Path(resume_token.value).resolve()
+                        (cwd / resume_token.value).resolve()
                         if resume_token is not None
                         else fresh_pending.get(topic_key, (None, 0))[0]
                         or live_session_path(config_path, chat_id, topic_key[1])
@@ -1505,12 +1507,11 @@ async def _run_main_loop_impl(
                     )
                     existing = (
                         resume_token is not None
-                        and Path(resume_token.value).is_absolute()
+                        and Path(resume_token.value).suffix == ".jsonl"
                         and path.suffix == ".jsonl"
                         and path.is_file()
                         and bound == resume_token
                     )
-                    cwd = cfg.runtime.resolve_run_cwd(context) or Path.cwd()
                     unresolved_initial = await live.inbox.initial_for_topic(
                         chat_id, topic_key[1]
                     )
@@ -1537,6 +1538,7 @@ async def _run_main_loop_impl(
                     if (
                         resume_token is not None
                         and not Path(resume_token.value).is_absolute()
+                        and Path(resume_token.value).suffix != ".jsonl"
                         and bound == resume_token
                         and isinstance(entry.runner, PiRunner)
                         and entry.available
@@ -1627,6 +1629,18 @@ async def _run_main_loop_impl(
                                 else:
                                     provisional_id = await verify_fresh_session(
                                         rpc, path, cwd
+                                    )
+                                if (
+                                    existing
+                                    and resume_token is not None
+                                    and resume_token.value != str(path)
+                                ):
+                                    resume_token = ResumeToken(
+                                        engine="pi", value=str(path)
+                                    )
+                                    assert state.topic_store is not None
+                                    await state.topic_store.set_session_resume(
+                                        chat_id, topic_key[1], resume_token
                                     )
                             except BaseException as exc:  # noqa: BLE001 - cancellation must close the claimed RPC too
                                 startup_cancel.pop(startup_key, None)
@@ -1926,8 +1940,8 @@ async def _run_main_loop_impl(
                     )
                 finally:
                     if isinstance(job.chat_id, int) and isinstance(job.thread_id, int):
-                        start_key = live_route_key(
-                            job.chat_id, job.thread_id, job.resume_token
+                        start_key = scoped_live_key(
+                            job.chat_id, job.thread_id, job.resume_token, job.context
                         )
                         if (
                             start_key is not None
@@ -1940,6 +1954,33 @@ async def _run_main_loop_impl(
 
             scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
             starting_live: set[tuple[int, int, str]] = set()
+
+            def scoped_live_key(
+                chat: int,
+                thread: int | None,
+                token: ResumeToken | None,
+                context: RunContext | None,
+            ) -> tuple[int, int, str] | None:
+                if token is not None and token.engine == "pi":
+                    candidate = Path(token.value)
+                    if not candidate.is_absolute() and candidate.suffix == ".jsonl":
+                        try:
+                            cwd = cfg.runtime.resolve_run_cwd(context)
+                        except ConfigError:
+                            return None
+                        if cwd is None:
+                            return None
+                        path = (cwd / candidate).resolve()
+                        header = pi_session_header(path)
+                        if (
+                            header is None
+                            or not isinstance(header.get("cwd"), str)
+                            or Path(header["cwd"]).resolve() != cwd.resolve()
+                        ):
+                            return None
+                        token = ResumeToken(engine="pi", value=str(path))
+                return live_route_key(chat, thread, token)
+
             startup_cancel: dict[tuple[int, int, int], RunningTask] = {}
             plugin_inflight: set[tuple[int, int]] = set()
             retry_starting: set[tuple[int, int, str]] = set()
@@ -2179,7 +2220,7 @@ async def _run_main_loop_impl(
                         candidate = await state.topic_store.get_session_resume(
                             chat_id, topic_key[1], "pi"
                         )
-                    key = live_route_key(chat_id, msg.thread_id, candidate)
+                    key = scoped_live_key(chat_id, msg.thread_id, candidate, context)
                     initial_fresh = False
                     if candidate is None and topic_key in fresh_pending:
                         provisional, first_id = fresh_pending[topic_key]
@@ -2301,7 +2342,7 @@ async def _run_main_loop_impl(
                     return
                 resume_token = resume_decision.resume_token
                 if live_eligible and live is not None and resume_token is not None:
-                    key = live_route_key(chat_id, msg.thread_id, resume_token)
+                    key = scoped_live_key(chat_id, msg.thread_id, resume_token, context)
                     if key is not None and await live.handle(
                         chat_id,
                         key[1],
@@ -2335,7 +2376,9 @@ async def _run_main_loop_impl(
                                     (chat_id, topic_key[1], str(provisional))
                                 )
                     return
-                start_key = live_route_key(chat_id, msg.thread_id, resume_token)
+                start_key = scoped_live_key(
+                    chat_id, msg.thread_id, resume_token, context
+                )
                 if live_eligible and live is not None and start_key is not None:
                     starting_live.add(start_key)
                 progress_ref = await _send_queued_progress(
@@ -2907,7 +2950,9 @@ async def _run_main_loop_impl(
                         if state.topic_store is not None and topic_key is not None
                         else None
                     )
-                    key = live_route_key(chat_id, msg.thread_id, candidate)
+                    key = scoped_live_key(
+                        chat_id, msg.thread_id, candidate, ambient_context
+                    )
                     if key is None and candidate is None and topic_key in fresh_pending:
                         provisional, _ = fresh_pending[topic_key]
                         key = (chat_id, topic_key[1], str(provisional))
@@ -3000,7 +3045,9 @@ async def _run_main_loop_impl(
                             )
                             return
                         if candidate is not None and (
-                            live_route_key(chat_id, msg.thread_id, candidate)
+                            scoped_live_key(
+                                chat_id, msg.thread_id, candidate, ambient_context
+                            )
                             != intent_key
                         ):
                             await reply(
@@ -3428,7 +3475,9 @@ async def _run_main_loop_impl(
                                 chat_id, topic_key[1], "pi"
                             )
                         )
-                        key = live_route_key(chat_id, msg.thread_id, candidate)
+                        key = scoped_live_key(
+                            chat_id, msg.thread_id, candidate, resolved_live.context
+                        )
                         if (
                             key is None
                             and candidate is None

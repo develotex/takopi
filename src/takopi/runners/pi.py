@@ -336,6 +336,11 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 else resolve_legacy_session(token, cwd)
             )
         async with claim_one_shot(path):
+            if resume is None:
+                if path.exists():
+                    raise ValueError("Pi fresh session path already exists")
+                yield  # New Pi writes its header only after the first prompt.
+                return
             header = session_header(path)
             if (
                 header is None

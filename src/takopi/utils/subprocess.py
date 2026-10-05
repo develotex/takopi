@@ -45,8 +45,8 @@ def _signal_process(
     fallback: Callable[[], None],
     log_event: str,
 ) -> None:
-    if proc.returncode is not None:
-        return
+    # A reaped Pi parent can still leave tools in its dedicated process group.
+    # The group must be signalled even when its leader already exited.
     if os.name == "posix" and proc.pid is not None:
         try:
             os.killpg(proc.pid, sig)
@@ -60,6 +60,8 @@ def _signal_process(
                 error_type=exc.__class__.__name__,
                 pid=proc.pid,
             )
+    if proc.returncode is not None:
+        return
     try:
         fallback()
     except ProcessLookupError:
@@ -81,10 +83,15 @@ async def manage_subprocess(
     try:
         yield proc
     finally:
-        if proc.returncode is None:
-            with anyio.CancelScope(shield=True):
-                terminate_process(proc)
+        with anyio.CancelScope(shield=True):
+            terminate_process(proc)
+            if proc.returncode is None:
                 timed_out = await wait_for_process(proc, timeout=2.0)
                 if timed_out:
                     kill_process(proc)
                     await proc.wait()
+            if os.name == "posix":
+                # SIGTERM can be ignored by a background tool even after Pi
+                # exits; do not release the session claim with a live writer.
+                await anyio.sleep(0.1)
+                kill_process(proc)
