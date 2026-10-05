@@ -324,12 +324,25 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if not live_claims_enabled():
             yield  # Live opt-in off: preserve legacy one-shot semantics.
             return
-        from .pi_identity import resolve_legacy_session
+        from .pi_identity import resolve_legacy_session, session_header
 
         token = state.resume.value
         path = Path(token)
+        cwd = (get_run_base_dir() or Path.cwd()).resolve()
         if not path.is_absolute():
-            path = resolve_legacy_session(token, get_run_base_dir() or Path.cwd())
+            if path.suffix == ".jsonl":
+                path = (cwd / path).resolve()
+                header = session_header(path)
+                if (
+                    header is None
+                    or not isinstance(header.get("cwd"), str)
+                    or Path(header["cwd"]).resolve() != cwd
+                ):
+                    raise ValueError(
+                        "Pi relative session path is not a same-project JSONL"
+                    )
+            else:
+                path = resolve_legacy_session(token, cwd)
         async with claim_one_shot(path):
             yield
 

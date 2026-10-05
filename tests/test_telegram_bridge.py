@@ -1149,6 +1149,63 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
 
 
 @pytest.mark.anyio
+async def test_live_pi_queued_callback_never_steers_or_drops_a_cross_topic_job() -> (
+    None
+):
+    transport = FakeTransport()
+    cfg = replace(
+        make_cfg(transport),
+        pi_live_conversation=True,
+        show_resume_line=False,
+        session_mode="chat",
+    )
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    class _Control(RunnerTurnControl):
+        def __init__(self) -> None:
+            self.steered: list[str] = []
+
+        async def steer(self, text: str) -> None:
+            self.steered.append(text)
+
+        async def interrupt(self) -> bool:
+            return True
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    token = ResumeToken(engine="pi", value="/tmp/existing-pi.jsonl")
+    progress_id = 91
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=10,
+        text="instruction from other topic",
+        resume_token=token,
+        thread_id=222,
+        progress_ref=MessageRef(channel_id=123, message_id=progress_id),
+    )
+    control = _Control()
+    running = RunningTask(resume=token, control=control)
+    query = TelegramCallbackQuery(
+        transport="telegram",
+        chat_id=123,
+        message_id=progress_id,
+        callback_query_id="cbq-live-cross-topic",
+        data="takopi:steer",
+        sender_id=123,
+    )
+    await telegram_loop.handle_callback_steer(
+        cfg,
+        query,
+        {MessageRef(channel_id=123, message_id=7, thread_id=111): running},
+        scheduler,
+    )
+    assert control.steered == []
+    assert await scheduler.get_queued(123, progress_id) is not None
+    assert "queued" in cast(FakeBot, cfg.bot).callback_calls[-1]["text"]
+
+
+@pytest.mark.anyio
 async def test_handle_callback_steer_claims_job_before_awaiting_steer() -> None:
     transport = FakeTransport()
     cfg = replace(

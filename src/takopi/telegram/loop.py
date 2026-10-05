@@ -1344,6 +1344,94 @@ async def _run_main_loop_impl(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
+                # All Pi launch paths (including media, directives and queued
+                # one-shot jobs) pass this gate, not just the opt-in RPC branch.
+                # Otherwise a legacy prompt can overtake an unresolved live
+                # instruction or write a Pi file bound to another topic.
+                if (
+                    live is not None
+                    and engine_for_overrides == "pi"
+                    and recovery_initial_id is None
+                    and recovery_rpc is None
+                ):
+                    if topic_key is not None:
+                        intent = await live.inbox.initial_for_topic(*topic_key)
+                        original_scheduled = (
+                            intent is not None
+                            and allow_live
+                            and resume_token is None
+                            and intent.state == "scheduled"
+                            and intent.message_id == user_msg_id
+                            and fresh_pending.get(topic_key, (None, 0))[0]
+                            == Path(intent.session_key)
+                            and intent.prompt == text
+                        )
+                        if intent is not None and not original_scheduled:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text=f"Initial Pi task #{intent.message_id} remains unresolved; no prompt submitted. Use scoped recovery.",
+                            )
+                            return
+                        outstanding = [
+                            receipt
+                            for receipt in await live.inbox.unresolved_all()
+                            if receipt.chat_id == chat_id
+                            and receipt.thread_id == topic_key[1]
+                            and receipt.message_id <= user_msg_id
+                        ]
+                        if outstanding and not original_scheduled:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Prior Pi update is unresolved; no prompt submitted. Reconcile, retry or defer its receipt first.",
+                            )
+                            return
+                    if resume_token is not None and state.topic_store is not None:
+                        try:
+                            cwd_for_claim = (
+                                cfg.runtime.resolve_run_cwd(context) or Path.cwd()
+                            )
+                            candidate_path = Path(resume_token.value)
+                            if not candidate_path.is_absolute():
+                                candidate_path = (
+                                    (cwd_for_claim / candidate_path).resolve()
+                                    if candidate_path.suffix == ".jsonl"
+                                    else resolve_legacy_session(
+                                        resume_token.value, cwd_for_claim
+                                    )
+                                )
+                            candidate_path = candidate_path.resolve()
+                            other_owners = await state.topic_store.session_owners(
+                                "pi",
+                                str(candidate_path),
+                                session_header_id(candidate_path)
+                                if candidate_path.is_file()
+                                else None,
+                            )
+                        except (ValueError, OSError, ConfigError):
+                            other_owners = None
+                        if other_owners is None or (
+                            other_owners
+                            and (topic_key is None or other_owners - {topic_key})
+                        ):
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text=(
+                                    "Pi session ID не найден однозначно в этом проекте; no prompt submitted."
+                                    if not Path(resume_token.value).is_absolute()
+                                    and Path(resume_token.value).suffix != ".jsonl"
+                                    else "Pi session identity or topic owner cannot be verified; no prompt submitted."
+                                ),
+                            )
+                            return
                 from ..runner_bridge import RunningTask
 
                 running_task = RunningTask(context=context)
@@ -2020,6 +2108,17 @@ async def _run_main_loop_impl(
                     )
                     if active is not None and key is None:
                         key = (chat_id, topic_key[1], active.session_key)
+                    if active is not None and (
+                        active.running_task is None
+                        or resolved.context != active.running_task.context
+                    ):
+                        await live._startup_reply(
+                            chat_id,
+                            topic_key[1],
+                            user_msg_id,
+                            "Project/branch directive was not sent to the active Pi task. Wait for completion or use a separate topic.",
+                        )
+                        return
                     if (
                         key is not None
                         and active is None
@@ -2250,7 +2349,7 @@ async def _run_main_loop_impl(
                 if (
                     live is not None
                     and pending.topic_key is not None
-                    and resolved.context_source == "directives"
+                    and resolved.engine_override in (None, "pi")
                     and not pending.forwards
                     and not pending.is_voice_transcribed
                     and fresh_pending.get(pending.topic_key, (None, 0))[1]
@@ -2457,6 +2556,41 @@ async def _run_main_loop_impl(
 
                 command_id = classification.command_id
                 args_text = classification.args_text
+                # Project commands can bypass ordinary-text live interception via
+                # dispatch_command. Never let a command for another project/branch
+                # run or steer under this topic's active Pi session identity.
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and command_id is not None
+                ):
+                    active_pi = live.owner_for_topic(chat_id, topic_key[1])
+                    if active_pi is not None:
+                        try:
+                            command_target = cfg.runtime.resolve_message(
+                                text=text,
+                                reply_text=msg.reply_to_text,
+                                ambient_context=ambient_context,
+                                chat_id=chat_id,
+                            )
+                        except DirectiveError:
+                            command_target = None
+                        if (
+                            command_target is not None
+                            and command_target.context_source == "directives"
+                            and (
+                                active_pi.running_task is None
+                                or command_target.context
+                                != active_pi.running_task.context
+                            )
+                        ):
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Project/branch command cannot target the active Pi task; use another topic or wait for completion.",
+                            )
+                            return
                 if command_id == "new":
                     if topic_key is not None and live is not None:
                         initial = await live.inbox.initial_for_topic(
@@ -3116,9 +3250,54 @@ async def _run_main_loop_impl(
                         )
                         if active is not None and key is None:
                             key = (chat_id, topic_key[1], active.session_key)
+                        if active is not None and (
+                            active.running_task is None
+                            or resolved_live.context != active.running_task.context
+                        ):
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Project/branch directive was not sent to the active Pi task. Wait for completion or use a separate topic.",
+                            )
+                            return
                         replied_task = (
                             state.running_tasks.get(reply_ref) if reply_ref else None
                         )
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is None
+                            and key in starting_live
+                            and state.topic_store is not None
+                        ):
+                            bound_context = await state.topic_store.get_context(
+                                *topic_key
+                            )
+                            initial = await live.inbox.initial_for_topic(*topic_key)
+                            context_mismatch = (
+                                bound_context is not None
+                                and resolved_live.context != bound_context
+                            )
+                            if bound_context is None and initial is not None:
+                                try:
+                                    target_cwd = cfg.runtime.resolve_run_cwd(
+                                        resolved_live.context
+                                    )
+                                    context_mismatch = (
+                                        target_cwd is None
+                                        or str(target_cwd.resolve()) != initial.cwd
+                                    )
+                                except ConfigError:
+                                    context_mismatch = True
+                            if context_mismatch:
+                                await live._startup_reply(
+                                    chat_id,
+                                    topic_key[1],
+                                    msg.message_id,
+                                    "Project/branch directive was not sent to the starting Pi task. Use another topic or wait for completion.",
+                                )
+                                return
                         if (
                             engine_live.engine == "pi"
                             and key is not None

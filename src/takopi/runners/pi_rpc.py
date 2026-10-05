@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -226,6 +227,7 @@ class PiRpcClient:
     async def _close_claimed_child(self) -> None:
         self._fail(RuntimeError("Pi RPC client closed"))
         proc = self._proc
+        group_safe = os.name != "posix" or proc is None
         try:
             if proc is not None:
                 if proc.stdin is not None:
@@ -242,13 +244,23 @@ class PiRpcClient:
                     except TimeoutError:
                         proc.kill()
                         await proc.wait()
+                # Pi can exit while a tool/subagent still holds its session
+                # file open. The RPC claim is not safe to release until its
+                # dedicated POSIX process group is terminated too.
+                if os.name == "posix":
+                    with suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    await anyio.sleep(0.1)
+                    with suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    group_safe = True
         finally:
             for task in self._tasks:
                 task.cancel()
             if self._tasks:
                 await asyncio.gather(*self._tasks, return_exceptions=True)
             # If reaping fails, retain ownership and permit a second close.
-            if proc is None or proc.returncode is not None:
+            if group_safe and (proc is None or proc.returncode is not None):
                 self._closed = True
                 await _release_owner(self.session_path, self)
 
@@ -376,7 +388,19 @@ class PiRpcRun:
             if self._interrupting:
                 return True
             self._interrupting = True
-            # Pi's abort continues queued steer/follow-up work unless cleared first.
-            await self.client.request("clear_queue")
+            # Preserve stdin command order, but a stalled clear_queue response
+            # must not prevent abort from being sent. Do not claim a clean
+            # cancellation when the clear acknowledgement was never observed.
+            clear_error: Exception | None = None
+            try:
+                async with asyncio.timeout(0.2):
+                    ident, future = await self.client.send_request("clear_queue")
+                    await self.client.wait_response(ident, future)
+            except (TimeoutError, RuntimeError) as exc:
+                clear_error = exc
             await self.client.request("abort")
+            if clear_error is not None:
+                raise RuntimeError(
+                    "Pi RPC queue clear unconfirmed; abort requested"
+                ) from clear_error
             return True

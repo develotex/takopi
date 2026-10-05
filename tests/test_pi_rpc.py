@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -306,6 +308,79 @@ async def test_interrupt_clears_pending_steer_before_abort(
         await stream.aclose()
     finally:
         await rpc.close()
+
+
+@pytest.mark.anyio
+async def test_interrupt_does_not_wait_for_stalled_clear_queue_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rpc = PiRpcClient(tmp_path / "session.jsonl", tmp_path, [])
+    run = PiRpcRun(rpc)
+    run._unsettled = True
+    writes: list[str] = []
+    clear_future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+
+    async def send_request(typ: str, **_fields: object):
+        writes.append(typ)
+        future = asyncio.Future()
+        if typ == "clear_queue":
+            future = clear_future
+        else:
+            future.set_result({"success": True})
+        return typ, future
+
+    async def wait_response(ident: str, future: asyncio.Future[dict[str, Any]]):
+        return await future
+
+    monkeypatch.setattr(rpc, "send_request", send_request)
+    monkeypatch.setattr(rpc, "wait_response", wait_response)
+    async with asyncio.timeout(1):
+        with pytest.raises(RuntimeError, match="queue clear unconfirmed"):
+            await run.interrupt()
+    assert writes == ["clear_queue", "abort"]
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    os.name != "posix" or not Path("/proc").exists(), reason="Linux process groups"
+)
+async def test_close_reaps_tool_descendants_before_releasing_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_pid = tmp_path / "child.pid"
+    script = tmp_path / "parent.py"
+    script.write_text(
+        "import pathlib, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid))\n"
+        "for line in sys.stdin.buffer: pass\n"
+    )
+    monkeypatch.setattr("takopi.runners.pi_rpc._PI_COMMAND", sys.executable)
+    rpc = PiRpcClient(tmp_path / "session.jsonl", tmp_path, ["-u", str(script)])
+    await rpc.start()
+    try:
+        async with asyncio.timeout(2):
+            while not child_pid.exists():
+                await asyncio.sleep(0.01)
+        pid = int(child_pid.read_text())
+    finally:
+        await rpc.close()
+    # Zombie descendants cannot execute or write the session; live descendants can.
+    try:
+        async with asyncio.timeout(1):
+            while (
+                Path(f"/proc/{pid}/stat").exists()
+                and Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+            ):
+                await asyncio.sleep(0.02)
+        assert rpc._closed
+    finally:
+        if (
+            Path(f"/proc/{pid}/stat").exists()
+            and Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+        ):
+            os.kill(pid, signal.SIGKILL)  # Only the synthetic test child.
 
 
 @pytest.mark.anyio

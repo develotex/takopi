@@ -23,7 +23,16 @@ from tests.telegram_fakes import FakeBot, FakeTransport
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("mode", ["fresh_caption", "bound_caption", "forward"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "fresh_caption",
+        "bound_caption",
+        "bound_caption_unresolved",
+        "foreign_caption",
+        "forward",
+    ],
+)
 async def test_composed_initial_prompt_routes_through_one_shot_not_live_rpc(
     tmp_path: Path, mode: str
 ):
@@ -60,9 +69,18 @@ async def test_composed_initial_prompt_routes_through_one_shot_not_live_rpc(
 
     runner = Runner()
     config = tmp_path / "takopi.toml"
-    if mode == "bound_caption":
+    if mode in ("bound_caption", "bound_caption_unresolved"):
+        bound = str(tmp_path / "existing.jsonl")
         await TopicStateStore(resolve_state_path(config)).set_session_resume(
-            -100, 77, ResumeToken("pi", str(tmp_path / "existing.jsonl"))
+            -100, 77, ResumeToken("pi", bound)
+        )
+        if mode == "bound_caption_unresolved":
+            inbox = LiveInbox(resolve_inbox_path(config))
+            receipt = await inbox.receive(-100, 77, 0, bound, "Use green")
+            await inbox.mark_uncertain(receipt.id, "RPC delivery ambiguous")
+    if mode == "foreign_caption":
+        await TopicStateStore(resolve_state_path(config)).set_session_resume(
+            -100, 88, ResumeToken("pi", str(tmp_path / "existing.jsonl"))
         )
     runtime = TransportRuntime(
         router=AutoRouter([RunnerEntry(engine="pi", runner=runner)], "pi"),
@@ -130,7 +148,11 @@ async def test_composed_initial_prompt_routes_through_one_shot_not_live_rpc(
                 message_id=1,
                 text="Review this file",
                 reply_to_message_id=None,
-                reply_to_text=None,
+                reply_to_text=(
+                    f"pi --session {tmp_path / 'existing.jsonl'}"
+                    if mode == "foreign_caption"
+                    else None
+                ),
                 sender_id=123,
                 document=TelegramDocument(
                     file_id="doc-1",
@@ -142,10 +164,18 @@ async def test_composed_initial_prompt_routes_through_one_shot_not_live_rpc(
             )
 
     await run_main_loop(cfg, poller)
-    assert len(runner.prompts) == 1
-    assert (
-        "Forwarded source content" if mode == "forward" else "[uploaded file:"
-    ) in runner.prompts[0]
+    if mode in ("bound_caption_unresolved", "foreign_caption"):
+        assert runner.prompts == [], "unsafe one-shot Pi must be gated"
+        assert any(
+            ("unresolved" if mode == "bound_caption_unresolved" else "topic owner")
+            in item["message"].text.lower()
+            for item in transport.send_calls
+        )
+    else:
+        assert len(runner.prompts) == 1
+        assert (
+            "Forwarded source content" if mode == "forward" else "[uploaded file:"
+        ) in runner.prompts[0]
     assert (
         await LiveInbox(resolve_inbox_path(config)).initial_for_topic(-100, 77) is None
     )

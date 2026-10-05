@@ -121,6 +121,34 @@ async def test_missing_short_id_fails_closed_only_when_live_opted_in(
 
 
 @pytest.mark.anyio
+async def test_relative_jsonl_resume_claims_against_runner_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "existing.jsonl"
+    path.write_text(
+        json.dumps({"type": "session", "id": uuid4().hex, "cwd": str(tmp_path)}) + "\n"
+    )
+    spawned = False
+
+    async def stop_after_claim(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("pre-spawn claim succeeded")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", stop_after_claim)
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    with (
+        pi_rpc.enable_live_claims(),
+        pytest.raises(AssertionError, match="pre-spawn claim"),
+    ):
+        await anext(runner.run("Task", ResumeToken("pi", "./existing.jsonl")))
+    assert spawned
+
+
+@pytest.mark.anyio
 async def test_rejected_one_shot_never_releases_the_real_rpc_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

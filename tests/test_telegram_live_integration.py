@@ -583,9 +583,12 @@ async def test_settlement_race_uses_same_owner_followup_once(tmp_path: Path):
         "unbound",
         "unbound_predebounce",
         "unbound_directive_first",
+        "unbound_pi_directive_first",
         "unbound_directive_after",
         "unbound_forward_after_update",
         "bound_held_steer_cancel",
+        "bound_other_project",
+        "unbound_other_project",
     ],
 )
 @pytest.mark.parametrize("command_first", [False, True])
@@ -600,14 +603,18 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
         "unbound",
         "unbound_predebounce",
         "unbound_directive_first",
+        "unbound_pi_directive_first",
         "unbound_directive_after",
         "unbound_forward_after_update",
+        "unbound_other_project",
     )
     predebounce = mode in (
         "unbound_predebounce",
         "unbound_directive_first",
+        "unbound_pi_directive_first",
         "unbound_directive_after",
         "unbound_forward_after_update",
+        "unbound_other_project",
     )
     held_steer = mode == "bound_held_steer_cancel"
     steer_entered = anyio.Event()
@@ -740,7 +747,13 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 path=tmp_path,
                 worktrees_dir=tmp_path / ".worktrees",
                 chat_id=-100,
-            )
+            ),
+            "other": ProjectConfig(
+                alias="other",
+                path=tmp_path / "other",
+                worktrees_dir=tmp_path / "other" / ".worktrees",
+                chat_id=-100,
+            ),
         },
         default_project=None,
         chat_map={-100: "test"},
@@ -780,13 +793,19 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             chat_id=-100,
             thread_id=77,
             message_id=1,
-            text="/test start" if mode == "unbound_directive_first" else "start",
+            text=(
+                "/pi Build original task"
+                if mode == "unbound_pi_directive_first"
+                else "/test start"
+                if mode == "unbound_directive_first"
+                else "start"
+            ),
             reply_to_message_id=None,
             reply_to_text=None,
             sender_id=123,
         )
         if not predebounce:
-            if unbound or held_steer:
+            if unbound or held_steer or mode == "bound_other_project":
                 await rpc.run_started.wait()
             else:
                 await progress_ready.wait()
@@ -797,6 +816,8 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
             message_id=2,
             text="/test Change goal"
             if mode == "unbound_directive_after"
+            else "/other Please deploy change"
+            if mode in ("bound_other_project", "unbound_other_project")
             else "/update Используй синий"
             if command_first
             else "Не трогай авторизацию",
@@ -872,6 +893,13 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                         "cancel must pass a held Pi steer response"
                     )
             pending = await LiveInbox(resolve_inbox_path(config)).pending(str(rpc.path))
+            if mode in ("bound_other_project", "unbound_other_project"):
+                assert [(r.message_id, r.text) for r in pending] == (
+                    [(3, "Не трогай авторизацию")] if command_first else []
+                ), "other-project directive must not reach this Pi"
+                assert all("Please deploy change" not in text for text in rpc.sent)
+                assert (await store.get_context(-100, 77)) == RunContext(project="test")
+                return
             assert [item.text for item in pending] == (
                 (["Используй синий"] if command_first else ["Не трогай авторизацию"])
                 if mode == "unbound_forward_after_update"
@@ -900,9 +928,11 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 assert [item.state for item in pending] == (
                     ["uncertain", "received"] if command_first else ["uncertain"]
                 )
-                assert rpc.prompts[0].endswith("start"), (
-                    "initial task must not be replaced by rapid text"
-                )
+                assert rpc.prompts[0].endswith(
+                    "Build original task"
+                    if mode == "unbound_pi_directive_first"
+                    else "start"
+                ), "initial task must not be replaced by rapid text"
                 assert not rpc.sent
             elif command_first and not unbound:
                 assert [item.state for item in pending] == ["uncertain", "received"]

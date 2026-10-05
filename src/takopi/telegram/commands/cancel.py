@@ -177,6 +177,16 @@ async def handle_callback_steer(
         )
         return
 
+    # A queued Pi callback has no durable live receipt or exact topic ownership
+    # proof. Never turn it into an untracked RPC steer (or replay an ambiguous
+    # steer after timeout); keep the queued job for normal guarded dispatch.
+    if cfg.pi_live_conversation and job.resume_token.engine == "pi":
+        await cfg.bot.answer_callback_query(
+            callback_query_id=query.callback_query_id,
+            text="Pi live updates must use /update in the active topic; still queued.",
+        )
+        return
+
     control = None
     for running_task in running_tasks.values():
         if running_task.resume == job.resume_token:
