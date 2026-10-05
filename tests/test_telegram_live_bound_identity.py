@@ -168,6 +168,7 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
         "unknown_callback",
         "callback_race",
         "forwarded_legacy_callback",
+        "forwarded_queued_callback",
     ],
 )
 async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
@@ -178,6 +179,25 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
     config = tmp_path / "takopi.toml"
     entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
     legacy_started = anyio.Event()
+    worker_queued, release_worker = anyio.Event(), anyio.Event()
+    if mode == "forwarded_queued_callback":
+        from takopi.scheduler import ThreadScheduler
+
+        original_worker = ThreadScheduler._thread_worker
+
+        async def delayed_worker(self, key):
+            worker_queued.set()
+            await release_worker.wait()
+            await original_worker(self, key)
+
+        monkeypatch.setattr(ThreadScheduler, "_thread_worker", delayed_worker)
+        bound = tmp_path / "legacy.jsonl"
+        bound.write_text(
+            json.dumps({"type": "session", "id": "abc", "cwd": str(tmp_path)}) + "\n"
+        )
+        store = TopicStateStore(resolve_state_path(config))
+        await store.set_context(-100, 77, RunContext(project="test"))
+        await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
     dispatches: list[str] = []
     monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
 
@@ -211,7 +231,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
             raise AssertionError("live start must wait for delayed plugin")
 
         async def run(self, *_args):
-            if mode == "forwarded_legacy_callback":
+            if mode in ("forwarded_legacy_callback", "forwarded_queued_callback"):
                 yield StartedEvent(
                     engine="pi",
                     resume=ResumeToken("pi", str(tmp_path / "legacy.jsonl")),
@@ -257,11 +277,13 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         ),
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
-        forward_coalesce_s=0.05 if mode == "forwarded_legacy_callback" else 0,
+        forward_coalesce_s=0.05
+        if mode in ("forwarded_legacy_callback", "forwarded_queued_callback")
+        else 0,
     )
 
     async def poller(_cfg):
-        if mode == "forwarded_legacy_callback":
+        if mode in ("forwarded_legacy_callback", "forwarded_queued_callback"):
             yield TelegramIncomingMessage(
                 transport="telegram",
                 chat_id=-100,
@@ -285,7 +307,10 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 raw={"forward_date": 1},
             )
             with anyio.fail_after(2):
-                await legacy_started.wait()
+                if mode == "forwarded_queued_callback":
+                    await worker_queued.wait()
+                else:
+                    await legacy_started.wait()
             yield TelegramCallbackQuery(
                 transport="telegram",
                 chat_id=-100,
@@ -351,6 +376,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                 "unknown_callback",
                 "callback_race",
                 "forwarded_legacy_callback",
+                "forwarded_queued_callback",
             ):
                 assert dispatches == [], (
                     "plugin callback with unproven topic must fail closed"
@@ -364,6 +390,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
                     is None
                 )
         finally:
+            release_worker.set()
             release.set()
 
 

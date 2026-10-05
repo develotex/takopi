@@ -893,6 +893,38 @@ async def test_handle_cancel_cancels_queued_job() -> None:
 
 
 @pytest.mark.anyio
+async def test_cancel_queued_forwarded_fallback_releases_topic_reservation() -> None:
+    released: list[tuple[int, int, int]] = []
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    def on_cancel(job) -> None:
+        assert job.legacy_fallback
+        released.append((job.chat_id, job.thread_id, job.user_msg_id))
+
+    scheduler = ThreadScheduler(
+        task_group=_NoopTaskGroup(),
+        run_job=_noop_run_job,
+        on_cancel_queued=on_cancel,
+    )
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=10,
+        text="forwarded",
+        thread_id=77,
+        resume_token=ResumeToken(engine="pi", value="existing.jsonl"),
+        progress_ref=MessageRef(channel_id=123, message_id=55),
+        legacy_fallback=True,
+    )
+    job = await scheduler.cancel_queued(123, 55)
+    assert job is not None
+    assert released == [(123, 77, 10)]
+    assert await scheduler.cancel_queued(123, 55) is None
+    assert released == [(123, 77, 10)]
+
+
+@pytest.mark.anyio
 async def test_handle_file_put_writes_file(tmp_path: Path) -> None:
     payload = b"hello"
 

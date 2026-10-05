@@ -1990,6 +1990,8 @@ async def _run_main_loop_impl(
                         allow_live=job.allow_live,
                     )
                 finally:
+                    if job.legacy_fallback:
+                        release_legacy_queued(job)
                     if isinstance(job.chat_id, int) and isinstance(job.thread_id, int):
                         start_key = reserved_pi_start_key(
                             job.chat_id, job.thread_id, job.resume_token, job.context
@@ -2003,7 +2005,22 @@ async def _run_main_loop_impl(
                         ):
                             starting_live.discard(start_key)
 
-            scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
+            def release_legacy_queued(job: ThreadJob) -> None:
+                if (
+                    isinstance(job.chat_id, int)
+                    and isinstance(job.thread_id, int)
+                    and isinstance(job.user_msg_id, int)
+                ):
+                    legacy_queued.discard((job.chat_id, job.thread_id, job.user_msg_id))
+                    legacy_pending.discard((job.chat_id, job.thread_id))
+
+            scheduler = ThreadScheduler(
+                task_group=tg,
+                run_job=run_thread_job,
+                on_cancel_queued=lambda job: release_legacy_queued(job)
+                if job.legacy_fallback
+                else None,
+            )
             starting_live: set[tuple[int, int, str]] = set()
 
             def resolve_stored_pi_alias(
@@ -2074,6 +2091,7 @@ async def _run_main_loop_impl(
             retry_starting: set[tuple[int, int, str]] = set()
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
             legacy_pending: set[tuple[int, int]] = set()
+            legacy_queued: set[tuple[int, int, int]] = set()
             recovery_queue: asyncio.Queue[Callable[[], Awaitable[None]]] = (
                 asyncio.Queue(maxsize=32)
             )
@@ -2260,6 +2278,7 @@ async def _run_main_loop_impl(
                 reply_ref: MessageRef | None,
                 reply_id: int | None,
                 live_eligible: bool = True,
+                legacy_fallback: bool = False,
             ) -> None:
                 chat_id = msg.chat_id
                 user_msg_id = msg.message_id
@@ -2478,17 +2497,30 @@ async def _run_main_loop_impl(
                     context=context,
                     steerable=await scheduler.is_busy(resume_token),
                 )
-                await scheduler.enqueue_resume(
-                    chat_id,
-                    user_msg_id,
-                    prompt_text,
-                    resume_token,
-                    context,
-                    msg.thread_id,
-                    chat_session_key,
-                    progress_ref,
-                    allow_live=live_eligible,
+                legacy_key = (
+                    (chat_id, topic_key[1], user_msg_id)
+                    if legacy_fallback and topic_key is not None
+                    else None
                 )
+                if legacy_key is not None:
+                    legacy_queued.add(legacy_key)
+                try:
+                    await scheduler.enqueue_resume(
+                        chat_id,
+                        user_msg_id,
+                        prompt_text,
+                        resume_token,
+                        context,
+                        msg.thread_id,
+                        chat_session_key,
+                        progress_ref,
+                        allow_live=live_eligible,
+                        legacy_fallback=legacy_fallback,
+                    )
+                except BaseException:
+                    if legacy_key is not None:
+                        legacy_queued.discard(legacy_key)
+                    raise
 
             async def run_prompt_from_upload(
                 msg: TelegramIncomingMessage,
@@ -2524,7 +2556,16 @@ async def _run_main_loop_impl(
                 try:
                     await _dispatch_pending_prompt_impl(pending)
                 finally:
-                    if pending.topic_key is not None and pending.forwards:
+                    if (
+                        pending.topic_key is not None
+                        and pending.forwards
+                        and (
+                            pending.topic_key[0],
+                            pending.topic_key[1],
+                            pending.msg.message_id,
+                        )
+                        not in legacy_queued
+                    ):
                         legacy_pending.discard(pending.topic_key)
 
             async def _dispatch_pending_prompt_impl(pending: _PendingPrompt) -> None:
@@ -2610,9 +2651,19 @@ async def _run_main_loop_impl(
                                 and resolved.context_source != "directives"
                             )
                         ),
+                        legacy_fallback=bool(pending.forwards),
                     )
                 finally:
-                    if pending.topic_key is not None and pending.forwards:
+                    if (
+                        pending.topic_key is not None
+                        and pending.forwards
+                        and (
+                            pending.topic_key[0],
+                            pending.topic_key[1],
+                            pending.msg.message_id,
+                        )
+                        not in legacy_queued
+                    ):
                         legacy_pending.discard(pending.topic_key)
 
             forward_coalescer = ForwardCoalescer(
@@ -2832,6 +2883,7 @@ async def _run_main_loop_impl(
                                 pending_forward.forwards.append(
                                     (msg.message_id, msg.text)
                                 )
+                            legacy_pending.add(forward_topic)
                             if (
                                 intent is not None
                                 and intent.message_id == pending_forward.msg.message_id
@@ -2849,7 +2901,6 @@ async def _run_main_loop_impl(
                                         intent.session_key,
                                     )
                                 )
-                                legacy_pending.add(forward_topic)
                         finally:
                             barrier.set()
                             pending_forward.forward_barrier = None
