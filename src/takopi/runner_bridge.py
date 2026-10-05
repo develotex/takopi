@@ -337,6 +337,7 @@ async def run_runner_with_cancel(
     on_thread_known: Callable[[ResumeToken, anyio.Event], Awaitable[None]] | None,
 ) -> RunOutcome:
     outcome = RunOutcome()
+    cancel_done = anyio.Event()
     async with anyio.create_task_group() as tg:
 
         async def run_runner() -> None:
@@ -381,21 +382,30 @@ async def run_runner_with_cancel(
                         outcome.completed = evt
                     await edits.on_event(evt)
             finally:
+                if running_task is not None and running_task.cancel_requested.is_set():
+                    outcome.cancelled = True
+                    # The stream may settle while clear_queue is awaiting an ACK.
+                    # Do not cancel the abort worker or report success here.
+                    with anyio.move_on_after(35, shield=True):
+                        await cancel_done.wait()
                 tg.cancel_scope.cancel()
 
         async def wait_cancel(task: RunningTask) -> None:
             await task.cancel_requested.wait()
-            if task.control is not None:
+            outcome.cancelled = True
+            with anyio.CancelScope(shield=True):
                 try:
-                    await task.control.interrupt()
+                    if task.control is not None:
+                        await task.control.interrupt()
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "runner.control_interrupt_failed",
                         error=str(exc),
                         error_type=exc.__class__.__name__,
                     )
-            outcome.cancelled = True
-            tg.cancel_scope.cancel()
+                finally:
+                    cancel_done.set()
+                    tg.cancel_scope.cancel()
 
         tg.start_soon(run_runner)
         if running_task is not None:

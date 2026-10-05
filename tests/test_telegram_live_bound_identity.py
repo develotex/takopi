@@ -161,7 +161,9 @@ async def test_bound_pi_session_fails_closed_before_any_prompt(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("mode", ["delayed_plugin", "unknown_callback"])
+@pytest.mark.parametrize(
+    "mode", ["delayed_plugin", "unknown_callback", "callback_race"]
+)
 async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
@@ -178,6 +180,24 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         await release.wait()
 
     monkeypatch.setattr(loop, "dispatch_command", fake_dispatch)
+    if mode == "callback_race":
+        from takopi.telegram.live_conversation import LiveConversationService
+
+        raced = {"armed": False, "busy": False}
+        original_unresolved = LiveInbox.unresolved_all
+
+        async def race_after_last_await(self):
+            result = await original_unresolved(self)
+            if raced["armed"]:
+                raced["busy"] = True  # Pi owner registers while the guard awaits inbox.
+            return result
+
+        monkeypatch.setattr(LiveInbox, "unresolved_all", race_after_last_await)
+        monkeypatch.setattr(
+            LiveConversationService,
+            "has_topic_owner",
+            lambda _self, _chat, _thread: raced["busy"],
+        )
 
     class Runner(PiRunner):
         def rpc_run(self, *_args, **_kwargs):
@@ -226,7 +246,18 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
     )
 
     async def poller(_cfg):
-        if mode == "unknown_callback":
+        if mode == "callback_race":
+            raced["armed"] = True
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=1,
+                callback_query_id="topic-race",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "unknown_callback":
             yield TelegramCallbackQuery(
                 transport="telegram",
                 chat_id=-100,
@@ -267,7 +298,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
             with anyio.fail_after(2):
                 await emitted.wait()
             await anyio.sleep(0.05)
-            if mode == "unknown_callback":
+            if mode in ("unknown_callback", "callback_race"):
                 assert dispatches == [], (
                     "plugin callback with unproven topic must fail closed"
                 )

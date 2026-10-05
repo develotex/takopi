@@ -2700,10 +2700,17 @@ async def _run_main_loop_impl(
                     return True
                 if await live.inbox.initial_for_topic(*topic_key) is not None:
                     return True
-                return any(
-                    receipt.chat_id == topic_key[0]
-                    and receipt.thread_id == topic_key[1]
-                    for receipt in await live.inbox.unresolved_all()
+                receipts = await live.inbox.unresolved_all()
+                # This is the final check before callers synchronously reserve
+                # plugin_inflight; owner registration may have raced either await.
+                return (
+                    topic_key in plugin_inflight
+                    or live_topic_running(topic_key)
+                    or any(
+                        receipt.chat_id == topic_key[0]
+                        and receipt.thread_id == topic_key[1]
+                        for receipt in receipts
+                    )
                 )
 
             async def run_guarded_plugin(
