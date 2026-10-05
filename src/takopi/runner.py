@@ -640,6 +640,7 @@ class JsonlSubprocessRunner(BaseRunner):
         async with manage_subprocess(
             cmd,
             shield_start=self.shield_subprocess_start(),
+            kill_descendants=self.shield_subprocess_start(),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

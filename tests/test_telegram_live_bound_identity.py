@@ -292,6 +292,7 @@ async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
         ("identity", "root"),
         ("debounce", "none"),
         ("debounce", "root"),
+        ("empty_forward", "none"),
     ],
 )
 async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
@@ -324,8 +325,13 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
 
         async def run(self, *_args):
             self.prompt_sent = True
+            if phase == "empty_forward":
+                yield StartedEvent(
+                    engine="pi", resume=ResumeToken("pi", str(self.session_path))
+                )
+                yield CompletedEvent(engine="pi", ok=True, answer="done")
+                return
             raise AssertionError("cancelled startup must not submit a Pi prompt")
-            yield  # pragma: no cover
 
         async def close(self):
             pass
@@ -372,7 +378,7 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
         ),
         topics=TelegramTopicsSettings(enabled=True, scope="projects"),
         pi_live_conversation=True,
-        forward_coalesce_s=0.3 if phase == "debounce" else 0,
+        forward_coalesce_s=0.3 if phase in ("debounce", "empty_forward") else 0,
     )
 
     async def poller(_cfg):
@@ -386,6 +392,34 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
             reply_to_text=None,
             sender_id=123,
         )
+        if phase == "empty_forward":
+            await anyio.sleep(0.05)
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+                raw={"forward_date": 1},
+            )
+            with anyio.fail_after(2):
+                await entered.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=3,
+                text="/update Use green",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            emitted.set()
+            await asyncio.Event().wait()
+            return
         if phase == "identity":
             await entered.wait()
         else:
@@ -408,6 +442,14 @@ async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
         with anyio.fail_after(2):
             await emitted.wait()
         await anyio.sleep(0.05)
+        if phase == "empty_forward":
+            assert rpc_runs
+            assert (
+                await LiveInbox(resolve_inbox_path(config)).get((-100, 77, 3))
+            ).text == "Use green"
+            release.set()
+            tg.cancel_scope.cancel()
+            return
         release.set()
         await anyio.sleep(0.4 if phase == "debounce" else 0.1)
         assert all(not rpc.prompt_sent for rpc in rpc_runs)

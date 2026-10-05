@@ -74,6 +74,7 @@ async def manage_subprocess(
 ) -> AsyncIterator[Process]:
     """Ensure subprocesses receive SIGTERM, then SIGKILL after a 2s timeout."""
     shield_start = kwargs.pop("shield_start", False)
+    kill_descendants = kwargs.pop("kill_descendants", False)
     if os.name == "posix":
         kwargs.setdefault("start_new_session", True)
     # Do not release a session claim while cancellation can strand a newly
@@ -84,14 +85,15 @@ async def manage_subprocess(
         yield proc
     finally:
         with anyio.CancelScope(shield=True):
-            terminate_process(proc)
             if proc.returncode is None:
+                terminate_process(proc)
                 timed_out = await wait_for_process(proc, timeout=2.0)
                 if timed_out:
                     kill_process(proc)
                     await proc.wait()
-            if os.name == "posix":
-                # SIGTERM can be ignored by a background tool even after Pi
-                # exits; do not release the session claim with a live writer.
+            if kill_descendants and os.name == "posix":
+                # Only opted-in Pi claims own the background tool's session;
+                # preserve the other runners' successful-exit behavior.
+                terminate_process(proc)
                 await anyio.sleep(0.1)
                 kill_process(proc)

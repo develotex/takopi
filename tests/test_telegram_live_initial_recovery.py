@@ -45,6 +45,8 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "cancel_before_file",
         "cancel_after_file",
         "cancel_root_reply",
+        "cancel_original_reply",
+        "cancel_verify_fresh_original",
     ],
 )
 async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent_fifo(
@@ -86,6 +88,7 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
         "bound_bypass",
         "cancel_after_file",
         "cancel_root_reply",
+        "cancel_original_reply",
     ):
         path.parent.mkdir()
         path.write_text(
@@ -245,7 +248,13 @@ async def test_explicit_initial_recovery_preserves_original_prompt_and_dependent
                 thread_id=77,
                 message_id=51,
                 text="/cancel",
-                reply_to_message_id=77 if case == "cancel_root_reply" else None,
+                reply_to_message_id=(
+                    77
+                    if case == "cancel_root_reply"
+                    else 1
+                    if case in ("cancel_original_reply", "cancel_verify_fresh_original")
+                    else None
+                ),
                 reply_to_text=None,
                 sender_id=123,
             )

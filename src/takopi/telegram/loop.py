@@ -420,6 +420,7 @@ class _PendingPrompt:
     is_voice_transcribed: bool
     forwards: list[tuple[int, str]]
     cancel_scope: anyio.CancelScope | None = None
+    forward_barrier: anyio.Event | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1869,10 +1870,23 @@ async def _run_main_loop_impl(
                             logger.debug("live.reconcile.failed", error=str(exc))
 
                 try:
-                    if owner is not None and running_task.cancel_requested.is_set():
+                    if owner is not None and (
+                        running_task.cancel_requested.is_set()
+                        or (
+                            (
+                                recovery := recovery_cancel.get(
+                                    (chat_id, owner.thread_id, user_msg_id)
+                                )
+                            )
+                            is not None
+                            and recovery[0].is_set()
+                        )
+                    ):
                         assert live is not None
                         if (
-                            initial_intent is not None
+                            recovery_initial_id is None
+                            and initial_intent is not None
+                            and initial_intent.state == "scheduled"
                             and initial_intent.session_key == owner.session_key
                         ):
                             await live.inbox.mark_initial_deferred(
@@ -2474,6 +2488,15 @@ async def _run_main_loop_impl(
                 )
 
             async def _dispatch_pending_prompt(pending: _PendingPrompt) -> None:
+                try:
+                    await _dispatch_pending_prompt_impl(pending)
+                finally:
+                    if pending.topic_key is not None and pending.forwards:
+                        legacy_pending.discard(pending.topic_key)
+
+            async def _dispatch_pending_prompt_impl(pending: _PendingPrompt) -> None:
+                if pending.forward_barrier is not None:
+                    await pending.forward_barrier.wait()
                 msg = pending.msg
                 reply = make_reply(cfg, msg)
                 try:
@@ -2695,6 +2718,12 @@ async def _run_main_loop_impl(
                 text = classification.text
                 is_voice_transcribed = False
                 if classification.is_forward_candidate:
+                    # A captionless forward cannot be attached by the coalescer.
+                    # Never defer the durable initial intent or reserve the topic
+                    # for an update that the transport will silently ignore.
+                    if msg.sender_id is None or not msg.text.strip():
+                        forward_coalescer.attach_forward(msg)
+                        return
                     pending_forward = forward_coalescer._pending.get(_forward_key(msg))
                     if (
                         live is not None
@@ -2702,33 +2731,74 @@ async def _run_main_loop_impl(
                         and pending_forward.topic_key is not None
                     ):
                         forward_topic = pending_forward.topic_key
-                        intent = await live.inbox.initial_for_topic(*forward_topic)
-                        if (
-                            intent is not None
-                            and intent.message_id == pending_forward.msg.message_id
-                        ):
-                            dependent = await live.inbox.unresolved_for_topic(
-                                forward_topic[0], forward_topic[1], intent.session_key
+                        if pending_forward.forward_barrier is not None:
+                            await live._startup_reply(
+                                msg.chat_id,
+                                forward_topic[1],
+                                msg.message_id,
+                                "Forwarded composition is already being resolved; resend this forward.",
                             )
-                            if dependent or intent.state != "scheduled":
+                            return
+                        barrier = anyio.Event()
+                        pending_forward.forward_barrier = barrier
+                        try:
+                            intent = await live.inbox.initial_for_topic(*forward_topic)
+                            if (
+                                intent is not None
+                                and intent.message_id == pending_forward.msg.message_id
+                            ):
+                                dependent = await live.inbox.unresolved_for_topic(
+                                    forward_topic[0],
+                                    forward_topic[1],
+                                    intent.session_key,
+                                )
+                                if dependent or intent.state != "scheduled":
+                                    await live._startup_reply(
+                                        msg.chat_id,
+                                        forward_topic[1],
+                                        msg.message_id,
+                                        "Forwarded message not accepted: initial Pi task has dependent updates or may already have started. Resend after resolving the live task.",
+                                    )
+                                    return
+                            current = forward_coalescer._pending.get(_forward_key(msg))
+                            if current is not None and current is not pending_forward:
                                 await live._startup_reply(
                                     msg.chat_id,
                                     forward_topic[1],
                                     msg.message_id,
-                                    "Forwarded message not accepted: initial Pi task has dependent updates or may already have started. Resend after resolving the live task.",
+                                    "Forwarded composition changed; resend this forward.",
                                 )
                                 return
-                            await live.inbox.mark_initial_deferred(
-                                intent.id,
-                                intent.session_key,
-                                "Transport rerouted forwarded composition to legacy one-shot before Pi submission",
-                            )
-                            fresh_pending.pop(forward_topic, None)
-                            starting_live.discard(
-                                (forward_topic[0], forward_topic[1], intent.session_key)
-                            )
-                            legacy_pending.add(forward_topic)
-                    forward_coalescer.attach_forward(msg)
+                            if current is pending_forward:
+                                forward_coalescer.attach_forward(msg)
+                            else:
+                                # Its debounce already fired, but dispatch waits
+                                # on this barrier; attach to that exact prompt.
+                                pending_forward.forwards.append(
+                                    (msg.message_id, msg.text)
+                                )
+                            if (
+                                intent is not None
+                                and intent.message_id == pending_forward.msg.message_id
+                            ):
+                                await live.inbox.mark_initial_deferred(
+                                    intent.id,
+                                    intent.session_key,
+                                    "Transport rerouted forwarded composition to legacy one-shot before Pi submission",
+                                )
+                                fresh_pending.pop(forward_topic, None)
+                                starting_live.discard(
+                                    (
+                                        forward_topic[0],
+                                        forward_topic[1],
+                                        intent.session_key,
+                                    )
+                                )
+                                legacy_pending.add(forward_topic)
+                        finally:
+                            barrier.set()
+                    else:
+                        forward_coalescer.attach_forward(msg)
                     return
                 forward_key = _forward_key(msg)
                 if classification.is_media_group_document:
@@ -2798,7 +2868,15 @@ async def _run_main_loop_impl(
                                 for task in state.running_tasks.values()
                             )
                             and (
-                                cancel_reply_id is None
+                                (
+                                    cancel_reply_id is None
+                                    and sum(
+                                        task.thread_id == topic_key[1]
+                                        and ref.channel_id == chat_id
+                                        for ref, task in state.running_tasks.items()
+                                    )
+                                    == 1
+                                )
                                 or cancel_reply_id == owner.running_task.user_message_id
                                 or any(
                                     (chat, thread, command)
@@ -2819,8 +2897,36 @@ async def _run_main_loop_impl(
                                 handle_cancel,
                                 cfg,
                                 replace(
-                                    msg, reply_to_message_id=None, reply_to_text=None
+                                    msg,
+                                    reply_to_message_id=owner.running_task.user_message_id,
+                                    reply_to_text=None,
                                 ),
+                                state.running_tasks,
+                                scheduler,
+                            )
+                            return
+                        if (
+                            owner is not None
+                            and owner.running_task is not None
+                            and any(
+                                task is owner.running_task
+                                for task in state.running_tasks.values()
+                            )
+                        ):
+                            # Already running: a recovery event only fences a
+                            # future prompt and cannot interrupt the active task.
+                            # Let handle_cancel require an unambiguous target.
+                            cancel_msg = (
+                                replace(
+                                    msg, reply_to_message_id=None, reply_to_text=None
+                                )
+                                if cancel_reply_id is None
+                                else msg
+                            )
+                            tg.start_soon(
+                                handle_cancel,
+                                cfg,
+                                cancel_msg,
                                 state.running_tasks,
                                 scheduler,
                             )
@@ -2839,6 +2945,18 @@ async def _run_main_loop_impl(
                         ]
                         if len(recovery_pending) == 1:
                             recovery_pending[0].set()
+                            for (chat, thread, command), task in startup_cancel.items():
+                                if (
+                                    (chat, thread) == topic_key
+                                    and (
+                                        event := recovery_cancel.get(
+                                            (chat, thread, command)
+                                        )
+                                    )
+                                    is not None
+                                    and event[0] is recovery_pending[0]
+                                ):
+                                    task.cancel_requested.set()
                             await reply(
                                 text="Cancelling Pi recovery inspection; no retry prompt will be submitted."
                             )
