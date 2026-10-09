@@ -44,6 +44,7 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "document_before_running",
         "album_flush_before_initial",
         "initial_reservation_race",
+        "plugin_during_media",
     ],
 )
 async def test_media_in_forward_window_cannot_replace_initial_pi_task(
@@ -52,6 +53,14 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
     import takopi.telegram.loop as loop
 
     download_started, download_release = anyio.Event(), anyio.Event()
+    plugin_calls: list[str] = []
+    if media == "plugin_during_media":
+        monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
+
+        async def fake_dispatch(*_args, **_kwargs):
+            plugin_calls.append("dispatched")
+
+        monkeypatch.setattr(loop, "dispatch_command", fake_dispatch)
     if media == "initial_reservation_race":
         original_receive_initial = LiveInbox.receive_initial
 
@@ -119,7 +128,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
         async def run(
             self, prompt: str, resume: ResumeToken | None
         ) -> AsyncIterator[TakopiEvent]:
-            if media == "album_flush_before_initial":
+            if media in ("album_flush_before_initial", "plugin_during_media"):
                 yield StartedEvent(
                     engine="pi",
                     resume=ResumeToken("pi", str(tmp_path / "legacy.jsonl")),
@@ -167,7 +176,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             return File(file_path="files/hello.txt")
 
         async def download_file(self, file_path: str) -> bytes | None:
-            if media == "album_flush_before_initial":
+            if media in ("album_flush_before_initial", "plugin_during_media"):
                 download_started.set()
                 await download_release.wait()
                 return b"hello"
@@ -207,6 +216,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_running",
                 "album_flush_before_initial",
                 "initial_reservation_race",
+                "plugin_during_media",
             )
             else 1,
             text="Build original task",
@@ -225,6 +235,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_running",
                 "album_flush_before_initial",
                 "initial_reservation_race",
+                "plugin_during_media",
             )
             else 2,
             text="Album caption"
@@ -235,6 +246,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "single_document",
                 "album_flush_before_initial",
                 "initial_reservation_race",
+                "plugin_during_media",
             )
             else "@one @two Replace original"
             if media == "invalid_directive"
@@ -254,6 +266,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_running",
                 "album_flush_before_initial",
                 "initial_reservation_race",
+                "plugin_during_media",
             )
             else None,
             media_group_id="album-1"
@@ -265,6 +278,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_running",
                 "album_flush_before_initial",
                 "initial_reservation_race",
+                "plugin_during_media",
             )
             else None,
         )
@@ -273,13 +287,26 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             "document_before_running",
             "album_flush_before_initial",
             "initial_reservation_race",
+            "plugin_during_media",
         ):
             yield incoming_media
-            if media == "album_flush_before_initial":
+            if media in ("album_flush_before_initial", "plugin_during_media"):
                 with anyio.fail_after(2):
                     await download_started.wait()
-            yield initial
-            if media == "album_flush_before_initial":
+            if media == "plugin_during_media":
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=2,
+                    text="/spy change",
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=123,
+                )
+            else:
+                yield initial
+            if media in ("album_flush_before_initial", "plugin_during_media"):
                 await anyio.sleep(0.08)
                 assert runner.rpc is None, (
                     "initial Pi run overtook an active album upload"
@@ -290,7 +317,8 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             yield incoming_media
 
     await run_main_loop(cfg, poller)
-    if media == "album_flush_before_initial":
+    if media in ("album_flush_before_initial", "plugin_during_media"):
+        assert not plugin_calls, "plugin must not run during album processing"
         assert runner.rpc is None, (
             "Pi must not start concurrently with accepted album upload"
         )

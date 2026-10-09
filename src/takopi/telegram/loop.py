@@ -2944,7 +2944,7 @@ async def _run_main_loop_impl(
                 async with media_admission_locks.setdefault(topic_key, asyncio.Lock()):
                     if (
                         topic_key not in fresh_pending
-                        and not live.has_topic_owner(*topic_key)
+                        and not live_topic_running(topic_key)
                         and topic_key not in media_inflight
                         and topic_key not in legacy_pending
                         and topic_key not in plugin_inflight
@@ -3045,6 +3045,7 @@ async def _run_main_loop_impl(
                 if (
                     topic_key in plugin_inflight
                     or topic_key in legacy_pending
+                    or topic_key in media_inflight
                     or live_topic_running(topic_key)
                     or any(
                         ref.channel_id == topic_key[0]
@@ -3061,6 +3062,7 @@ async def _run_main_loop_impl(
                 return (
                     topic_key in plugin_inflight
                     or topic_key in legacy_pending
+                    or topic_key in media_inflight
                     or live_topic_running(topic_key)
                     or any(
                         ref.channel_id == topic_key[0]
@@ -4177,13 +4179,21 @@ async def _run_main_loop_impl(
                             chat_prefs=state.chat_prefs,
                             topic_store=state.topic_store,
                         )
-                        if await live_plugin_blocked(topic_key):
+                        if live is not None and topic_key is not None:
+                            async with media_admission_locks.setdefault(
+                                topic_key, asyncio.Lock()
+                            ):
+                                if await live_plugin_blocked(topic_key):
+                                    await reply(
+                                        text="Plugin command not accepted: Pi live topic became busy."
+                                    )
+                                    return
+                                plugin_inflight.add(topic_key)
+                        elif await live_plugin_blocked(topic_key):
                             await reply(
                                 text="Plugin command not accepted: Pi live topic became busy."
                             )
                             return
-                        if live is not None and topic_key is not None:
-                            plugin_inflight.add(topic_key)
                         tg.start_soon(
                             run_guarded_plugin,
                             topic_key,
@@ -4476,12 +4486,17 @@ async def _run_main_loop_impl(
                             async with media_admission_locks.setdefault(
                                 topic_key, asyncio.Lock()
                             ):
-                                if topic_key in media_inflight:
+                                if (
+                                    topic_key in media_inflight
+                                    or topic_key in plugin_inflight
+                                    or topic_key in legacy_pending
+                                    or live_topic_running(topic_key)
+                                ):
                                     await live._startup_reply(
                                         chat_id,
                                         topic_key[1],
                                         msg.message_id,
-                                        "Media group is being processed in this topic; this message was not accepted. Resend after it completes.",
+                                        "Another task is active in this topic; this message was not accepted. Resend after it completes.",
                                     )
                                     return
                                 existing_initial = await live.inbox.initial_for_topic(
@@ -4650,14 +4665,23 @@ async def _run_main_loop_impl(
                                 cfg.bot.answer_callback_query,
                                 update.callback_query_id,
                             )
-                            if await live_plugin_blocked(ctx.topic_key):
+                            if live is not None and ctx.topic_key is not None:
+                                async with media_admission_locks.setdefault(
+                                    ctx.topic_key, asyncio.Lock()
+                                ):
+                                    if await live_plugin_blocked(ctx.topic_key):
+                                        await cfg.bot.answer_callback_query(
+                                            callback_query_id=update.callback_query_id,
+                                            text="Pi live topic became busy; command not accepted.",
+                                        )
+                                        return
+                                    plugin_inflight.add(ctx.topic_key)
+                            elif await live_plugin_blocked(ctx.topic_key):
                                 await cfg.bot.answer_callback_query(
                                     callback_query_id=update.callback_query_id,
                                     text="Pi live topic became busy; command not accepted.",
                                 )
                                 return
-                            if live is not None and ctx.topic_key is not None:
-                                plugin_inflight.add(ctx.topic_key)
                             tg.start_soon(
                                 run_guarded_plugin,
                                 ctx.topic_key,
