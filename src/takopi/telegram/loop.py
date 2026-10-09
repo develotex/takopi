@@ -841,8 +841,10 @@ class MediaGroupBuffer:
         ],
         before_flush: Callable[[list[TelegramIncomingMessage]], Awaitable[bool]]
         | None = None,
+        after_flush: Callable[[list[TelegramIncomingMessage]], None] | None = None,
     ) -> None:
         self._before_flush = before_flush
+        self._after_flush = after_flush
         self._task_group = task_group
         self._debounce_s = debounce_s
         self._sleep = sleep
@@ -906,13 +908,17 @@ class MediaGroupBuffer:
                 messages
             ):
                 return
-            await handle_media_group(
-                self._cfg,
-                messages,
-                self._topic_store,
-                self._run_prompt_from_upload,
-                self._resolve_prompt_message,
-            )
+            try:
+                await handle_media_group(
+                    self._cfg,
+                    messages,
+                    self._topic_store,
+                    self._run_prompt_from_upload,
+                    self._resolve_prompt_message,
+                )
+            finally:
+                if self._after_flush is not None:
+                    self._after_flush(messages)
             return
 
 
@@ -2148,6 +2154,7 @@ async def _run_main_loop_impl(
                 tuple[int, int, int], tuple[asyncio.Event, int | None]
             ] = {}
             plugin_inflight: set[tuple[int, int]] = set()
+            media_inflight: set[tuple[int, int]] = set()
             retry_starting: set[tuple[int, int, str]] = set()
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
             legacy_pending: set[tuple[int, int]] = set()
@@ -2931,19 +2938,33 @@ async def _run_main_loop_impl(
                 if live is None:
                     return True
                 topic_key = resolve_topic_key(messages[0])
-                if topic_key is None or (
+                if topic_key is None:
+                    return True
+                if (
                     topic_key not in fresh_pending
                     and not live.has_topic_owner(*topic_key)
+                    and topic_key not in media_inflight
+                    and topic_key not in legacy_pending
+                    and topic_key not in plugin_inflight
                 ):
+                    # Reserve the topic through download and dispatch. An initial
+                    # Pi task arriving mid-upload must not start concurrently.
+                    media_inflight.add(topic_key)
                     return True
                 await make_reply(cfg, messages[0])(
-                    text="Media not accepted while a Pi live task owns this topic; resend after it finishes. Original task was not replaced."
+                    text="Media not accepted while this topic is busy; resend after the active task finishes."
                 )
                 return False
+
+            def release_media_group(messages: list[TelegramIncomingMessage]) -> None:
+                topic_key = resolve_topic_key(messages[0])
+                if topic_key is not None:
+                    media_inflight.discard(topic_key)
 
             media_group_buffer = MediaGroupBuffer(
                 task_group=tg,
                 before_flush=guard_media_group_before_flush,
+                after_flush=release_media_group,
                 debounce_s=state.media_group_debounce_s,
                 sleep=sleep,
                 cfg=cfg,
@@ -3161,6 +3182,18 @@ async def _run_main_loop_impl(
                 reply_id = ctx.reply_id
                 reply_ref = ctx.reply_ref
                 topic_key = ctx.topic_key
+                if (
+                    live is not None
+                    and topic_key in media_inflight
+                    and not classification.is_cancel
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Media group is being processed in this topic; this message was not accepted. Resend after it completes.",
+                    )
+                    return
                 if (
                     live is not None
                     and topic_key in legacy_pending

@@ -42,12 +42,15 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "document_before_initial",
         "invalid_directive",
         "document_before_running",
+        "album_flush_before_initial",
     ],
 )
 async def test_media_in_forward_window_cannot_replace_initial_pi_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, media: str
 ) -> None:
     import takopi.telegram.loop as loop
+
+    download_started, download_release = anyio.Event(), anyio.Event()
 
     class Rpc:
         def __init__(self, path: Path) -> None:
@@ -107,6 +110,13 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
         async def run(
             self, prompt: str, resume: ResumeToken | None
         ) -> AsyncIterator[TakopiEvent]:
+            if media == "album_flush_before_initial":
+                yield StartedEvent(
+                    engine="pi",
+                    resume=ResumeToken("pi", str(tmp_path / "legacy.jsonl")),
+                )
+                yield CompletedEvent(engine="pi", ok=True, answer="done")
+                return
             raise AssertionError("second media prompt must not steal the initial task")
             yield  # pragma: no cover
 
@@ -148,6 +158,10 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             return File(file_path="files/hello.txt")
 
         async def download_file(self, file_path: str) -> bytes | None:
+            if media == "album_flush_before_initial":
+                download_started.set()
+                await download_release.wait()
+                return b"hello"
             raise AssertionError(
                 "media must not upload while initial Pi prompt is reserved"
             )
@@ -178,7 +192,12 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             chat_id=-100,
             thread_id=77,
             message_id=2
-            if media in ("document_before_initial", "document_before_running")
+            if media
+            in (
+                "document_before_initial",
+                "document_before_running",
+                "album_flush_before_initial",
+            )
             else 1,
             text="Build original task",
             reply_to_message_id=None,
@@ -190,10 +209,21 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             chat_id=-100,
             thread_id=77,
             message_id=1
-            if media in ("document_before_initial", "document_before_running")
+            if media
+            in (
+                "document_before_initial",
+                "document_before_running",
+                "album_flush_before_initial",
+            )
             else 2,
             text="Album caption"
-            if media in ("album", "document_album", "single_document")
+            if media
+            in (
+                "album",
+                "document_album",
+                "single_document",
+                "album_flush_before_initial",
+            )
             else "@one @two Replace original"
             if media == "invalid_directive"
             else "",
@@ -210,6 +240,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "single_document",
                 "document_before_initial",
                 "document_before_running",
+                "album_flush_before_initial",
             )
             else None,
             media_group_id="album-1"
@@ -219,17 +250,40 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_album",
                 "document_before_initial",
                 "document_before_running",
+                "album_flush_before_initial",
             )
             else None,
         )
-        if media in ("document_before_initial", "document_before_running"):
+        if media in (
+            "document_before_initial",
+            "document_before_running",
+            "album_flush_before_initial",
+        ):
             yield incoming_media
+            if media == "album_flush_before_initial":
+                with anyio.fail_after(2):
+                    await download_started.wait()
             yield initial
+            if media == "album_flush_before_initial":
+                await anyio.sleep(0.08)
+                assert runner.rpc is None, (
+                    "initial Pi run overtook an active album upload"
+                )
+                download_release.set()
         else:
             yield initial
             yield incoming_media
 
     await run_main_loop(cfg, poller)
+    if media == "album_flush_before_initial":
+        assert runner.rpc is None, (
+            "Pi must not start concurrently with accepted album upload"
+        )
+        assert any(
+            "not accepted" in call["message"].text.lower()
+            for call in transport.send_calls
+        )
+        return
     assert runner.rpc is not None
     assert runner.rpc.prompts[0].endswith("Build original task")
     inbox = LiveInbox(resolve_inbox_path(config))

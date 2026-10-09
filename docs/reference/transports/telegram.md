@@ -41,8 +41,10 @@ forward window, later ordinary text is durably buffered as a dependent update,
 not substituted for it. Unsupported voice, document and album payloads cannot
 be safely joined to this initial text; they receive an explicit refusal and can
 be resent after the active task finishes (or after startup for a standalone
-voice/document). Malformed directives also cannot evict the initial
-prompt. The forward window length is unchanged. Document-caption and voice prompts use legacy
+voice/document). An album already being processed reserves its topic until
+upload/dispatch finishes; a Pi prompt arriving during that work is explicitly
+refused rather than starting concurrently. Malformed directives cannot evict
+the initial prompt. The forward window length is unchanged. Document-caption and voice prompts use legacy
 one-shot routing rather than claiming an incomplete live initial intent. Pi can
 return a canonical ID/path from `get_state` before it creates the new JSONL;
 that identity is provisional until the full ID and project header match. Takopi
