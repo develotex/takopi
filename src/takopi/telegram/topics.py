@@ -24,6 +24,7 @@ __all__ = [
     "_resolve_topics_scope",
     "_topic_icon_choice",
     "_topic_key",
+    "_topic_management_allowed",
     "_topic_title",
     "_topics_chat_allowed",
     "_topics_chat_project",
@@ -146,6 +147,12 @@ def _topic_key(
     return (msg.chat_id, msg.thread_id)
 
 
+def _topic_management_allowed(cfg: TelegramBridgeConfig, chat_id: int) -> bool:
+    # Telegram private chat IDs are positive; group/supergroup IDs are negative.
+    # Private-topic management belongs to the bot and needs no group admin right.
+    return cfg.topics.manage_topics or chat_id > 0
+
+
 def _topic_title(*, runtime: TransportRuntime, context: RunContext) -> str:
     project = (
         runtime.project_alias_for_key(context.project)
@@ -168,6 +175,8 @@ async def _maybe_rename_topic(
     context: RunContext,
     snapshot: TopicThreadSnapshot | None = None,
 ) -> None:
+    if not _topic_management_allowed(cfg, chat_id):
+        return
     title = _topic_title(runtime=cfg.runtime, context=context)
     if snapshot is None:
         snapshot = await store.get_thread(chat_id, thread_id)
@@ -276,6 +285,13 @@ async def _validate_topics_setup_for(
                 f"(chat_id={chat_id}); promote the bot to admin with manage topics."
             )
         if member.status == "creator":
+            continue
+        if not topics.manage_topics:
+            if member.status not in {"administrator", "member"}:
+                raise ConfigError(
+                    "topics enabled but bot cannot participate in the chat "
+                    f"(chat_id={chat_id}); add it as a member with permission to post."
+                )
             continue
         if member.status != "administrator":
             raise ConfigError(

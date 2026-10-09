@@ -15,7 +15,7 @@ Topics bind Telegram **forum threads** to a project/branch context. Each topic k
 
 - The chat is a **forum-enabled supergroup**
 - **Topics are enabled** in the group settings
-- The bot is an **admin** with **Manage Topics** permission
+- To create or rename topics, the bot is an **admin** with **Manage Topics** permission. To use existing topics only, the bot must be a member allowed to post in the group. For ordinary messages (not just commands and replies), disable bot privacy mode via @BotFather; non-admin bots with privacy mode enabled may not receive them.
 - If you want topics in project chats, set `projects.<alias>.chat_id`
 
 !!! note "Setting up workspace from scratch"
@@ -40,7 +40,10 @@ Topics bind Telegram **forum threads** to a project/branch context. Each topic k
     [transports.telegram.topics]
     enabled = true
     scope = "auto" # auto | main | projects | all
+    manage_topics = false # optional: use existing GROUP topics without admin rights
     ```
+
+Set `transports.telegram.topics.manage_topics` to `false` to use existing **group** topics only. Sessions, replies, `/new`, and `/ctx set` still work in existing group topics. In groups the bot will not create or rename topics; `/topic` replies with an explanation. Private chats, including creation and renaming of **private topics**, keep their previous behavior. The default is `true` for the usual managed-topic workflow. Startup checks group membership, not whether message delivery or posting works; verify both after changing bot rights/privacy mode.
 
 ### Scope explained
 
@@ -97,7 +100,7 @@ Topic bindings and sessions live in:
 - **"chat is not a supergroup" / "topics enabled but chat does not have topics"**
   - Convert the group to a supergroup and enable topics.
 - **"bot lacks manage topics permission"**
-  - Promote the bot to admin and grant Manage Topics.
+  - Grant Manage Topics only if the bot should create or rename topics. Otherwise set `transports.telegram.topics.manage_topics = false` and ensure it can post messages.
 
 ## Related
 
