@@ -6,6 +6,42 @@ from takopi.telegram.topic_state import TopicStateStore
 
 
 @pytest.mark.anyio
+async def test_session_owners_includes_short_id_aliases(tmp_path) -> None:
+    store = TopicStateStore(tmp_path / "topics.json")
+    path = str(tmp_path / "pi-live-sessions" / "session.jsonl")
+    ident = "abcdef0123456789abcdef0123456789"
+    await store.set_session_resume(1, 10, ResumeToken(engine="pi", value=ident[:12]))
+    await store.set_session_resume(1, 11, ResumeToken(engine="pi", value=path))
+    await store.set_session_resume(
+        1, 12, ResumeToken(engine="pi", value="deadbeef0000")
+    )
+    alias = path.replace("/session.jsonl", "/./session.jsonl")
+    await store.set_session_resume(1, 13, ResumeToken(engine="pi", value=alias))
+    assert await store.session_owners("pi", path, ident) == {(1, 10), (1, 11), (1, 13)}
+    assert await store.session_owners("pi", path) == {(1, 11), (1, 13)}
+
+
+@pytest.mark.anyio
+async def test_session_owners_resolves_project_relative_pi_aliases(tmp_path) -> None:
+    store = TopicStateStore(tmp_path / "topics.json")
+    project = tmp_path / "project"
+    absolute = (project / "sessions" / "same.jsonl").resolve()
+    await store.set_context(1, 20, RunContext(project="a"))
+    await store.set_session_resume(
+        1, 20, ResumeToken(engine="pi", value="sessions/same.jsonl")
+    )
+    await store.set_session_resume(1, 21, ResumeToken(engine="pi", value=str(absolute)))
+    owners = await store.session_owners(
+        "pi",
+        str(absolute),
+        relative_resolver=lambda _chat, _thread, ctx, alias: (
+            (project / alias).resolve() if ctx == RunContext(project="a") else None
+        ),
+    )
+    assert owners == {(1, 20), (1, 21)}
+
+
+@pytest.mark.anyio
 async def test_topic_state_store_roundtrip(tmp_path) -> None:
     path = tmp_path / "telegram_topics_state.json"
     store = TopicStateStore(path)

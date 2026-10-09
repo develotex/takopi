@@ -1,0 +1,266 @@
+"""Pre-spawn in-process canonical ownership for Pi RPC and one-shot runners."""
+
+import asyncio
+import json
+import sys
+from collections.abc import AsyncGenerator
+from typing import Any, cast
+
+import anyio
+from uuid import uuid4
+from pathlib import Path
+
+import pytest
+
+from takopi.model import ResumeToken, StartedEvent, TakopiEvent
+from takopi.runners.pi import PiRunner
+from takopi.runners.pi_rpc import PiRpcClient
+
+
+async def _running_rpc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PiRpcClient:
+    from takopi.runners import pi_rpc
+
+    script = tmp_path / "fake_pi.py"
+    script.write_text("import sys\nfor line in sys.stdin: pass\n")
+    monkeypatch.setattr(pi_rpc, "_PI_COMMAND", sys.executable)
+    rpc = PiRpcClient(tmp_path / "owned.jsonl", tmp_path, ["-u", str(script)])
+    await rpc.start()
+    return rpc
+
+
+@pytest.mark.anyio
+async def test_one_shot_cannot_spawn_over_rpc_canonical_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    rpc = await _running_rpc(tmp_path, monkeypatch)
+    spawned = False
+
+    async def forbidden_spawn(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("one-shot must not spawn against a claimed Pi session")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", forbidden_spawn)
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    try:
+        with pi_rpc.enable_live_claims(), pytest.raises(RuntimeError, match="owner"):
+            await anext(
+                runner.run("Another task", ResumeToken("pi", str(rpc.session_path)))
+            )
+        assert not spawned
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.anyio
+async def test_short_id_alias_cannot_spawn_over_rpc_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    rpc = await _running_rpc(tmp_path, monkeypatch)
+    ident = uuid4().hex
+    rpc.session_path.write_text(
+        json.dumps({"type": "session", "id": ident, "cwd": str(Path.cwd())}) + "\n"
+    )
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path))
+    spawned = False
+
+    async def forbidden_spawn(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("short ID cannot spawn a second owner")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", forbidden_spawn)
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    try:
+        with pi_rpc.enable_live_claims(), pytest.raises(RuntimeError, match="owner"):
+            await anext(runner.run("Another task", ResumeToken("pi", ident[:12])))
+        assert not spawned
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.anyio
+async def test_reverse_claim_blocks_rpc_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    path = tmp_path / "owned.jsonl"
+    async with pi_rpc.claim_one_shot(path):
+        rpc = PiRpcClient(path, tmp_path, [])
+        with pytest.raises(RuntimeError, match="owner"):
+            await rpc.start()
+    # The rejected RPC client may not remove another claimant's lease.
+    async with pi_rpc.claim_one_shot(path):
+        pass
+
+
+@pytest.mark.anyio
+async def test_missing_short_id_fails_closed_only_when_live_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    spawned = False
+
+    async def forbidden_spawn(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("legacy one-shot proceeds to child without a live claim")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", forbidden_spawn)
+    with (
+        pi_rpc.enable_live_claims(),
+        pytest.raises(ValueError, match="not uniquely found"),
+    ):
+        await anext(runner.run("Legacy", ResumeToken("pi", "deadbeef0000")))
+    assert not spawned
+    with pytest.raises(AssertionError, match="legacy one-shot proceeds"):
+        await anext(runner.run("Legacy", ResumeToken("pi", "deadbeef0000")))
+    assert spawned
+
+
+@pytest.mark.anyio
+async def test_relative_jsonl_resume_claims_against_runner_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "existing.jsonl"
+    path.write_text(
+        json.dumps({"type": "session", "id": uuid4().hex, "cwd": str(tmp_path)}) + "\n"
+    )
+    spawned = False
+
+    async def stop_after_claim(*args, **kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("pre-spawn claim succeeded")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", stop_after_claim)
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    with (
+        pi_rpc.enable_live_claims(),
+        pytest.raises(AssertionError, match="pre-spawn claim"),
+    ):
+        await anext(runner.run("Task", ResumeToken("pi", "./existing.jsonl")))
+    assert spawned
+
+
+@pytest.mark.anyio
+async def test_one_shot_claim_survives_inner_stream_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "existing.jsonl"
+    path.write_text(
+        json.dumps({"type": "session", "id": uuid4().hex, "cwd": str(tmp_path)}) + "\n"
+    )
+    cleanup_started, finish_cleanup = anyio.Event(), anyio.Event()
+
+    class Runner(PiRunner):
+        async def _run_with_state(
+            self, prompt: str, resume: ResumeToken | None, state: Any
+        ) -> AsyncGenerator[TakopiEvent]:
+            try:
+                yield StartedEvent(engine="pi", resume=ResumeToken("pi", str(path)))
+            finally:
+                cleanup_started.set()
+                await finish_cleanup.wait()
+
+    runner = Runner(extra_args=[], model=None, provider=None)
+    with pi_rpc.enable_live_claims():
+        stream = cast(
+            AsyncGenerator[TakopiEvent],
+            runner.run("Task", ResumeToken("pi", str(path))),
+        )
+        await anext(stream)
+        closer = asyncio.create_task(stream.aclose())
+        try:
+            with anyio.fail_after(1):
+                await cleanup_started.wait()
+            with pytest.raises(RuntimeError, match="owner"):
+                async with pi_rpc.claim_one_shot(path):
+                    pass
+        finally:
+            finish_cleanup.set()
+            await closer
+
+
+@pytest.mark.anyio
+async def test_new_one_shot_session_may_claim_unique_future_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PI_CODING_AGENT_SESSION_DIR", str(tmp_path / "sessions"))
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    state = runner.new_state("New task", None)
+    path = Path(state.resume.value)
+    assert not path.exists()
+    with pi_rpc.enable_live_claims():
+        async with runner.pre_spawn_scope(state, None):
+            assert not path.exists(), "Pi writes the fresh header after prompt"
+
+
+@pytest.mark.anyio
+async def test_absolute_jsonl_from_foreign_project_cannot_spawn_one_shot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "foreign.jsonl"
+    path.write_text(
+        json.dumps(
+            {"type": "session", "id": uuid4().hex, "cwd": str(tmp_path / "other")}
+        )
+        + "\n"
+    )
+    spawned = False
+
+    async def forbidden_spawn(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("foreign session must not spawn")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", forbidden_spawn)
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    with pi_rpc.enable_live_claims(), pytest.raises(ValueError, match="same-project"):
+        await anext(runner.run("Task", ResumeToken("pi", str(path))))
+    assert not spawned
+
+
+@pytest.mark.anyio
+async def test_rejected_one_shot_never_releases_the_real_rpc_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    rpc = await _running_rpc(tmp_path, monkeypatch)
+
+    async def forbidden_spawn(*args, **kwargs):
+        raise AssertionError("must refuse before spawn")
+
+    monkeypatch.setattr("takopi.utils.subprocess.anyio.open_process", forbidden_spawn)
+    runner = PiRunner(extra_args=[], model=None, provider=None)
+    try:
+        with pi_rpc.enable_live_claims():
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="owner"):
+                    await anext(
+                        runner.run(
+                            "Another task", ResumeToken("pi", str(rpc.session_path))
+                        )
+                    )
+    finally:
+        await rpc.close()

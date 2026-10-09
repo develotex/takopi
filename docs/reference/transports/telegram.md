@@ -16,6 +16,94 @@ This document captures current behavior so transport changes stay intentional.
 4. High-value messages enqueue a send.
 5. All writes go through the outbox.
 
+## Pi live conversation (opt-in)
+
+Set `pi_live_conversation = true` under `[transports.telegram]` and enable Telegram
+`topics`. New Pi tasks in a bound topic use one owned Pi RPC session. Pi RPC and
+one-shot subprocesses in this Takopi process share a canonical pre-spawn claim;
+this does **not** fence independent external Pi/Takopi processes. Existing
+topics with an absolute JSONL Pi session path can resume live when that exact
+path is bound to the topic and the file exists. Abbreviated legacy Pi IDs can
+migrate in the same topic: resolve one header-matched session in the current
+project, claim its canonical file, verify Pi `get_state` before any prompt, then
+update the topic binding. Missing/ambiguous IDs, project mismatch, and locally
+running one-shot aliases fail closed without prompt; retry after the active run
+settles. Already-running external Pi processes cannot be attached retroactively.
+Other engines and inactive topics without unresolved live receipts keep their
+current queue behavior. This requires a writable Takopi config directory for
+`telegram_live_inbox.json` and `pi-live-sessions/`. A new topic's initial Pi prompt
+and provisional canonical path are stored before forward debounce or any follow-up
+acknowledgement, so rapid messages cannot replace the original instruction. An
+eligible forwarded-message burst is switched to legacy one-shot **before** submitting
+the initial Pi prompt, only if no dependent live updates were accepted; otherwise
+the forward is explicitly refused. While the initial Pi text is waiting in the
+forward window, later ordinary text is durably buffered as a dependent update,
+not substituted for it. Unsupported voice, document and album payloads cannot
+be safely joined to this initial text; they receive an explicit refusal and can
+be resent after the active task finishes (or after startup for a standalone
+voice/document). An album already being processed reserves its topic until
+upload/dispatch finishes; a Pi prompt arriving during that work is explicitly
+refused rather than starting concurrently. Malformed directives cannot evict
+the initial prompt. The forward window length is unchanged. Document-caption and voice prompts use legacy
+one-shot routing rather than claiming an incomplete live initial intent. Pi can
+return a canonical ID/path from `get_state` before it creates the new JSONL;
+that identity is provisional until the full ID and project header match. Takopi
+will not bind the topic, attest delivery, or publish a successful final result
+without that later verification.
+
+During an active Pi task, ask a status question in the same topic for an isolated,
+short-lived no-tools Pi answer. Its snapshot includes only a validated public
+progress phase and aggregate same-session receipt-state counts. Raw task and update
+text, receipt reasons, assistant transcript, and tool/subagent output are never
+sent to the isolated process. Use
+`/update <instruction>` to unambiguously send a constraint to the main task.
+Ordinary Russian messages such as «Как дела?», «Не трогай авторизацию» and
+«Как дела? И ещё — не трогай авторизацию» are supported, as are English status
+questions and `? Also ...` instructions. Other ambiguous messages ask for
+clarification rather than silently
+changing the task. Commands `/cancel` and `/new`, media, and explicitly different
+resume routes keep their existing behavior.
+
+An update is persisted before the **received** reply. **Submitted** means the RPC
+command accepted it, not that Pi read it. **Delivered** requires observation of
+the exact user message in the main Pi stream. **Considered/deferred** requires an
+explicit main-agent marker and explanation; no marker means no consideration claim.
+If a command response is lost, the receipt stays **uncertain** and blocks later
+submissions in that session. A queued steer can still execute later (for example,
+after a tool returns), so `/update defer` refuses submitted receipts and uncertain
+receipts whose Pi acceptance cannot be disproved. Only a provably local follow-up
+still queued in this running owner can be withdrawn; after restart that proof is
+lost and explicit deferral is refused. Locally queued follow-ups also remain
+uncertain until the continuation prompt starts; a successful final answer is not published while
+any receipt remains unresolved. On restart, a scoped notice lists the receipt ID
+and state without repeating private text. No automatic retry occurs. To withdraw a
+not-yet-submitted receipt, use `/update defer <original-message-id> <reason>` in its
+topic; refusal means Pi may already have accepted it, and no local status change
+can retract Pi's queue. To retry, use
+`/update retry <original-message-id> confirm` in that same bound topic. If idle,
+Takopi claims the canonical RPC owner, verifies session identity and project, and
+inspects the main-session messages before submitting the exact original marked
+update as the first cancellable continuation prompt. A missing marker does **not**
+prove Pi never applied the update: an explicit retry may duplicate effects. A
+conflicting owner, different topic/session, or prior unresolved receipt refuses
+the retry. Other topics are unaffected. The isolated quick answer
+is never fed into the writable main session. Replies remain in the same topic and
+are associated with the original user message. At most 16 quick questions can wait
+per active topic; when full, the next question is explicitly refused rather than
+silently dropped.
+
+If Takopi restarts while a **new topic's initial Pi task** is uncertain (including
+before its JSONL file exists), it sends a scoped notice with the original message ID
+but no prompt text. Neither the original task nor dependent updates are automatically
+replayed. Use `/update retry-initial <original-message-id> confirm` in that exact
+project/topic to inspect the canonical session, then explicitly restart the original
+prompt if absent or continue from its observed state if present. Explicit retry can
+repeat tool effects; an unknown outcome is never treated as proof of non-acceptance.
+Use `/update defer-initial <original-message-id> <reason>` to abandon that initial
+task; any dependent receipts still require separate reconciliation. An uncertain
+receipt cannot be marked deferred without proof that Pi never accepted it.
+Wrong project, conflicting topic owner, or unverifiable session refuses retry.
+
 ## Incoming messages
 
 `parse_incoming_update` accepts text messages and voice notes.

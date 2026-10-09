@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import anyio
+
 from ...logging import get_logger
 from ...progress import ProgressTracker
 from ...runner_bridge import RunningTasks
@@ -177,11 +179,25 @@ async def handle_callback_steer(
         )
         return
 
+    # A live RPC steer requires a durable receipt. A legacy queued Pi turn
+    # outside that owner retains its existing button; never steer across topics.
+    from ...runners.pi_rpc import PiRpcRun
+
     control = None
-    for running_task in running_tasks.values():
-        if running_task.resume == job.resume_token:
-            control = running_task.control
-            break
+    for ref, running_task in running_tasks.items():
+        if running_task.resume != job.resume_token:
+            continue
+        if cfg.pi_live_conversation and job.resume_token.engine == "pi":
+            if ref.channel_id != job.chat_id or running_task.thread_id != job.thread_id:
+                continue
+            if isinstance(running_task.control, PiRpcRun):
+                await cfg.bot.answer_callback_query(
+                    callback_query_id=query.callback_query_id,
+                    text="Pi live updates must use /update in the active topic; still queued.",
+                )
+                return
+        control = running_task.control
+        break
     if control is None:
         await cfg.bot.answer_callback_query(
             callback_query_id=query.callback_query_id,
@@ -199,7 +215,13 @@ async def handle_callback_steer(
 
     try:
         await control.steer(claimed.text)
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001 - cancellation may leave steer outcome unknown
+        if not isinstance(exc, Exception):
+            # Never replay a steer that may have reached the active turn. Do not
+            # leave the claimed fallback's topic reserved after task shutdown.
+            with anyio.CancelScope(shield=True):
+                await scheduler.settle_claimed(claimed)
+            raise
         await scheduler.requeue_front(claimed)
         logger.warning(
             "steer.failed",
@@ -215,6 +237,7 @@ async def handle_callback_steer(
         )
         return
 
+    await scheduler.settle_claimed(claimed)
     await _edit_labelled_message(cfg, progress_ref, claimed, label="steered")
     await cfg.bot.answer_callback_query(
         callback_query_id=query.callback_query_id,
