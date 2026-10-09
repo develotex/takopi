@@ -212,6 +212,13 @@ async def test_full_quick_queue_reports_question_not_accepted(tmp_path: Path):
             "повтор"
             in next(text for message, text in replies if message == 117).lower()
         )
+        # If the notice queue is saturated too, the refusal must not vanish.
+        svc._startup_notices = asyncio.Queue(maxsize=1)
+        svc._startup_notices.put_nowait((1, 10, 999, "occupied"))
+        await svc.handle(1, 10, 118, owner.session_key, "How is progress?")
+        assert any(
+            message == 118 and "повтор" in text.lower() for message, text in replies
+        )
         release.set()
         svc.unregister(owner)
         svc.stop_workers()

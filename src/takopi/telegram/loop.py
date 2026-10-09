@@ -839,7 +839,10 @@ class MediaGroupBuffer:
             [TelegramIncomingMessage, str, RunContext | None],
             Awaitable[ResolvedMessage | None],
         ],
+        before_flush: Callable[[list[TelegramIncomingMessage]], Awaitable[bool]]
+        | None = None,
     ) -> None:
+        self._before_flush = before_flush
         self._task_group = task_group
         self._debounce_s = debounce_s
         self._sleep = sleep
@@ -897,6 +900,10 @@ class MediaGroupBuffer:
                     reserved_chat_commands=self._reserved_chat_commands,
                 )
                 for msg in messages
+            ):
+                return
+            if self._before_flush is not None and not await self._before_flush(
+                messages
             ):
                 return
             await handle_media_group(
@@ -2918,8 +2925,25 @@ async def _run_main_loop_impl(
                 prompt = _build_upload_prompt(resolved.prompt, annotation)
                 await run_prompt_from_upload(msg, prompt, resolved)
 
+            async def guard_media_group_before_flush(
+                messages: list[TelegramIncomingMessage],
+            ) -> bool:
+                if live is None:
+                    return True
+                topic_key = resolve_topic_key(messages[0])
+                if topic_key is None or (
+                    topic_key not in fresh_pending
+                    and not live.has_topic_owner(*topic_key)
+                ):
+                    return True
+                await make_reply(cfg, messages[0])(
+                    text="Media not accepted while a Pi live task owns this topic; resend after it finishes. Original task was not replaced."
+                )
+                return False
+
             media_group_buffer = MediaGroupBuffer(
                 task_group=tg,
+                before_flush=guard_media_group_before_flush,
                 debounce_s=state.media_group_debounce_s,
                 sleep=sleep,
                 cfg=cfg,
@@ -3599,6 +3623,20 @@ async def _run_main_loop_impl(
                 ):
                     return
 
+                # A reserved initial prompt cannot be replaced by unsupported
+                # media. Refuse before transcription or upload has side effects.
+                if (
+                    live is not None
+                    and topic_key in fresh_pending
+                    and (msg.voice is not None or msg.document is not None)
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Media not accepted during Pi startup; resend after the first task starts. Original task is still queued.",
+                    )
+                    return
                 if msg.voice is not None:
                     text = await transcribe_voice(
                         bot=cfg.bot,
@@ -3613,21 +3651,6 @@ async def _run_main_loop_impl(
                     if text is None:
                         return
                     is_voice_transcribed = True
-                # The initial Pi prompt is already durably reserved while the
-                # forward window is open. Unsupported media must not replace it
-                # in ForwardCoalescer; do not silently pass a partial payload.
-                if (
-                    live is not None
-                    and topic_key in fresh_pending
-                    and msg.voice is not None
-                ):
-                    await live._startup_reply(
-                        chat_id,
-                        topic_key[1],
-                        msg.message_id,
-                        "Media not accepted during Pi startup; resend after the first task starts. Original task is still queued.",
-                    )
-                    return
                 if msg.document is not None:
                     if cfg.files.enabled and cfg.files.auto_put:
                         caption_text = text.strip()
@@ -4443,6 +4466,19 @@ async def _run_main_loop_impl(
                             )
                             fresh_pending[topic_key] = (provisional, msg.message_id)
                             starting_live.add((chat_id, topic_key[1], str(provisional)))
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and (reserved := fresh_pending.get(topic_key)) is not None
+                    and reserved[1] != msg.message_id
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Message not accepted during Pi startup; original task is still queued. Resend after it starts.",
+                    )
+                    return
                 forward_coalescer.schedule(pending)
 
             allowed_user_ids = set(cfg.allowed_user_ids)

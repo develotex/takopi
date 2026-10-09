@@ -38,9 +38,11 @@ eligible forwarded-message burst is switched to legacy one-shot **before** submi
 the initial Pi prompt, only if no dependent live updates were accepted; otherwise
 the forward is explicitly refused. While the initial Pi text is waiting in the
 forward window, later ordinary text is durably buffered as a dependent update,
-not substituted for it. Voice and album items cannot be safely joined to this
-initial text; they receive an explicit refusal and can be resent after startup.
-The forward window length is unchanged. Document-caption and voice prompts use legacy
+not substituted for it. Unsupported voice, document and album payloads cannot
+be safely joined to this initial text; they receive an explicit refusal and can
+be resent after the active task finishes (or after startup for a standalone
+voice/document). Malformed directives also cannot evict the initial
+prompt. The forward window length is unchanged. Document-caption and voice prompts use legacy
 one-shot routing rather than claiming an incomplete live initial intent. Pi can
 return a canonical ID/path from `get_state` before it creates the new JSONL;
 that identity is provisional until the full ID and project header match. Takopi

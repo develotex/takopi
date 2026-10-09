@@ -490,7 +490,15 @@ class LiveConversationService:
             self._startup_notices.put_nowait((chat, thread, message, text))
             self._startup_notify.set()
         except asyncio.QueueFull:
-            logger.warning("Startup ACK queue full; receipt remains durable")
+            # A quick question has no durable receipt. Do not silently drop its
+            # refusal when the bounded notification queue is also saturated.
+            try:
+                with anyio.fail_after(5):
+                    await self._reply(chat, thread, message, text)
+            except Exception:  # noqa: BLE001 - Telegram can still be unavailable
+                logger.warning(
+                    "Startup ACK and direct reply failed; receipt remains durable"
+                )
 
     async def _startup_ack_worker(self) -> None:
         while True:
