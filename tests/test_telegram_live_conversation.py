@@ -182,6 +182,42 @@ async def test_quick_reply_failure_does_not_kill_bounded_owner_worker(tmp_path: 
 
 
 @pytest.mark.anyio
+async def test_full_quick_queue_reports_question_not_accepted(tmp_path: Path):
+    entered, release = anyio.Event(), anyio.Event()
+    replies: list[tuple[int, str]] = []
+
+    async def answer(_question: str, _snapshot: str) -> str:
+        entered.set()
+        await release.wait()
+        return "Working"
+
+    async def reply(_chat: int, _thread: int, message: int, text: str) -> None:
+        replies.append((message, text))
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "inbox.json"), answer, reply)
+    owner = LiveOwner(1, 10, "/sessions/a.jsonl", Main(), "write tests")
+    assert svc.register(owner)
+    async with anyio.create_task_group() as tg:
+        svc.attach_workers(tg)
+        await svc.handle(1, 10, 100, owner.session_key, "How is progress?")
+        with anyio.fail_after(1):
+            await entered.wait()
+        for message in range(101, 117):
+            await svc.handle(1, 10, message, owner.session_key, "How is progress?")
+        await svc.handle(1, 10, 117, owner.session_key, "How is progress?")
+        with anyio.fail_after(1):
+            while not any(message == 117 for message, _ in replies):
+                await anyio.sleep(0.01)
+        assert (
+            "повтор"
+            in next(text for message, text in replies if message == 117).lower()
+        )
+        release.set()
+        svc.unregister(owner)
+        svc.stop_workers()
+
+
+@pytest.mark.anyio
 async def test_recovery_notice_and_scoped_ambiguous_deferral_refusal_after_restart(
     tmp_path: Path,
 ):

@@ -3119,6 +3119,16 @@ async def _run_main_loop_impl(
                         forward_coalescer.attach_forward(msg)
                     return
                 forward_key = _forward_key(msg)
+                if live is not None and msg.media_group_id is not None:
+                    album_topic = resolve_topic_key(msg)
+                    if album_topic is not None and album_topic in fresh_pending:
+                        await live._startup_reply(
+                            msg.chat_id,
+                            album_topic[1],
+                            msg.message_id,
+                            "Media not accepted during Pi startup; resend after the first task starts. Original task is still queued.",
+                        )
+                        return
                 if classification.is_media_group_document:
                     media_group_buffer.add(msg)
                     return
@@ -3603,6 +3613,21 @@ async def _run_main_loop_impl(
                     if text is None:
                         return
                     is_voice_transcribed = True
+                # The initial Pi prompt is already durably reserved while the
+                # forward window is open. Unsupported media must not replace it
+                # in ForwardCoalescer; do not silently pass a partial payload.
+                if (
+                    live is not None
+                    and topic_key in fresh_pending
+                    and msg.voice is not None
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Media not accepted during Pi startup; resend after the first task starts. Original task is still queued.",
+                    )
+                    return
                 if msg.document is not None:
                     if cfg.files.enabled and cfg.files.auto_put:
                         caption_text = text.strip()

@@ -962,6 +962,12 @@ class LiveConversationService:
                     owner.quick_event.set()
                 except asyncio.QueueFull:
                     logger.warning("Live quick-answer queue full; main task unchanged")
+                    await self._startup_reply(
+                        chat,
+                        thread,
+                        message,
+                        "Очередь быстрых вопросов заполнена; вопрос не принят. Повторите позже.",
+                    )
             return True
         receipt: Receipt | None = None
         if update:

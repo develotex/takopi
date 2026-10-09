@@ -36,7 +36,11 @@ and provisional canonical path are stored before forward debounce or any follow-
 acknowledgement, so rapid messages cannot replace the original instruction. An
 eligible forwarded-message burst is switched to legacy one-shot **before** submitting
 the initial Pi prompt, only if no dependent live updates were accepted; otherwise
-the forward is explicitly refused. Document-caption and voice prompts use legacy
+the forward is explicitly refused. While the initial Pi text is waiting in the
+forward window, later ordinary text is durably buffered as a dependent update,
+not substituted for it. Voice and album items cannot be safely joined to this
+initial text; they receive an explicit refusal and can be resent after startup.
+The forward window length is unchanged. Document-caption and voice prompts use legacy
 one-shot routing rather than claiming an incomplete live initial intent. Pi can
 return a canonical ID/path from `get_state` before it creates the new JSONL;
 that identity is provisional until the full ID and project header match. Takopi
@@ -80,7 +84,9 @@ prove Pi never applied the update: an explicit retry may duplicate effects. A
 conflicting owner, different topic/session, or prior unresolved receipt refuses
 the retry. Other topics are unaffected. The isolated quick answer
 is never fed into the writable main session. Replies remain in the same topic and
-are associated with the original user message.
+are associated with the original user message. At most 16 quick questions can wait
+per active topic; when full, the next question is explicitly refused rather than
+silently dropped.
 
 If Takopi restarts while a **new topic's initial Pi task** is uncertain (including
 before its JSONL file exists), it sends a scoped notice with the original message ID
