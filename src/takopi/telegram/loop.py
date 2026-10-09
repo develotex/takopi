@@ -2155,6 +2155,7 @@ async def _run_main_loop_impl(
             ] = {}
             plugin_inflight: set[tuple[int, int]] = set()
             media_inflight: set[tuple[int, int]] = set()
+            media_admission_locks: dict[tuple[int, int], asyncio.Lock] = {}
             retry_starting: set[tuple[int, int, str]] = set()
             fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
             legacy_pending: set[tuple[int, int]] = set()
@@ -2940,17 +2941,19 @@ async def _run_main_loop_impl(
                 topic_key = resolve_topic_key(messages[0])
                 if topic_key is None:
                     return True
-                if (
-                    topic_key not in fresh_pending
-                    and not live.has_topic_owner(*topic_key)
-                    and topic_key not in media_inflight
-                    and topic_key not in legacy_pending
-                    and topic_key not in plugin_inflight
-                ):
-                    # Reserve the topic through download and dispatch. An initial
-                    # Pi task arriving mid-upload must not start concurrently.
-                    media_inflight.add(topic_key)
-                    return True
+                async with media_admission_locks.setdefault(topic_key, asyncio.Lock()):
+                    if (
+                        topic_key not in fresh_pending
+                        and not live.has_topic_owner(*topic_key)
+                        and topic_key not in media_inflight
+                        and topic_key not in legacy_pending
+                        and topic_key not in plugin_inflight
+                        and await live.inbox.initial_for_topic(*topic_key) is None
+                    ):
+                        # Reserve through download and dispatch. This lock also
+                        # covers receive_initial, including its durable I/O.
+                        media_inflight.add(topic_key)
+                        return True
                 await make_reply(cfg, messages[0])(
                     text="Media not accepted while this topic is busy; resend after the active task finishes."
                 )
@@ -4470,35 +4473,50 @@ async def _run_main_loop_impl(
                             and topic_key not in fresh_pending
                             and config_path is not None
                         ):
-                            existing_initial = await live.inbox.initial_for_topic(
-                                chat_id, topic_key[1]
-                            )
-                            if existing_initial is not None:
-                                await reply(
-                                    text=f"Initial Pi task #{existing_initial.message_id} is unresolved after restart; no new prompt started. Use scoped retry-initial or defer-initial."
+                            async with media_admission_locks.setdefault(
+                                topic_key, asyncio.Lock()
+                            ):
+                                if topic_key in media_inflight:
+                                    await live._startup_reply(
+                                        chat_id,
+                                        topic_key[1],
+                                        msg.message_id,
+                                        "Media group is being processed in this topic; this message was not accepted. Resend after it completes.",
+                                    )
+                                    return
+                                existing_initial = await live.inbox.initial_for_topic(
+                                    chat_id, topic_key[1]
                                 )
-                                return
-                            provisional = live_session_path(
-                                config_path, chat_id, topic_key[1]
-                            )
-                            try:
-                                cwd = (
-                                    cfg.runtime.resolve_run_cwd(resolved_live.context)
-                                    or Path.cwd()
+                                if existing_initial is not None:
+                                    await reply(
+                                        text=f"Initial Pi task #{existing_initial.message_id} is unresolved after restart; no new prompt started. Use scoped retry-initial or defer-initial."
+                                    )
+                                    return
+                                provisional = live_session_path(
+                                    config_path, chat_id, topic_key[1]
                                 )
-                            except ConfigError as exc:
-                                await reply(text=f"error: {exc}")
-                                return
-                            await live.inbox.receive_initial(
-                                chat_id,
-                                topic_key[1],
-                                msg.message_id,
-                                str(provisional),
-                                resolved_live.prompt,
-                                str(cwd.resolve()),
-                            )
-                            fresh_pending[topic_key] = (provisional, msg.message_id)
-                            starting_live.add((chat_id, topic_key[1], str(provisional)))
+                                try:
+                                    cwd = (
+                                        cfg.runtime.resolve_run_cwd(
+                                            resolved_live.context
+                                        )
+                                        or Path.cwd()
+                                    )
+                                except ConfigError as exc:
+                                    await reply(text=f"error: {exc}")
+                                    return
+                                await live.inbox.receive_initial(
+                                    chat_id,
+                                    topic_key[1],
+                                    msg.message_id,
+                                    str(provisional),
+                                    resolved_live.prompt,
+                                    str(cwd.resolve()),
+                                )
+                                fresh_pending[topic_key] = (provisional, msg.message_id)
+                                starting_live.add(
+                                    (chat_id, topic_key[1], str(provisional))
+                                )
                 if (
                     live is not None
                     and topic_key is not None

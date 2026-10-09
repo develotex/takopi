@@ -43,6 +43,7 @@ from tests.telegram_fakes import FakeBot, FakeTransport
         "invalid_directive",
         "document_before_running",
         "album_flush_before_initial",
+        "initial_reservation_race",
     ],
 )
 async def test_media_in_forward_window_cannot_replace_initial_pi_task(
@@ -51,6 +52,14 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
     import takopi.telegram.loop as loop
 
     download_started, download_release = anyio.Event(), anyio.Event()
+    if media == "initial_reservation_race":
+        original_receive_initial = LiveInbox.receive_initial
+
+        async def slow_receive_initial(self, *args):
+            await anyio.sleep(0.06)
+            return await original_receive_initial(self, *args)
+
+        monkeypatch.setattr(LiveInbox, "receive_initial", slow_receive_initial)
 
     class Rpc:
         def __init__(self, path: Path) -> None:
@@ -197,6 +206,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_initial",
                 "document_before_running",
                 "album_flush_before_initial",
+                "initial_reservation_race",
             )
             else 1,
             text="Build original task",
@@ -214,6 +224,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_initial",
                 "document_before_running",
                 "album_flush_before_initial",
+                "initial_reservation_race",
             )
             else 2,
             text="Album caption"
@@ -223,6 +234,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_album",
                 "single_document",
                 "album_flush_before_initial",
+                "initial_reservation_race",
             )
             else "@one @two Replace original"
             if media == "invalid_directive"
@@ -241,6 +253,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_initial",
                 "document_before_running",
                 "album_flush_before_initial",
+                "initial_reservation_race",
             )
             else None,
             media_group_id="album-1"
@@ -251,6 +264,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
                 "document_before_initial",
                 "document_before_running",
                 "album_flush_before_initial",
+                "initial_reservation_race",
             )
             else None,
         )
@@ -258,6 +272,7 @@ async def test_media_in_forward_window_cannot_replace_initial_pi_task(
             "document_before_initial",
             "document_before_running",
             "album_flush_before_initial",
+            "initial_reservation_race",
         ):
             yield incoming_media
             if media == "album_flush_before_initial":
