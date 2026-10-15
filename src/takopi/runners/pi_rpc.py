@@ -370,14 +370,17 @@ class PiRpcRun:
                     if (
                         isinstance(message, dict)
                         and message.get("role") == "assistant"
-                        and message.get("stopReason") in ("stop", "toolUse")
+                        and message.get("stopReason") in ("stop", "length", "toolUse")
                     ):
                         text = _extract_text_blocks(message.get("content"))
                         if text:
                             # Steering can add another completed assistant turn
                             # before agent_settled; the final translator retains
                             # only the last one. Keep earlier deliverables too.
-                            completed_turn = message.get("stopReason") == "stop"
+                            completed_turn = message.get("stopReason") in (
+                                "stop",
+                                "length",
+                            )
                             self.assistant_outputs.append((text, completed_turn))
                             if completed_turn:
                                 self.completed_answers.append(text)

@@ -2,6 +2,7 @@ from typing import cast
 
 import pytest
 
+from takopi.model import CompletedEvent
 from takopi.runners.pi_rpc import PiRpcRun
 from takopi.telegram.live_conversation import (
     LiveConversationService,
@@ -78,3 +79,24 @@ async def test_mixed_completed_event_preserves_prefix_marker_suffix_order(tmp_pa
         "Corrected result: limit=20",
         "Final details: limit=20",
     ]
+
+
+@pytest.mark.anyio
+async def test_uncaptured_successful_final_cannot_bypass_durable_queue(tmp_path):
+    rpc = BufferedRun()  # Returns a successful final without a message_end event.
+    runner = LiveRunner(FakePi(), cast(PiRpcRun, rpc))
+    sent = []
+
+    async def reply(*args):
+        sent.append(args[-1])
+
+    svc = LiveConversationService(LiveInbox(tmp_path / "i.json"), None, reply)
+    owner = LiveOwner(1, 10, "a", runner, "task")
+    runner.before_final = lambda: svc.finalize(owner)
+    runner.on_intermediate_answer = lambda text: svc.queue_output(1, 10, 1, "a", text)
+    completed = [
+        e async for e in runner.run("task", None) if isinstance(e, CompletedEvent)
+    ]
+    assert sent == ["done"]
+    assert completed[-1].answer == ""
+    assert runner.suppress_empty_final

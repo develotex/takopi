@@ -327,6 +327,19 @@ class LiveRunner:
             answer = (
                 self.public_answer(completed.answer) if completed is not None else ""
             )
+            if (
+                self.outputs_managed
+                and answer
+                and completed is not None
+                and completed.ok
+            ):
+                # A valid terminal answer may exist without a captured message_end
+                # (e.g. an adapter variant). It must not bypass queued earlier output.
+                if self.on_intermediate_answer is None:
+                    raise RuntimeError("Live final needs a durable output handler")
+                await self.on_intermediate_answer(answer)
+                self.published_outputs.add(completed.answer)
+                answer = ""
             if not self._followups:
                 if completed is not None:
                     # Only silence an empty final when its actual answer has
