@@ -223,12 +223,18 @@ class LiveRunner:
         self.cancel_requested: anyio.Event | None = None
         self.settlement_ok = False
         self.answered_markers: set[str] = set()
+        self.published_outputs: set[str] = set()
+        self.output_generation = -1
+        self.output_cursor = 0
+        self.outputs_managed = False
         self.suppress_empty_final = False
         self.on_intermediate_answer: Callable[[str], Awaitable[None]] | None = None
         self.final_failure = "Live update delivery is uncertain; final result is incomplete. Check the scoped receipt before retrying."
 
     def public_answer(self, text: str) -> str:
         """Do not echo answers already handed to durable reply delivery."""
+        if text in self.published_outputs:
+            return ""
         return _ACK.sub(
             lambda match: ""
             if match.group(2) in self.answered_markers
@@ -310,7 +316,7 @@ class LiveRunner:
                 and completed_answers[-1] == completed.answer
                 else completed_answers
             )
-            for previous in earlier:
+            for previous in [] if self.outputs_managed else earlier:
                 public = self.public_answer(previous)
                 if public:
                     if self.on_intermediate_answer is None:
@@ -998,10 +1004,41 @@ class LiveConversationService:
             raise ValueError("Pi get_messages returned no message list")
         await self.inbox.reconcile(owner.session_key, entries)
         receipts = {r.marker: r for r in await self.inbox.pending(owner.session_key)}
-        for entry in entries:
-            if not isinstance(entry, dict) or entry.get("role") != "assistant":
-                continue
-            for match in _ACK.finditer(_text(entry)):
+        main = owner.main if isinstance(owner.main, LiveRunner) else None
+        managed = main is not None and hasattr(main.rpc, "assistant_outputs")
+        if main is not None:
+            main.answered_markers.update(
+                receipt.marker
+                for receipt in await self.inbox.for_session(owner.session_key)
+                if receipt.state in ("considered", "deferred")
+                and receipt.reply_sequence > 0
+            )
+        if managed and main is not None:
+            # Consume the current RPC stream, not old session history. Assign
+            # durable sequence numbers in assistant-event order, before a later
+            # correction can overtake an earlier completed task result.
+            main.outputs_managed = True
+            generation = main.rpc.output_generation
+            if main.output_generation != generation:
+                main.output_generation = generation
+                main.output_cursor = 0
+                main.published_outputs.clear()
+            outputs = list(main.rpc.assistant_outputs[main.output_cursor :])
+        else:
+            outputs = [
+                (_text(entry), False)
+                for entry in entries
+                if isinstance(entry, dict) and entry.get("role") == "assistant"
+            ]
+        for text, completed_turn in outputs:
+            matches = list(_ACK.finditer(text))
+            if managed and any(
+                match.group(2) in receipts
+                and receipts[match.group(2)].state != "delivered"
+                for match in matches
+            ):
+                break  # Wait for positive user-message evidence, without overtaking it.
+            for match in matches:
                 action, marker, reason = match.groups()
                 receipt = receipts.get(marker)
                 if receipt is None or receipt.state != "delivered":
@@ -1013,14 +1050,20 @@ class LiveConversationService:
                         receipt.id, reason, reply_pending=True
                     )
                 receipts.pop(marker, None)
+                if main is not None:
+                    main.answered_markers.add(marker)
+            if managed and main is not None:
+                if completed_turn:
+                    public = main.public_answer(text)
+                    if public:
+                        if main.on_intermediate_answer is None:
+                            raise RuntimeError(
+                                "Live output needs a durable output handler"
+                            )
+                        await main.on_intermediate_answer(public)
+                    main.published_outputs.add(text)
+                main.output_cursor += 1
         await self._queue_replies()
-        if isinstance(owner.main, LiveRunner):
-            owner.main.answered_markers.update(
-                receipt.marker
-                for receipt in await self.inbox.for_session(owner.session_key)
-                if receipt.state in ("considered", "deferred")
-                and receipt.reply_sequence > 0
-            )
 
     async def queue_output(
         self, chat: int, thread: int, message: int, session: str, text: str

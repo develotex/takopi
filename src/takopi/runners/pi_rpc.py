@@ -291,6 +291,8 @@ class PiRpcRun:
         self.expected_session_id: str | None = None
         self.cancel_requested: anyio.Event | None = None
         self.completed_answers: list[str] = []
+        self.assistant_outputs: list[tuple[str, bool]] = []
+        self.output_generation = 0
         self._active = False
         self._prompt_started = False
         self._unsettled = False
@@ -315,6 +317,8 @@ class PiRpcRun:
         self._active = True
         self._prompt_started = False
         self.completed_answers = []
+        self.assistant_outputs = []
+        self.output_generation += 1
         try:
             if self._unsettled:
                 await self._reconcile()
@@ -366,14 +370,17 @@ class PiRpcRun:
                     if (
                         isinstance(message, dict)
                         and message.get("role") == "assistant"
-                        and message.get("stopReason") == "stop"
+                        and message.get("stopReason") in ("stop", "toolUse")
                     ):
                         text = _extract_text_blocks(message.get("content"))
                         if text:
                             # Steering can add another completed assistant turn
                             # before agent_settled; the final translator retains
                             # only the last one. Keep earlier deliverables too.
-                            self.completed_answers.append(text)
+                            completed_turn = message.get("stopReason") == "stop"
+                            self.assistant_outputs.append((text, completed_turn))
+                            if completed_turn:
+                                self.completed_answers.append(text)
                 if kind == "agent_start" and not state.started:
                     state.started = True
                     yield StartedEvent(

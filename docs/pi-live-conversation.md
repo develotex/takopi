@@ -45,10 +45,16 @@ send and persistence can still duplicate a chunk; this is not exactly-once deliv
 A completed main-task result must not disappear when a later question is consumed.
 The RPC adapter therefore retains completed, non-tool assistant turns before
 `agent_settled`, not only the last turn. Earlier results and settlement-turn results
-are separately persisted and sent as replies to the original task message. They are
-not cached and relabelled as the final state after a correction. Final output omits
-only marker replies already handed to durable delivery. A genuinely empty final
-without such an answer keeps the existing failure behavior.
+are persisted and sent as replies to the original task message, including the final
+result. Verified reconciliation consumes current-run assistant events in order;
+completed task results and marked answers use the same ordered durable dispatcher.
+A normal final cannot bypass a delayed earlier output, and a correction cannot be
+followed by an older result presented as the latest state. Independently completed
+outputs remain stored even if a later receipt cannot settle. Outputs are not cached
+and relabelled as the final state after a correction. The ordinary bridge suppresses
+only output already handed to durable delivery. A genuinely empty final without
+such an answer keeps the existing failure behavior. Actionable error/recovery
+notices retain their existing independent path.
 
 Old inbox records decode with no pending reply; historical terminal receipts are not
 reannounced. Inbox/output compaction, cross-process session ownership and exactly-once
@@ -61,6 +67,7 @@ Automated checks cover startup/active/settlement, natural and mixed messages,
 durable intake while RPC/Telegram is busy, receipt and standalone-output retry,
 partial chunks, restart, topic isolation and the existing media/forward/cancel matrix.
 A real installed Pi RPC probe with tools/extensions disabled additionally checks
-inference context and active steer with a synthetic task; its Telegram callback is
-in-memory. This is not a production Telegram end-to-end or background-tool test.
+inference context and active steer with a synthetic task, conflicting correction
+(10 → 20), and a subsequent question remembering the corrected value; its Telegram
+callback is in-memory. This is not a production Telegram end-to-end or background-tool test.
 Deployment/restart is a separate operation, not implied by opening the PR.
