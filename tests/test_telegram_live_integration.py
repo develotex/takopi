@@ -1456,6 +1456,12 @@ async def test_settlement_continuation_is_rendered_before_final_and_cancellable(
     receipt = await svc.inbox.receive(1, 10, 33, owner.session_key, "use green")
     runner.before_final = lambda: svc.flush(owner)
     runner.on_followup_started = lambda text: svc.followup_started(owner, text)
+    intermediate: list[str] = []
+
+    async def save_intermediate(text: str):
+        intermediate.append(text)
+
+    runner.on_intermediate_answer = save_intermediate
     emitted: list[CompletedEvent] = []
 
     async def consume():
@@ -1481,6 +1487,9 @@ async def test_settlement_continuation_is_rendered_before_final_and_cancellable(
         rpc.release_followup.set()
         await asyncio.wait_for(task, 1)
         assert [event.answer for event in emitted] == ["UPDATED FINAL RESULT"]
+        assert intermediate == ["outdated result"], (
+            "the earlier result was published before the correction, never as the final state"
+        )
 
 
 @pytest.mark.anyio

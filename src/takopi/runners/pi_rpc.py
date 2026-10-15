@@ -17,7 +17,7 @@ import msgspec
 
 from ..model import ResumeToken, StartedEvent, TakopiEvent
 from ..schemas import pi as pi_schema
-from .pi import ENGINE, PiStreamState, translate_pi_event
+from .pi import ENGINE, PiStreamState, translate_pi_event, _extract_text_blocks
 
 _PI_COMMAND = "pi"
 _OWNERS: dict[Path, object] = {}
@@ -290,6 +290,7 @@ class PiRpcRun:
         self.session_key: str | None = None
         self.expected_session_id: str | None = None
         self.cancel_requested: anyio.Event | None = None
+        self.completed_answers: list[str] = []
         self._active = False
         self._prompt_started = False
         self._unsettled = False
@@ -313,6 +314,7 @@ class PiRpcRun:
             raise RuntimeError("Pi RPC run already active")
         self._active = True
         self._prompt_started = False
+        self.completed_answers = []
         try:
             if self._unsettled:
                 await self._reconcile()
@@ -359,6 +361,19 @@ class PiRpcRun:
             meta = {"cwd": str(self.client.cwd), "control": self}
             async for record in self.client.events():
                 kind = record.get("type")
+                if kind == "message_end":
+                    message = record.get("message")
+                    if (
+                        isinstance(message, dict)
+                        and message.get("role") == "assistant"
+                        and message.get("stopReason") == "stop"
+                    ):
+                        text = _extract_text_blocks(message.get("content"))
+                        if text:
+                            # Steering can add another completed assistant turn
+                            # before agent_settled; the final translator retains
+                            # only the last one. Keep earlier deliverables too.
+                            self.completed_answers.append(text)
                 if kind == "agent_start" and not state.started:
                     state.started = True
                     yield StartedEvent(

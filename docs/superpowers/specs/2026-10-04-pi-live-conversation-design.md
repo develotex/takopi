@@ -1,5 +1,9 @@
 # Pi live conversation in Takopi — design (2026-10-04)
 
+> Historical design. The quick responder, lexical classification and public receipt
+> status UX below are superseded by [contextual Pi conversation](../../pi-live-conversation.md)
+> (2026-10-15). Ownership, durable intake and no-implicit-abort invariants remain.
+
 ## User intent and acceptance
 
 In one Telegram topic, a Pi task can run for hours while the user asks questions or requests a status update and receives a prompt answer without cancelling or waiting for that task. New constraints/information sent in that topic are durably received, passed to the main Pi session at a safe checkpoint, and explicitly acknowledged when actually considered. The user must be able to tell apart **received**, **delivered to Pi**, and **considered**. The main task, running tools, and detached subagents must not be cancelled just because a message arrives. A quick answer cannot claim to know unrecorded thoughts, a pending tool result, or an unfinished subagent result.

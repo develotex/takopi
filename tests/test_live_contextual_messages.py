@@ -58,6 +58,9 @@ async def test_entire_message_reaches_contextual_owner_without_status_noise(
             }
         )
         await svc.reconcile(owner)
+        with anyio.fail_after(1):
+            while not replies:
+                await anyio.sleep(0.001)
         assert replies == [
             (1, 10, 12, "65 harness tests passed; the baseline is not finished yet.")
         ]

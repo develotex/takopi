@@ -1850,6 +1850,13 @@ async def _run_main_loop_impl(
                         live_runner.on_followup_started = partial(
                             live.followup_started, owner
                         )
+                        live_runner.on_intermediate_answer = partial(
+                            live.queue_output,
+                            chat_id,
+                            topic_key[1],
+                            user_msg_id,
+                            str(path),
+                        )
                     elif resume_token is not None:
                         await send_plain(
                             cfg.exec_cfg.transport,
@@ -2228,6 +2235,7 @@ async def _run_main_loop_impl(
                         thread_id=thread,
                         text=text,
                         notify=False,
+                        require_success=True,
                     )
 
                 live = LiveConversationService(

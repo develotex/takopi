@@ -131,6 +131,7 @@ async def test_run_starts_from_state_and_only_completes_at_settled(
         completed = [event for event in remaining if isinstance(event, CompletedEvent)]
         assert len(completed) == 1
         assert completed[0].answer == "final\u2028answer"
+        assert run.completed_answers == ["final\u2028answer"]
         assert completed[0].resume == started.resume
     finally:
         await rpc.close()

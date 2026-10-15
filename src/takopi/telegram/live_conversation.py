@@ -14,6 +14,7 @@ from uuid import uuid4
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Protocol
+from functools import partial
 
 from ..model import ActionEvent, CompletedEvent, ResumeToken, StartedEvent, TakopiEvent
 from ..runner_bridge import RunningTask
@@ -221,15 +222,16 @@ class LiveRunner:
         self._inflight_followup: str | None = None
         self.cancel_requested: anyio.Event | None = None
         self.settlement_ok = False
-        self.delivered_markers: set[str] = set()
-        self.suppress_empty_final = True
+        self.answered_markers: set[str] = set()
+        self.suppress_empty_final = False
+        self.on_intermediate_answer: Callable[[str], Awaitable[None]] | None = None
         self.final_failure = "Live update delivery is uncertain; final result is incomplete. Check the scoped receipt before retrying."
 
     def public_answer(self, text: str) -> str:
-        """Do not echo technical receipts whose actual answer was already sent."""
+        """Do not echo answers already handed to durable reply delivery."""
         return _ACK.sub(
             lambda match: ""
-            if match.group(2) in self.delivered_markers
+            if match.group(2) in self.answered_markers
             else match.group(0),
             text,
         ).strip()
@@ -264,7 +266,6 @@ class LiveRunner:
         next_prompt = prompt if self.initial_recovery else guidance + prompt
         next_resume = resume
         queued_text: str | None = None
-        last_answer = ""
         for iteration in range(
             9
         ):  # Bound settlement drain even if updates arrive continuously.
@@ -301,14 +302,45 @@ class LiveRunner:
                     error="Unresolved live update receipt",
                 )
                 return
-            if completed is not None:
-                answer = self.public_answer(completed.answer)
-                if answer:
-                    last_answer = answer
+            completed_answers = getattr(self.rpc, "completed_answers", [])
+            earlier = (
+                completed_answers[:-1]
+                if completed is not None
+                and completed_answers
+                and completed_answers[-1] == completed.answer
+                else completed_answers
+            )
+            for previous in earlier:
+                public = self.public_answer(previous)
+                if public:
+                    if self.on_intermediate_answer is None:
+                        raise RuntimeError(
+                            "Live conversation needs a durable output handler"
+                        )
+                    await self.on_intermediate_answer(public)
+            answer = (
+                self.public_answer(completed.answer) if completed is not None else ""
+            )
             if not self._followups:
                 if completed is not None:
-                    yield replace(completed, answer=last_answer)
+                    # Only silence an empty final when its actual answer has
+                    # already been durably handed to the reply dispatcher.
+                    self.suppress_empty_final = bool(
+                        completed.answer.strip() and not answer
+                    )
+                    yield replace(completed, answer=answer)
                 return
+            if answer and not (
+                self.cancel_requested is not None and self.cancel_requested.is_set()
+            ):
+                # A later question must not overwrite the original deliverable;
+                # a correction must not cause an old result to be republished
+                # as the final state. Publish each completed turn in order.
+                if self.on_intermediate_answer is None:
+                    raise RuntimeError(
+                        "Live continuation needs a durable output handler"
+                    )
+                await self.on_intermediate_answer(answer)
             if iteration == 8:
                 raise RuntimeError(
                     "Live Pi settlement drain exceeded eight follow-ups; receipt state retained"
@@ -396,12 +428,15 @@ class LiveConversationService:
         reply: Reply,
         *,
         quick_timeout: float = 15,
+        reply_retry_interval: float = 5,
     ) -> None:
         self.inbox = inbox
         # Legacy constructor arguments are accepted for embedding compatibility;
         # the context-free answer callback is intentionally never invoked.
         self._reply = reply
         self._reply_lock = asyncio.Lock()
+        self._reply_event = asyncio.Event()
+        self._reply_retry_interval = reply_retry_interval
         self._owners: dict[tuple[int, int, str], LiveOwner] = {}
         self._worker_tg: TaskGroup | None = None
         self._startup_notices: asyncio.Queue[tuple[int, int, int, str]] = asyncio.Queue(
@@ -413,12 +448,28 @@ class LiveConversationService:
     def stop_workers(self) -> None:
         self._worker_stopping = True
         self._startup_notify.set()
+        self._reply_event.set()
 
     def attach_workers(self, task_group: TaskGroup) -> None:
         self._worker_tg = task_group
         task_group.start_soon(self._startup_ack_worker)
+        task_group.start_soon(self._reply_worker)
         for owner in self._owners.values():
             self._start_workers(owner)
+
+    async def _reply_worker(self) -> None:
+        # Independent of owner lifetime: a finished task's answer is still owed.
+        while not self._worker_stopping:
+            self._reply_event.clear()
+            await self._send_replies()
+            with anyio.move_on_after(self._reply_retry_interval):
+                await self._reply_event.wait()
+
+    async def _queue_replies(self) -> None:
+        if self._worker_tg is None:
+            await self._send_replies()
+        else:
+            self._reply_event.set()
 
     async def _startup_reply(
         self, chat: int, thread: int, message: int, text: str
@@ -634,7 +685,7 @@ class LiveConversationService:
         return "continue" if observed else "retry"
 
     async def notify_recovery(self) -> None:
-        await self._send_replies()
+        await self._queue_replies()
         for intent in await self.inbox.initial_unresolved():
             try:
                 await self._reply(
@@ -962,30 +1013,76 @@ class LiveConversationService:
                         receipt.id, reason, reply_pending=True
                     )
                 receipts.pop(marker, None)
-        await self._send_replies(owner.session_key)
+        await self._queue_replies()
         if isinstance(owner.main, LiveRunner):
-            owner.main.delivered_markers.update(
+            owner.main.answered_markers.update(
                 receipt.marker
                 for receipt in await self.inbox.for_session(owner.session_key)
                 if receipt.state in ("considered", "deferred")
-                and not receipt.reply_pending
+                and receipt.reply_sequence > 0
             )
+
+    async def queue_output(
+        self, chat: int, thread: int, message: int, session: str, text: str
+    ) -> None:
+        await self.inbox.queue_output(chat, thread, message, session, text)
+        await self._queue_replies()
+
+    async def _deliver_text(
+        self,
+        chat: int,
+        thread: int,
+        message: int,
+        text: str,
+        offset: int,
+        advance: Callable[[int], Awaitable[None]],
+    ) -> None:
+        # A 2000-codepoint chunk is <=4000 UTF-16 units, including emoji. Persist
+        # each successful chunk so retrying a later failure does not repeat it.
+        while offset < len(text):
+            end = min(offset + 2000, len(text))
+            # The outbox owns its network timeouts: cancelling a waiter does not
+            # cancel its queued send and must not be used to trigger a retry.
+            await self._reply(chat, thread, message, text[offset:end])
+            await advance(end)
+            offset = end
 
     async def _send_replies(self, session_key: str | None = None) -> None:
         # Serialize recovery and live observation: the same answer must not be
         # posted concurrently. Persist the answer before touching Telegram.
         async with self._reply_lock:
-            for receipt in await self.inbox.pending_replies(session_key):
+            receipts = await self.inbox.pending_replies(session_key)
+            outputs = await self.inbox.pending_outputs()
+            pending = sorted(
+                [*receipts, *outputs],
+                key=lambda item: item.reply_sequence
+                if isinstance(item, Receipt)
+                else item.sequence,
+            )
+            blocked: set[str] = set()
+            for item in pending:
+                if item.session_key in blocked:
+                    continue
                 try:
-                    with anyio.fail_after(5):
-                        await self._reply(
-                            receipt.chat_id,
-                            receipt.thread_id,
-                            receipt.message_id,
-                            receipt.reason or "",
+                    if isinstance(item, Receipt):
+                        await self._deliver_text(
+                            item.chat_id,
+                            item.thread_id,
+                            item.message_id,
+                            item.reason or "",
+                            item.reply_offset,
+                            partial(self.inbox.advance_reply, item.id),
                         )
-                    await self.inbox.mark_reply_sent(receipt.id)
+                        await self.inbox.mark_reply_sent(item.id)
+                    else:
+                        await self._deliver_text(
+                            item.chat_id,
+                            item.thread_id,
+                            item.message_id,
+                            item.text,
+                            item.offset,
+                            partial(self.inbox.advance_output, item.id),
+                        )
                 except Exception:  # noqa: BLE001 - keep answer durable for retry
-                    logger.warning(
-                        "Live answer delivery failed; answer retained for retry"
-                    )
+                    blocked.add(item.session_key)
+                    logger.warning("Live answer delivery failed; retained for retry")

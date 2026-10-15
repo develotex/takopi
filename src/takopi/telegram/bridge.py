@@ -339,14 +339,17 @@ async def send_plain(
     text: str,
     notify: bool = True,
     thread_id: int | None = None,
+    require_success: bool = False,
 ) -> None:
     reply_to = MessageRef(channel_id=chat_id, message_id=user_msg_id)
     rendered_text, entities = prepare_telegram(MarkdownParts(header=text))
-    await transport.send(
+    sent = await transport.send(
         channel_id=chat_id,
         message=RenderedMessage(text=rendered_text, extra={"entities": entities}),
         options=SendOptions(reply_to=reply_to, notify=notify, thread_id=thread_id),
     )
+    if require_success and sent is None:
+        raise ConnectionError("Telegram did not confirm message delivery")
 
 
 def build_bot_commands(

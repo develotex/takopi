@@ -108,7 +108,7 @@ async def test_failed_steer_reports_uncertain_without_retry(tmp_path: Path) -> N
         attempts.append(text)
         raise TimeoutError("response lost")
 
-    main.steer = bad_steer
+    main.steer = bad_steer  # type: ignore[method-assign]
 
     async def reply(*args):
         replies.append(args[-1])
@@ -190,7 +190,7 @@ async def test_uncertain_first_blocks_later_question_and_successful_final(
             raise TimeoutError("response lost")
         return "queued"
 
-    main.steer = maybe_accepted
+    main.steer = maybe_accepted  # type: ignore[method-assign]
     replies = []
 
     async def reply(*args):
@@ -269,7 +269,7 @@ async def test_slow_steer_does_not_block_next_message_or_cancel(tmp_path: Path):
         await release.wait()
         return "queued"
 
-    main.steer = steer
+    main.steer = steer  # type: ignore[method-assign]
 
     async def reply(*_args):
         raise AssertionError("No admission notices")
