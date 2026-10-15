@@ -1030,6 +1030,33 @@ class LiveConversationService:
                 for entry in entries
                 if isinstance(entry, dict) and entry.get("role") == "assistant"
             ]
+        if managed and main is not None:
+            # A newly opened RPC owner has an empty event buffer, but recovery
+            # must still attest old pending receipts from this exact session.
+            # Do not replay historical standalone output, or reorder current
+            # stream markers by treating them as historical acknowledgements.
+            current_markers = {
+                match.group(2)
+                for text, _ in main.rpc.assistant_outputs
+                for match in _ACK.finditer(text)
+            }
+            delivery_markers = {
+                await self.inbox.delivery_text(receipt.id): marker
+                for marker, receipt in receipts.items()
+                if marker not in current_markers
+            }
+            observed_users: set[str] = set()
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("role") == "user":
+                    marker = delivery_markers.get(_text(entry))
+                    if marker is not None:
+                        observed_users.add(marker)
+                elif entry.get("role") == "assistant":
+                    for match in _ACK.finditer(_text(entry)):
+                        if match.group(2) in observed_users:
+                            await self._attest_match(match, receipts, main)
         for text, completed_turn in outputs:
             matches = list(_ACK.finditer(text))
             if managed and any(
@@ -1038,32 +1065,52 @@ class LiveConversationService:
                 for match in matches
             ):
                 break  # Wait for positive user-message evidence, without overtaking it.
+            position = 0
             for match in matches:
-                action, marker, reason = match.groups()
-                receipt = receipts.get(marker)
-                if receipt is None or receipt.state != "delivered":
-                    continue
-                if action == "considered":
-                    await self.inbox.mark_considered(receipt.id, reason)
-                else:
-                    await self.inbox.mark_deferred(
-                        receipt.id, reason, reply_pending=True
+                marker = match.group(2)
+                known = marker in receipts or (
+                    main is not None and marker in main.answered_markers
+                )
+                if not known:
+                    continue  # Preserve unrelated literal marker text as normal output.
+                if managed and main is not None and completed_turn:
+                    await self._queue_public_segment(
+                        main, text[position : match.start()]
                     )
-                receipts.pop(marker, None)
-                if main is not None:
-                    main.answered_markers.add(marker)
+                await self._attest_match(match, receipts, main)
+                position = match.end()
             if managed and main is not None:
                 if completed_turn:
-                    public = main.public_answer(text)
-                    if public:
-                        if main.on_intermediate_answer is None:
-                            raise RuntimeError(
-                                "Live output needs a durable output handler"
-                            )
-                        await main.on_intermediate_answer(public)
+                    await self._queue_public_segment(main, text[position:])
                     main.published_outputs.add(text)
                 main.output_cursor += 1
         await self._queue_replies()
+
+    async def _attest_match(
+        self,
+        match: re.Match[str],
+        receipts: dict[str, Receipt],
+        main: LiveRunner | None,
+    ) -> None:
+        action, marker, reason = match.groups()
+        receipt = receipts.get(marker)
+        if receipt is None or receipt.state != "delivered":
+            return
+        if action == "considered":
+            await self.inbox.mark_considered(receipt.id, reason)
+        else:
+            await self.inbox.mark_deferred(receipt.id, reason, reply_pending=True)
+        receipts.pop(marker, None)
+        if main is not None:
+            main.answered_markers.add(marker)
+
+    async def _queue_public_segment(self, main: LiveRunner, text: str) -> None:
+        public = text.strip()
+        if not public:
+            return
+        if main.on_intermediate_answer is None:
+            raise RuntimeError("Live output needs a durable output handler")
+        await main.on_intermediate_answer(public)
 
     async def queue_output(
         self, chat: int, thread: int, message: int, session: str, text: str

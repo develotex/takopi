@@ -57,7 +57,11 @@ such an answer keeps the existing failure behavior. Actionable error/recovery
 notices retain their existing independent path.
 
 Old inbox records decode with no pending reply; historical terminal receipts are not
-reannounced. Inbox/output compaction, cross-process session ownership and exactly-once
+reannounced. A fresh owner can still settle an unresolved historical receipt from
+exact-session evidence: the matching user message must precede its assistant
+acknowledgement. This does not replay old standalone outputs. Mixed assistant turns
+are split around known markers so preceding text, the answer and following text
+retain their order, not just the order between separate turns. Inbox/output compaction, cross-process session ownership and exactly-once
 external delivery are not implemented by this change. Terminal records and completed
 outputs currently remain in the JSON state file.
 
