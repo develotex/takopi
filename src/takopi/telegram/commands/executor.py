@@ -38,6 +38,11 @@ class _ResumeLineProxy:
     runner: Runner
 
     @property
+    def suppress_empty_final(self) -> bool:
+        # Read after iteration: live delivery decides this dynamically at settlement.
+        return bool(getattr(self.runner, "suppress_empty_final", False))
+
+    @property
     def engine(self) -> str:
         return self.runner.engine
 
@@ -60,6 +65,10 @@ class _ResumeLineProxy:
 class _PreludeRunner:
     runner: Runner
     prelude_events: Sequence[TakopiEvent]
+
+    @property
+    def suppress_empty_final(self) -> bool:
+        return bool(getattr(self.runner, "suppress_empty_final", False))
 
     @property
     def engine(self) -> str:
