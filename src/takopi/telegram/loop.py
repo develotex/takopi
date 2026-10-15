@@ -1948,7 +1948,12 @@ async def _run_main_loop_impl(
                         if owner is not None:
                             live_group.start_soon(monitor)
                         await run_engine(
-                            exec_cfg=cfg.exec_cfg,
+                            exec_cfg=(
+                                replace(cfg.exec_cfg, progress_updates="once")
+                                if live_runner is not None
+                                and cfg.exec_cfg.progress_updates == "full"
+                                else cfg.exec_cfg
+                            ),
                             runtime=cfg.runtime,
                             running_tasks=state.running_tasks,
                             chat_id=chat_id,

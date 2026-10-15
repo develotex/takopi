@@ -1,4 +1,4 @@
-"""Opt-in, exact-scope Pi live messages. No quick answer enters the writable session."""
+"""Opt-in, exact-scope conversation with the existing contextual Pi owner."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from anyio.abc import TaskGroup
 from pathlib import Path
 from uuid import uuid4
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from ..model import ActionEvent, CompletedEvent, ResumeToken, StartedEvent, TakopiEvent
@@ -221,7 +221,18 @@ class LiveRunner:
         self._inflight_followup: str | None = None
         self.cancel_requested: anyio.Event | None = None
         self.settlement_ok = False
+        self.delivered_markers: set[str] = set()
+        self.suppress_empty_final = True
         self.final_failure = "Live update delivery is uncertain; final result is incomplete. Check the scoped receipt before retrying."
+
+    def public_answer(self, text: str) -> str:
+        """Do not echo technical receipts whose actual answer was already sent."""
+        return _ACK.sub(
+            lambda match: ""
+            if match.group(2) in self.delivered_markers
+            else match.group(0),
+            text,
+        ).strip()
 
     def format_resume(self, token: ResumeToken) -> str:
         return self.runner.format_resume(token)  # type: ignore[attr-defined]
@@ -236,15 +247,24 @@ class LiveRunner:
         self, prompt: str, resume: ResumeToken | None
     ) -> AsyncIterator[TakopiEvent]:
         guidance = (
-            "For task updates marked [takopi-live:<marker>], first inspect how they "
-            "affect your work. Only after you actually review one, explicitly state "
-            "[takopi-considered:<marker>] <specific reason> or "
-            "[takopi-deferred:<marker>] <specific reason> in your assistant text. "
-            "Do not claim consideration on delivery alone. Continue the main task.\n\n"
+            "Messages marked [takopi-live:<marker>] are conversation from the user "
+            "in this task, including questions and corrections. Interpret the entire "
+            "message using the task and conversation history; no /update command is required. "
+            "Do not interrupt tools or abandon the main task. When you have an actual "
+            "answer or have applied a correction, state "
+            "[takopi-considered:<marker>] <your substantive answer to the user> or "
+            "[takopi-deferred:<marker>] <specific reason the request cannot be fulfilled>. "
+            "Put the entire reply on the same line after the marker; it is sent directly "
+            "to the user. Never substitute "
+            "receipt counts, tool lifecycle phases, acknowledgements, 'working on it', "
+            "or promises to check for an answer. If evidence is missing, do the required "
+            "work before answering; do not mark the request considered merely on delivery. "
+            "Do not repeat that answer in the final summary. Continue the main task.\n\n"
         )
         next_prompt = prompt if self.initial_recovery else guidance + prompt
         next_resume = resume
         queued_text: str | None = None
+        last_answer = ""
         for iteration in range(
             9
         ):  # Bound settlement drain even if updates arrive continuously.
@@ -281,9 +301,13 @@ class LiveRunner:
                     error="Unresolved live update receipt",
                 )
                 return
+            if completed is not None:
+                answer = self.public_answer(completed.answer)
+                if answer:
+                    last_answer = answer
             if not self._followups:
                 if completed is not None:
-                    yield completed
+                    yield replace(completed, answer=last_answer)
                 return
             if iteration == 8:
                 raise RuntimeError(
@@ -333,106 +357,22 @@ class LiveOwner:
     progress: str = "The main task is still running; a pending tool or child has no observed result."
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     accept_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    ack_queue: asyncio.Queue[tuple[int, str]] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=64)
-    )
-    quick_queue: asyncio.Queue[tuple[int, str]] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=16)
-    )
-    ack_event: asyncio.Event = field(default_factory=asyncio.Event)
-    quick_event: asyncio.Event = field(default_factory=asyncio.Event)
     drain_event: asyncio.Event = field(default_factory=asyncio.Event)
-    quick_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(1))
     closing: bool = False
     public_output: str = ""
     running_task: RunningTask | None = None
     identity_verified: bool = True
 
 
-def _classify(text: str) -> tuple[str | None, str | None]:
-    if text.startswith("/update "):
-        return None, text[len("/update ") :].strip() or None
-    if text.startswith("/обнови "):
-        return None, text[len("/обнови ") :].strip() or None
-    # Explicit requests phrased as questions still change the main task.
-    if text.lower().startswith(
-        (
-            "can you ",
-            "could you ",
-            "will you ",
-            "would you ",
-            "можешь ",
-            "сможешь ",
-            "не мог бы ",
-            "не могла бы ",
-        )
-    ):
-        return None, text.strip()
-    # Conservatively split an explicit question from a subsequent imperative.
-    question, sep, rest = text.partition("?")
-    if sep:
-        update = rest.strip()
-        if update.lower().startswith(
-            (
-                "also ",
-                "please ",
-                "use ",
-                "don't ",
-                "do not ",
-                "instead ",
-                "make ",
-                "и ещё",
-                "и еще",
-                "не трогай",
-                "используй",
-                "пожалуйста",
-                "вместо ",
-                "исправь ",
-            )
-        ):
-            return question.strip() + "?", update
-        if not update:
-            return text.strip(), None
-        return None, None
-    if text.lower().startswith(
-        (
-            "status",
-            "how is",
-            "what's the status",
-            "как дела",
-            "какой статус",
-            "что со статусом",
-        )
-    ):
-        return text.strip(), None
-    if text.lower().startswith(
-        (
-            "use ",
-            "please ",
-            "don't ",
-            "do not ",
-            "instead ",
-            "make ",
-            "change ",
-            "correct ",
-            "important: ",
-            "не трогай",
-            "используй",
-            "пожалуйста",
-            "вместо ",
-            "исправь ",
-            "поменяй ",
-            "важно: ",
-            "не меняй",
-            "сделай ",
-        )
-    ):
-        return None, text.strip()
-    if text.lower().startswith(("maybe ", "perhaps ", "возможно ", "может быть ")):
-        return None, None
-    # An ordinary statement in the active task topic is potentially relevant;
-    # retaining it is safer than silently dropping an unrecognized imperative.
-    return None, text.strip() or None
+def _conversation_text(text: str) -> str:
+    """Keep user meaning intact; /update remains an optional legacy alias."""
+    text = text.strip()
+    for command in ("/update", "/обнови"):
+        if text == command:
+            return ""
+        if text.startswith(command + " "):
+            return text[len(command) :].strip()
+    return text
 
 
 def _text(entry: dict) -> str:
@@ -452,17 +392,17 @@ class LiveConversationService:
     def __init__(
         self,
         inbox: LiveInbox,
-        answer: QuickAnswer,
+        answer: QuickAnswer | None,
         reply: Reply,
         *,
         quick_timeout: float = 15,
     ) -> None:
         self.inbox = inbox
-        self._answer = answer
+        # Legacy constructor arguments are accepted for embedding compatibility;
+        # the context-free answer callback is intentionally never invoked.
         self._reply = reply
-        self._timeout = quick_timeout
+        self._reply_lock = asyncio.Lock()
         self._owners: dict[tuple[int, int, str], LiveOwner] = {}
-        self._quick_global = asyncio.Semaphore(4)
         self._worker_tg: TaskGroup | None = None
         self._startup_notices: asyncio.Queue[tuple[int, int, int, str]] = asyncio.Queue(
             maxsize=128
@@ -517,37 +457,7 @@ class LiveConversationService:
     def _start_workers(self, owner: LiveOwner) -> None:
         if self._worker_tg is None:
             return
-        self._worker_tg.start_soon(self._ack_worker, owner)
         self._worker_tg.start_soon(self._drain_worker, owner)
-        self._worker_tg.start_soon(self._quick_worker, owner)
-
-    async def _ack_worker(self, owner: LiveOwner) -> None:
-        while self.owner(owner.chat_id, owner.thread_id, owner.session_key) is owner:
-            await owner.ack_event.wait()
-            owner.ack_event.clear()
-            while not owner.ack_queue.empty():
-                message, text = owner.ack_queue.get_nowait()
-                try:
-                    with anyio.fail_after(5):
-                        await self._reply(owner.chat_id, owner.thread_id, message, text)
-                except Exception:  # noqa: BLE001 - receipt remains durable if ACK fails
-                    logger.warning("Live receipt ACK failed; receipt remains durable")
-
-    async def _quick_worker(self, owner: LiveOwner) -> None:
-        while self.owner(owner.chat_id, owner.thread_id, owner.session_key) is owner:
-            await owner.quick_event.wait()
-            owner.quick_event.clear()
-            while not owner.quick_queue.empty():
-                message, question = owner.quick_queue.get_nowait()
-                try:
-                    with anyio.fail_after(self._timeout + 5):
-                        await self._answer_question(
-                            owner, owner.chat_id, owner.thread_id, message, question
-                        )
-                except Exception:  # noqa: BLE001 - later questions remain available
-                    logger.warning(
-                        "Live quick-answer reply failed; later questions remain queued"
-                    )
 
     async def _drain_worker(self, owner: LiveOwner) -> None:
         while self.owner(owner.chat_id, owner.thread_id, owner.session_key) is owner:
@@ -576,8 +486,6 @@ class LiveConversationService:
         key = (owner.chat_id, owner.thread_id, owner.session_key)
         if self._owners.get(key) is owner:
             del self._owners[key]
-            owner.ack_event.set()
-            owner.quick_event.set()
             owner.drain_event.set()
 
     def owner(self, chat: int, thread: int, session: str) -> LiveOwner | None:
@@ -609,29 +517,9 @@ class LiveConversationService:
         self, chat: int, thread: int, message: int, session: str, text: str
     ) -> None:
         """Persist updates while the exact queued Pi owner has not registered yet."""
-        question, update = _classify(text)
+        update = _conversation_text(text)
         if update:
-            receipt = await self.inbox.receive(chat, thread, message, session, update)
-            await self._startup_reply(
-                chat,
-                thread,
-                message,
-                f"Instruction stored ({receipt.state}); Pi startup pending, not yet considered.",
-            )
-        if question:
-            await self._startup_reply(
-                chat,
-                thread,
-                message,
-                "Pi is starting; no main-task progress has been observed yet.",
-            )
-        if question is None and update is None:
-            await self._startup_reply(
-                chat,
-                thread,
-                message,
-                "Please clarify or use /update <text>; nothing was stored.",
-            )
+            await self.inbox.receive(chat, thread, message, session, update)
 
     async def begin_idle_retry(
         self, receipt: Receipt, rpc: PiRpcRun, cwd: Path
@@ -746,6 +634,7 @@ class LiveConversationService:
         return "continue" if observed else "retry"
 
     async def notify_recovery(self) -> None:
+        await self._send_replies()
         for intent in await self.inbox.initial_unresolved():
             try:
                 await self._reply(
@@ -935,113 +824,28 @@ class LiveConversationService:
         owner = self.owner(chat, thread, session)
         if owner is None or owner.closing:
             return False
-        question, update = _classify(text)
-        if question is None and update is None:
-            await self._reply(
-                chat,
-                thread,
-                message,
-                "Уточните вопрос или передайте инструкцию через /update <текст>. (Please clarify.)",
-            )
+        # Questions and corrections belong to the same contextual Pi owner.
+        # Do not split on punctuation or answer from transport bookkeeping.
+        update = _conversation_text(text)
+        if not update:
             return True
         if self._worker_tg is not None:
-            if update:
-                async with owner.accept_lock:
-                    if owner.closing:
-                        return False
-                    receipt = await self.inbox.receive(
-                        chat, thread, message, session, update
-                    )
-                    status = (
-                        "Инструкция получена и сохранена (received); not yet confirmed delivered or considered."
-                        if receipt.state == "received"
-                        else f"Статус инструкции: {receipt.state}; это не означает, что она учтена."
-                    )
-                    try:
-                        owner.ack_queue.put_nowait((message, status))
-                        owner.ack_event.set()
-                    except asyncio.QueueFull:
-                        logger.warning("Live ACK queue full; receipt remains durable")
-                    if receipt.state == "received":
-                        owner.drain_event.set()
-            if question:
-                try:
-                    owner.quick_queue.put_nowait((message, question))
-                    owner.quick_event.set()
-                except asyncio.QueueFull:
-                    logger.warning("Live quick-answer queue full; main task unchanged")
-                    await self._startup_reply(
-                        chat,
-                        thread,
-                        message,
-                        "Очередь быстрых вопросов заполнена; вопрос не принят. Повторите позже.",
-                    )
-            return True
-        receipt: Receipt | None = None
-        if update:
-            async with owner.lock:
+            async with owner.accept_lock:
                 if owner.closing:
                     return False
                 receipt = await self.inbox.receive(
                     chat, thread, message, session, update
                 )
-                # A retry is not a new delivery; reply only after durable receive.
                 if receipt.state == "received":
-                    await self._reply(
-                        chat,
-                        thread,
-                        message,
-                        "Инструкция получена и сохранена (received); not yet confirmed delivered or considered.",
-                    )
-                    await self._drain_locked(owner)
-                else:
-                    await self._reply(
-                        chat,
-                        thread,
-                        message,
-                        f"Статус инструкции: {receipt.state}; это не означает, что она учтена.",
-                    )
-        if question:
-            quick = self._answer_question(owner, chat, thread, message, question)
-            if spawn_quick is None:
-                await quick
-            else:
-                spawn_quick(quick)
+                    owner.drain_event.set()
+            return True
+        async with owner.lock:
+            if owner.closing:
+                return False
+            receipt = await self.inbox.receive(chat, thread, message, session, update)
+            if receipt.state == "received":
+                await self._drain_locked(owner)
         return True
-
-    async def _answer_question(
-        self, owner: LiveOwner, chat: int, thread: int, message: int, question: str
-    ) -> None:
-        try:
-            async with asyncio.timeout(self._timeout):
-                async with self._quick_global, owner.quick_slots:
-                    statuses = await self.inbox.for_session(owner.session_key)
-                    counts = ", ".join(
-                        f"{state}: {sum(r.state == state for r in statuses)}"
-                        for state in (
-                            "received",
-                            "uncertain",
-                            "submitted",
-                            "delivered",
-                            "considered",
-                            "deferred",
-                        )
-                    )
-                    observed = (
-                        owner.progress
-                        if re.fullmatch(
-                            r"(command|tool|file_change|web_search|subagent|note|turn|warning|telemetry): (started|updated|completed)",
-                            owner.progress,
-                        )
-                        else "No public progress event observed."
-                    )
-                    snapshot = (
-                        f"Observed public phase: {observed}\nReceipt counts: {counts}"
-                    )
-                    answer = await self._answer(question, snapshot)
-        except Exception:  # noqa: BLE001 - quick reply must not affect main run
-            answer = "Quick answer unavailable; the main task has not been interrupted."
-        await self._reply(chat, thread, message, answer)
 
     async def _submit_locked(self, owner: LiveOwner, receipt: Receipt) -> None:
         # The finish flush can beat the incoming handler after durable receive.
@@ -1141,14 +945,7 @@ class LiveConversationService:
         entries = await owner.main.get_messages()
         if not isinstance(entries, list):
             raise ValueError("Pi get_messages returned no message list")
-        delivered = await self.inbox.reconcile(owner.session_key, entries)
-        for receipt in delivered:
-            await self._reply(
-                receipt.chat_id,
-                receipt.thread_id,
-                receipt.message_id,
-                "Инструкция доставлена Pi (delivered), но ещё не подтверждена как учтённая.",
-            )
+        await self.inbox.reconcile(owner.session_key, entries)
         receipts = {r.marker: r for r in await self.inbox.pending(owner.session_key)}
         for entry in entries:
             if not isinstance(entry, dict) or entry.get("role") != "assistant":
@@ -1161,11 +958,34 @@ class LiveConversationService:
                 if action == "considered":
                     await self.inbox.mark_considered(receipt.id, reason)
                 else:
-                    await self.inbox.mark_deferred(receipt.id, reason)
-                await self._reply(
-                    receipt.chat_id,
-                    receipt.thread_id,
-                    receipt.message_id,
-                    f"Update {action}: {reason}",
-                )
+                    await self.inbox.mark_deferred(
+                        receipt.id, reason, reply_pending=True
+                    )
                 receipts.pop(marker, None)
+        await self._send_replies(owner.session_key)
+        if isinstance(owner.main, LiveRunner):
+            owner.main.delivered_markers.update(
+                receipt.marker
+                for receipt in await self.inbox.for_session(owner.session_key)
+                if receipt.state in ("considered", "deferred")
+                and not receipt.reply_pending
+            )
+
+    async def _send_replies(self, session_key: str | None = None) -> None:
+        # Serialize recovery and live observation: the same answer must not be
+        # posted concurrently. Persist the answer before touching Telegram.
+        async with self._reply_lock:
+            for receipt in await self.inbox.pending_replies(session_key):
+                try:
+                    with anyio.fail_after(5):
+                        await self._reply(
+                            receipt.chat_id,
+                            receipt.thread_id,
+                            receipt.message_id,
+                            receipt.reason or "",
+                        )
+                    await self.inbox.mark_reply_sent(receipt.id)
+                except Exception:  # noqa: BLE001 - keep answer durable for retry
+                    logger.warning(
+                        "Live answer delivery failed; answer retained for retry"
+                    )

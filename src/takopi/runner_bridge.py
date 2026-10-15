@@ -688,6 +688,17 @@ async def handle_message(
         action_count=progress_tracker.action_count,
         resume=resume_value,
     )
+    # Live Pi may have sent its entire substantive answer through a scoped
+    # receipt already. Do not turn that successful empty final into "error" or
+    # another synthetic status. Other runners retain their existing behavior.
+    if (
+        run_ok
+        and not final_answer.strip()
+        and getattr(runner, "suppress_empty_final", False)
+    ):
+        if progress_ref is not None:
+            await cfg.transport.delete(ref=progress_ref)
+        return
     sync_resume_token(progress_tracker, completed.resume or outcome.resume)
     state = progress_tracker.snapshot(
         resume_formatter=runner.format_resume,

@@ -44,6 +44,7 @@ class Receipt:
     state: ReceiptState = "received"
     reason: str | None = None
     ever_attempted: bool | None = None  # None for pre-migration records: fail closed.
+    reply_pending: bool = False  # Old terminal records must not be reannounced.
 
     @property
     def id(self) -> ReceiptId:
@@ -88,6 +89,7 @@ class _Record(msgspec.Struct):
     state: ReceiptState
     reason: str | None
     ever_attempted: bool | None = None
+    reply_pending: bool = False
 
 
 class _State(msgspec.Struct):
@@ -463,6 +465,7 @@ class LiveInbox(JsonStateStore[_State]):
         reason: str | None = None,
         from_states: tuple[ReceiptState, ...],
         preserve_states: tuple[ReceiptState, ...] = (),
+        reply_pending: bool = False,
     ) -> Receipt:
         async with self._lock:
             self._reload_locked_if_needed()
@@ -473,6 +476,7 @@ class LiveInbox(JsonStateStore[_State]):
                 raise ValueError(f"Cannot move receipt from {item.state} to {state}")
             item.state = state
             item.reason = reason
+            item.reply_pending = reply_pending
             self._save_locked()
             return _receipt(item)
 
@@ -576,10 +580,16 @@ class LiveInbox(JsonStateStore[_State]):
         if not reason.strip():
             raise ValueError("Consideration needs explicit main-agent evidence")
         return await self._transition(
-            receipt_id, "considered", reason=reason, from_states=("delivered",)
+            receipt_id,
+            "considered",
+            reason=reason,
+            from_states=("delivered",),
+            reply_pending=True,
         )
 
-    async def mark_deferred(self, receipt_id: ReceiptId, reason: str) -> Receipt:
+    async def mark_deferred(
+        self, receipt_id: ReceiptId, reason: str, *, reply_pending: bool = False
+    ) -> Receipt:
         if not reason.strip():
             raise ValueError("Deferral needs an explicit reason")
         return await self._transition(
@@ -587,4 +597,27 @@ class LiveInbox(JsonStateStore[_State]):
             "deferred",
             reason=reason,
             from_states=("received", "uncertain", "submitted", "delivered"),
+            reply_pending=reply_pending,
         )
+
+    async def pending_replies(self, session_key: str | None = None) -> list[Receipt]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                _receipt(r)
+                for r in self._state.receipts
+                if r.reply_pending
+                and r.state in ("considered", "deferred")
+                and (session_key is None or r.session_key == session_key)
+            ]
+
+    async def mark_reply_sent(self, receipt_id: ReceiptId) -> None:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = self._required(receipt_id)
+            if item.state not in ("considered", "deferred"):
+                raise ValueError(
+                    "Cannot acknowledge an answer before actual consideration"
+                )
+            item.reply_pending = False
+            self._save_locked()
