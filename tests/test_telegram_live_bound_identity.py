@@ -1,0 +1,973 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import anyio
+from typing import cast
+
+import pytest
+
+from takopi.config import ProjectConfig, ProjectsConfig
+from takopi.context import RunContext
+from takopi.markdown import MarkdownPresenter
+from takopi.model import CompletedEvent, ResumeToken, StartedEvent
+from takopi.router import AutoRouter, RunnerEntry
+from takopi.runner_bridge import ExecBridgeConfig
+from takopi.runners.pi import PiRunner
+from takopi.runners.pi_rpc import PiRpcClient, PiRpcRun
+from takopi.settings import TelegramTopicsSettings
+from takopi.telegram.bridge import TelegramBridgeConfig, run_main_loop
+from takopi.telegram.live_inbox import LiveInbox, resolve_inbox_path
+from takopi.telegram.topic_state import TopicStateStore, resolve_state_path
+from takopi.telegram.types import TelegramCallbackQuery, TelegramIncomingMessage
+from takopi.transport import Transport
+from takopi.transport_runtime import TransportRuntime
+from tests.telegram_fakes import FakeBot, FakeTransport
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case", ["missing", "foreign_project", "relative"])
+async def test_bound_pi_session_fails_closed_before_any_prompt(
+    tmp_path: Path, case: str
+):
+    config = tmp_path / "takopi.toml"
+    path = tmp_path / "pi-live-sessions" / "-100-77-existing.jsonl"
+    if case in ("foreign_project", "relative"):
+        path.parent.mkdir()
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session",
+                    "id": "abc",
+                    "cwd": str(tmp_path if case == "relative" else tmp_path / "other"),
+                }
+            )
+            + "\n"
+        )
+
+    class Rpc:
+        def __init__(self):
+            self.client = self
+            self.session_path = path
+            self.requests = []
+            self.prompts = []
+            self.cwd = tmp_path
+            self._active = False
+            self._prompt_started = False
+
+        async def request(self, typ):
+            self.requests.append(typ)
+            assert typ == "get_state"
+            return {
+                "data": {
+                    "sessionId": "abc",
+                    "sessionFile": str(path),
+                    "isStreaming": False,
+                }
+            }
+
+        async def run(self, prompt, _resume):
+            if case != "relative":
+                raise AssertionError("Unverified bound Pi prompt forbidden")
+            self.prompts.append(prompt)
+            yield StartedEvent(engine="pi", resume=ResumeToken("pi", str(path)))
+            yield CompletedEvent(engine="pi", ok=True, answer="done")
+
+        async def close(self):
+            pass
+
+    rpc = Rpc()
+
+    class Runner(PiRunner):
+        async def run(self, *_):
+            raise AssertionError("One-shot fallback forbidden")
+            yield  # pragma: no cover
+
+        def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
+            assert session_path == path and cwd == tmp_path
+            return cast(PiRpcRun, rpc)
+
+    runner = Runner(extra_args=[], model=None, provider=None)
+    runtime = TransportRuntime(
+        router=AutoRouter([RunnerEntry(engine="pi", runner=runner)], "pi"),
+        projects=ProjectsConfig(
+            projects={
+                "test": ProjectConfig(
+                    alias="test",
+                    path=tmp_path,
+                    worktrees_dir=tmp_path / ".worktrees",
+                    chat_id=-100,
+                )
+            },
+            default_project=None,
+            chat_map={-100: "test"},
+        ),
+        config_path=config,
+    )
+    store = TopicStateStore(resolve_state_path(config))
+    await store.set_context(-100, 77, RunContext(project="test"))
+    await store.set_session_resume(
+        -100,
+        77,
+        ResumeToken(
+            engine="pi",
+            value="pi-live-sessions/-100-77-existing.jsonl"
+            if case == "relative"
+            else str(path),
+        ),
+    )
+    transport = FakeTransport()
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=cast(Transport, transport),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        pi_live_conversation=True,
+        forward_coalesce_s=0,
+    )
+
+    async def poller(_cfg):
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=-100,
+            thread_id=77,
+            message_id=50,
+            text="Perform task",
+            reply_to_message_id=None,
+            reply_to_text=None,
+            sender_id=123,
+        )
+
+    await run_main_loop(cfg, poller)
+    if case == "relative":
+        assert rpc.prompts and rpc.prompts[0].endswith("Perform task")
+        assert await store.get_session_resume(-100, 77, "pi") == ResumeToken(
+            "pi", str(path)
+        )
+        return
+    assert rpc.requests == ([] if case == "missing" else ["get_state"])
+    assert any(
+        "no prompt submitted" in item["message"].text.lower()
+        for item in transport.send_calls
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "delayed_plugin",
+        "unknown_callback",
+        "callback_race",
+        "forwarded_legacy_callback",
+        "forwarded_queued_callback",
+        "cancel_queued_resume",
+        "two_forward_queued",
+        "forward_cancel_callback",
+        "forward_cancel_reply",
+        "dispatching_cancel_peer",
+        "queued_progress_fail",
+    ],
+)
+async def test_plugin_cannot_race_live_start_or_run_with_unknown_topic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    import takopi.telegram.loop as loop
+
+    config = tmp_path / "takopi.toml"
+    entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
+    legacy_started = anyio.Event()
+    worker_queued, release_worker = anyio.Event(), anyio.Event()
+    scheduler_ref = {}
+    if mode in (
+        "forwarded_queued_callback",
+        "cancel_queued_resume",
+        "two_forward_queued",
+    ):
+        from takopi.scheduler import ThreadScheduler
+
+        original_worker = ThreadScheduler._thread_worker
+
+        async def delayed_worker(self, key):
+            scheduler_ref["scheduler"] = self
+            worker_queued.set()
+            await release_worker.wait()
+            await original_worker(self, key)
+
+        monkeypatch.setattr(ThreadScheduler, "_thread_worker", delayed_worker)
+        bound = tmp_path / "legacy.jsonl"
+        bound.write_text(
+            json.dumps({"type": "session", "id": "abc", "cwd": str(tmp_path)}) + "\n"
+        )
+        store = TopicStateStore(resolve_state_path(config))
+        await store.set_context(-100, 77, RunContext(project="test"))
+        await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
+    if mode == "dispatching_cancel_peer":
+        progress_entered, release_progress = anyio.Event(), anyio.Event()
+        peer_forward_attached, release_peer_timer = anyio.Event(), anyio.Event()
+        original_timer = loop.ForwardCoalescer._debounce_prompt_run
+
+        async def held_peer_timer(self, key, pending):
+            if pending.msg.sender_id == 456:
+                await release_peer_timer.wait()
+            await original_timer(self, key, pending)
+
+        monkeypatch.setattr(
+            loop.ForwardCoalescer, "_debounce_prompt_run", held_peer_timer
+        )
+        original_attach = loop.ForwardCoalescer.attach_forward
+
+        def observed_attach(self, msg):
+            original_attach(self, msg)
+            if msg.message_id == 11:
+                peer_forward_attached.set()
+
+        monkeypatch.setattr(loop.ForwardCoalescer, "attach_forward", observed_attach)
+        original_progress = loop._send_queued_progress
+
+        async def held_progress(*args, **kwargs):
+            if kwargs.get("user_msg_id") == 1:
+                progress_entered.set()
+                await release_progress.wait()
+            return await original_progress(*args, **kwargs)
+
+        monkeypatch.setattr(loop, "_send_queued_progress", held_progress)
+    if mode in ("queued_progress_fail", "dispatching_cancel_peer"):
+        bound = tmp_path / "legacy.jsonl"
+        bound.write_text(
+            json.dumps({"type": "session", "id": "abc", "cwd": str(tmp_path)}) + "\n"
+        )
+        store = TopicStateStore(resolve_state_path(config))
+        await store.set_context(-100, 77, RunContext(project="test"))
+        await store.set_session_resume(-100, 77, ResumeToken("pi", str(bound)))
+
+        if mode == "queued_progress_fail":
+
+            async def fail_progress(*_args, **_kwargs):
+                raise RuntimeError("synthetic progress transport failure")
+
+            monkeypatch.setattr(loop, "_send_queued_progress", fail_progress)
+    dispatches: list[str] = []
+    monkeypatch.setattr(loop, "list_command_ids", lambda **_: ["spy"])
+
+    async def fake_dispatch(*_args, **_kwargs):
+        dispatches.append("started")
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(loop, "dispatch_command", fake_dispatch)
+    if mode == "callback_race":
+        from takopi.telegram.live_conversation import LiveConversationService
+
+        raced = {"armed": False, "busy": False}
+        original_unresolved = LiveInbox.unresolved_all
+
+        async def race_after_last_await(self):
+            result = await original_unresolved(self)
+            if raced["armed"]:
+                raced["busy"] = True  # Pi owner registers while the guard awaits inbox.
+            return result
+
+        monkeypatch.setattr(LiveInbox, "unresolved_all", race_after_last_await)
+        monkeypatch.setattr(
+            LiveConversationService,
+            "has_topic_owner",
+            lambda _self, _chat, _thread: raced["busy"],
+        )
+
+    class Runner(PiRunner):
+        def rpc_run(self, *_args, **_kwargs):
+            raise AssertionError("live start must wait for delayed plugin")
+
+        async def run(self, *_args):
+            if mode in (
+                "forwarded_legacy_callback",
+                "forwarded_queued_callback",
+                "two_forward_queued",
+                "dispatching_cancel_peer",
+            ):
+                yield StartedEvent(
+                    engine="pi",
+                    resume=ResumeToken("pi", str(tmp_path / "legacy.jsonl")),
+                )
+                legacy_started.set()
+                await release.wait()
+                yield CompletedEvent(engine="pi", ok=True, answer="done")
+                return
+            raise AssertionError("plugin/initial must not start Pi concurrently")
+
+    runtime = TransportRuntime(
+        router=AutoRouter(
+            [
+                RunnerEntry(
+                    engine="pi", runner=Runner(extra_args=[], model=None, provider=None)
+                )
+            ],
+            "pi",
+        ),
+        projects=ProjectsConfig(
+            projects={
+                "test": ProjectConfig(
+                    alias="test",
+                    path=tmp_path,
+                    worktrees_dir=tmp_path / ".worktrees",
+                    chat_id=-100,
+                )
+            },
+            default_project=None,
+            chat_map={-100: "test"},
+        ),
+        config_path=config,
+    )
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=cast(Transport, FakeTransport()),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        pi_live_conversation=True,
+        forward_coalesce_s=5
+        if mode in ("forward_cancel_callback", "forward_cancel_reply")
+        else 0.05
+        if mode
+        in (
+            "forwarded_legacy_callback",
+            "forwarded_queued_callback",
+            "two_forward_queued",
+            "dispatching_cancel_peer",
+            "forward_cancel_callback",
+            "forward_cancel_reply",
+        )
+        else 0,
+    )
+    transport = cast(FakeTransport, cfg.exec_cfg.transport)
+
+    async def poller(_cfg):
+        if mode == "dispatching_cancel_peer":
+            for message_id, text, forwarded in (
+                (1, "Task A", False),
+                (10, "Task B", False),
+                (2, "Forward A", True),
+                (11, "Forward B", True),
+            ):
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=message_id,
+                    text=text,
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=123 if message_id in (1, 2) else 456,
+                    raw={"forward_date": 1} if forwarded else None,
+                )
+            with anyio.fail_after(2):
+                await progress_entered.wait()
+                await peer_forward_attached.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=12,
+                text="/cancel",
+                reply_to_message_id=10,
+                reply_to_text="Task B",
+                sender_id=456,
+            )
+            with anyio.fail_after(2):
+                while not any(
+                    "Pending forwarded task cancelled" in call["message"].text
+                    for call in transport.send_calls
+                ):
+                    await anyio.sleep(0.01)
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=30,
+                callback_query_id="during-dispatch",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=13,
+                text="/cancel",
+                reply_to_message_id=2,
+                reply_to_text="Forward A",
+                sender_id=123,
+            )
+        elif mode == "two_forward_queued":
+            for message_id, sender_id, text in (
+                (1, 123, "Task A"),
+                (10, 456, "Task B"),
+            ):
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=message_id,
+                    text=text,
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=sender_id,
+                )
+            for message_id, sender_id in ((2, 123), (11, 456)):
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=message_id,
+                    text="Forward details",
+                    reply_to_message_id=None,
+                    reply_to_text=None,
+                    sender_id=sender_id,
+                    raw={"forward_date": 1},
+                )
+            with anyio.fail_after(2):
+                await worker_queued.wait()
+                while len(scheduler_ref["scheduler"]._queued_by_progress) != 2:
+                    await anyio.sleep(0.01)
+            scheduler = scheduler_ref["scheduler"]
+            progress_id = next(
+                key[1]
+                for key, job in scheduler._queued_by_progress.items()
+                if job.user_msg_id == 1
+            )
+            assert await scheduler.cancel_queued(-100, progress_id) is not None
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=30,
+                callback_query_id="remaining-forward",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode in (
+            "forwarded_legacy_callback",
+            "forwarded_queued_callback",
+            "forward_cancel_callback",
+            "forward_cancel_reply",
+        ):
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            await anyio.sleep(0.01)
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="Forward details",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+                raw={"forward_date": 1},
+            )
+            if mode in ("forward_cancel_callback", "forward_cancel_reply"):
+                with anyio.fail_after(2):
+                    while True:
+                        intent = await LiveInbox(
+                            resolve_inbox_path(config)
+                        ).initial_by_id((-100, 77, 1))
+                        if intent is not None and intent.state == "deferred":
+                            break
+                        await anyio.sleep(0.01)
+                yield TelegramIncomingMessage(
+                    transport="telegram",
+                    chat_id=-100,
+                    thread_id=77,
+                    message_id=4,
+                    text="/cancel",
+                    reply_to_message_id=2 if mode == "forward_cancel_reply" else None,
+                    reply_to_text=None,
+                    sender_id=123,
+                )
+                await anyio.sleep(0.05)
+            else:
+                with anyio.fail_after(2):
+                    if mode == "forwarded_queued_callback":
+                        await worker_queued.wait()
+                    else:
+                        await legacy_started.wait()
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=3,
+                callback_query_id="legacy-topic",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "queued_progress_fail":
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            with anyio.fail_after(2):
+                while not any(
+                    "Could not queue task" in call["message"].text
+                    for call in transport.send_calls
+                ):
+                    await anyio.sleep(0.01)
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=3,
+                callback_query_id="failed-queue",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "cancel_queued_resume":
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            with anyio.fail_after(2):
+                await worker_queued.wait()
+            scheduler = scheduler_ref["scheduler"]
+            progress_id = next(iter(scheduler._queued_by_progress))[1]
+            assert await scheduler.cancel_queued(-100, progress_id) is not None
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=3,
+                callback_query_id="cancelled-queue",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "callback_race":
+            raced["armed"] = True
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=1,
+                callback_query_id="topic-race",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {"message_thread_id": 77}},
+            )
+        elif mode == "unknown_callback":
+            yield TelegramCallbackQuery(
+                transport="telegram",
+                chat_id=-100,
+                message_id=1,
+                callback_query_id="missing-thread",
+                data="spy:run",
+                sender_id=123,
+                raw={"message": {}},
+            )
+        else:
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=1,
+                text="/spy run",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            await entered.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="Build task",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+        emitted.set()
+        await release.wait()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_main_loop, cfg, poller)
+        try:
+            with anyio.fail_after(2):
+                await emitted.wait()
+            await anyio.sleep(0.05)
+            if mode in (
+                "unknown_callback",
+                "callback_race",
+                "forwarded_legacy_callback",
+                "forwarded_queued_callback",
+                "two_forward_queued",
+                "dispatching_cancel_peer",
+            ):
+                assert dispatches == [], (
+                    "plugin callback with unproven topic must fail closed"
+                )
+                if mode == "dispatching_cancel_peer":
+                    with anyio.fail_after(2):
+                        while not any(
+                            "Cancellation requested during forwarded dispatch"
+                            in call["message"].text
+                            for call in transport.send_calls
+                        ):
+                            await anyio.sleep(0.01)
+                    release_progress.set()
+                    with anyio.fail_after(2):
+                        while not any(
+                            "Forwarded task cancelled before queueing"
+                            in call["message"].text
+                            for call in transport.send_calls
+                        ):
+                            await anyio.sleep(0.01)
+                    assert not legacy_started.is_set(), (
+                        "cancelled forwarded task must never start Pi"
+                    )
+            else:
+                assert dispatches == ["started"], [
+                    call["message"].text for call in transport.send_calls
+                ]
+                assert (
+                    await LiveInbox(resolve_inbox_path(config)).initial_for_topic(
+                        -100, 77
+                    )
+                    is None
+                )
+        finally:
+            if mode == "dispatching_cancel_peer":
+                release_progress.set()
+                release_peer_timer.set()
+            release_worker.set()
+            release.set()
+    if mode in ("forwarded_queued_callback", "two_forward_queued"):
+        assert legacy_started.is_set(), "Remaining forwarded one-shot must run"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("phase", "reply_kind"),
+    [
+        ("identity", "none"),
+        ("identity", "original"),
+        ("identity", "root"),
+        ("debounce", "none"),
+        ("debounce", "root"),
+        ("empty_forward", "none"),
+    ],
+)
+async def test_telegram_cancel_while_fresh_identity_is_pending_prevents_prompt(
+    tmp_path: Path,
+    phase: str,
+    reply_kind: str,
+) -> None:
+    config = tmp_path / "takopi.toml"
+    entered, release, emitted = anyio.Event(), anyio.Event(), anyio.Event()
+    rpc_runs: list[Rpc] = []
+
+    class Rpc:
+        def __init__(self, session_path: Path):
+            self.client = self
+            self.session_path = session_path
+            self.cwd = tmp_path
+            self.prompt_sent = False
+
+        async def request(self, typ: str):
+            assert typ == "get_state"
+            entered.set()
+            await release.wait()
+            return {
+                "data": {
+                    "sessionId": "fixture",
+                    "sessionFile": str(self.session_path),
+                    "isStreaming": False,
+                }
+            }
+
+        async def run(self, *_args):
+            self.prompt_sent = True
+            if phase == "empty_forward":
+                yield StartedEvent(
+                    engine="pi", resume=ResumeToken("pi", str(self.session_path))
+                )
+                yield CompletedEvent(engine="pi", ok=True, answer="done")
+                return
+            raise AssertionError("cancelled startup must not submit a Pi prompt")
+
+        async def close(self):
+            pass
+
+    class Runner(PiRunner):
+        def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
+            rpc = Rpc(session_path)
+            rpc_runs.append(rpc)
+            return cast(PiRpcRun, rpc)
+
+    runtime = TransportRuntime(
+        router=AutoRouter(
+            [
+                RunnerEntry(
+                    engine="pi", runner=Runner(extra_args=[], model=None, provider=None)
+                )
+            ],
+            "pi",
+        ),
+        projects=ProjectsConfig(
+            projects={
+                "test": ProjectConfig(
+                    alias="test",
+                    path=tmp_path,
+                    worktrees_dir=tmp_path / ".worktrees",
+                    chat_id=-100,
+                )
+            },
+            default_project=None,
+            chat_map={-100: "test"},
+        ),
+        config_path=config,
+    )
+    transport = FakeTransport()
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=cast(Transport, transport),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        pi_live_conversation=True,
+        forward_coalesce_s=0.3 if phase in ("debounce", "empty_forward") else 0,
+    )
+
+    async def poller(_cfg):
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=-100,
+            thread_id=77,
+            message_id=1,
+            text="Build task",
+            reply_to_message_id=None,
+            reply_to_text=None,
+            sender_id=123,
+        )
+        if phase == "empty_forward":
+            await anyio.sleep(0.05)
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=2,
+                text="",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+                raw={"forward_date": 1},
+            )
+            with anyio.fail_after(2):
+                await entered.wait()
+            yield TelegramIncomingMessage(
+                transport="telegram",
+                chat_id=-100,
+                thread_id=77,
+                message_id=3,
+                text="/update Use green",
+                reply_to_message_id=None,
+                reply_to_text=None,
+                sender_id=123,
+            )
+            emitted.set()
+            await asyncio.Event().wait()
+            return
+        if phase == "identity":
+            await entered.wait()
+        else:
+            await anyio.sleep(0.05)
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=-100,
+            thread_id=77,
+            message_id=2,
+            text="/cancel",
+            reply_to_message_id={"original": 1, "root": 77}.get(reply_kind),
+            reply_to_text="Build task" if reply_kind == "original" else None,
+            sender_id=123,
+        )
+        emitted.set()
+        await asyncio.Event().wait()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_main_loop, cfg, poller)
+        with anyio.fail_after(2):
+            await emitted.wait()
+        await anyio.sleep(0.05)
+        if phase == "empty_forward":
+            assert rpc_runs
+            assert (
+                await LiveInbox(resolve_inbox_path(config)).get((-100, 77, 3))
+            ).text == "Use green"
+            release.set()
+            tg.cancel_scope.cancel()
+            return
+        release.set()
+        await anyio.sleep(0.4 if phase == "debounce" else 0.1)
+        assert all(not rpc.prompt_sent for rpc in rpc_runs)
+        if phase == "identity":
+            assert rpc_runs
+        assert (
+            await LiveInbox(resolve_inbox_path(config)).initial_for_topic(-100, 77)
+            is None
+        )
+        assert not any(
+            "nothing is currently running" in call["message"].text
+            for call in transport.send_calls
+        )
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_cancel_during_fresh_identity_request_releases_rpc_claim_and_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from takopi.runners import pi_rpc
+
+    entered = anyio.Event()
+    config = tmp_path / "takopi.toml"
+    client: PiRpcClient | None = None
+
+    class Stream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+    class Stdin:
+        async def send(self, _data: bytes):
+            entered.set()
+
+        async def aclose(self):
+            pass
+
+    class Proc:
+        pid = 999999
+        stdin = Stdin()
+        stdout = Stream()
+        stderr = Stream()
+        returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+    async def fake_open(*_args, **_kwargs):
+        return Proc()
+
+    monkeypatch.setattr(pi_rpc.anyio, "open_process", fake_open)
+    monkeypatch.setattr(pi_rpc.os, "killpg", lambda *_args: None)
+
+    class Runner(PiRunner):
+        def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
+            nonlocal client
+            assert cwd == tmp_path
+            client = PiRpcClient(session_path, tmp_path, [])
+            return PiRpcRun(client)
+
+    runtime = TransportRuntime(
+        router=AutoRouter(
+            [
+                RunnerEntry(
+                    engine="pi", runner=Runner(extra_args=[], model=None, provider=None)
+                )
+            ],
+            "pi",
+        ),
+        projects=ProjectsConfig(
+            projects={
+                "test": ProjectConfig(
+                    alias="test",
+                    path=tmp_path,
+                    worktrees_dir=tmp_path / ".worktrees",
+                    chat_id=-100,
+                )
+            },
+            default_project=None,
+            chat_map={-100: "test"},
+        ),
+        config_path=config,
+    )
+    cfg = TelegramBridgeConfig(
+        bot=FakeBot(),
+        runtime=runtime,
+        chat_id=-100,
+        startup_msg="",
+        exec_cfg=ExecBridgeConfig(
+            transport=cast(Transport, FakeTransport()),
+            presenter=MarkdownPresenter(),
+            final_notify=True,
+        ),
+        topics=TelegramTopicsSettings(enabled=True, scope="projects"),
+        pi_live_conversation=True,
+        forward_coalesce_s=0,
+    )
+
+    async def poller(_cfg):
+        yield TelegramIncomingMessage(
+            transport="telegram",
+            chat_id=-100,
+            thread_id=77,
+            message_id=1,
+            text="Build task",
+            reply_to_message_id=None,
+            reply_to_text=None,
+            sender_id=123,
+        )
+        await asyncio.Event().wait()
+
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_main_loop, cfg, poller)
+            with anyio.fail_after(2):
+                await entered.wait()
+            tg.cancel_scope.cancel()
+        assert client is not None
+        assert client._closed, "cancelled identity verification must close RPC"
+        assert pi_rpc._OWNERS.get(client.session_path) is None
+        assert all(task.done() for task in client._tasks)
+    finally:
+        if client is not None:
+            await client.close()

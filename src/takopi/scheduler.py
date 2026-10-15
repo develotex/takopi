@@ -25,6 +25,8 @@ class ThreadJob:
     thread_id: ThreadId | None = None
     session_key: tuple[int, int | None] | None = None
     progress_ref: MessageRef | None = None
+    allow_live: bool = True
+    legacy_fallback: bool = False
 
 
 RunJob = Callable[[ThreadJob], Awaitable[None]]
@@ -37,9 +39,16 @@ class TaskGroup(Protocol):
 
 
 class ThreadScheduler:
-    def __init__(self, *, task_group: TaskGroup, run_job: RunJob) -> None:
+    def __init__(
+        self,
+        *,
+        task_group: TaskGroup,
+        run_job: RunJob,
+        on_cancel_queued: Callable[[ThreadJob], Awaitable[None]] | None = None,
+    ) -> None:
         self._task_group = task_group
         self._run_job = run_job
+        self._on_cancel_queued = on_cancel_queued
         self._lock = anyio.Lock()
         self._pending_by_thread: dict[str, deque[ThreadJob]] = {}
         self._queued_by_progress: dict[tuple[ChannelId, MessageId], ThreadJob] = {}
@@ -84,6 +93,8 @@ class ThreadScheduler:
         thread_id: ThreadId | None = None,
         session_key: tuple[int, int | None] | None = None,
         progress_ref: MessageRef | None = None,
+        allow_live: bool = True,
+        legacy_fallback: bool = False,
     ) -> None:
         await self.enqueue(
             ThreadJob(
@@ -95,6 +106,8 @@ class ThreadScheduler:
                 thread_id=thread_id,
                 session_key=session_key,
                 progress_ref=progress_ref,
+                allow_live=allow_live,
+                legacy_fallback=legacy_fallback,
             )
         )
 
@@ -102,13 +115,21 @@ class ThreadScheduler:
         self, chat_id: ChannelId, progress_msg_id: MessageId
     ) -> ThreadJob | None:
         async with self._lock:
-            return self._pop_queued_locked(chat_id, progress_msg_id)
+            job = self._pop_queued_locked(chat_id, progress_msg_id)
+        if job is not None and self._on_cancel_queued is not None:
+            await self._on_cancel_queued(job)
+        return job
 
     async def claim_queued(
         self, chat_id: ChannelId, progress_msg_id: MessageId
     ) -> ThreadJob | None:
         async with self._lock:
             return self._pop_queued_locked(chat_id, progress_msg_id)
+
+    async def settle_claimed(self, job: ThreadJob) -> None:
+        """Release an exclusive topic reservation after the claimed job leaves the queue."""
+        if job.legacy_fallback and self._on_cancel_queued is not None:
+            await self._on_cancel_queued(job)
 
     async def requeue_front(self, job: ThreadJob) -> None:
         key = self.thread_key(job.resume_token)
@@ -132,6 +153,16 @@ class ThreadScheduler:
         progress_key = (chat_id, progress_msg_id)
         async with self._lock:
             return self._queued_by_progress.get(progress_key)
+
+    async def has_pending_for_topic(
+        self, token: ResumeToken, chat_id: ChannelId, thread_id: ThreadId
+    ) -> bool:
+        key = self.thread_key(token)
+        async with self._lock:
+            return any(
+                job.chat_id == chat_id and job.thread_id == thread_id
+                for job in self._pending_by_thread.get(key, ())
+            )
 
     async def is_busy(self, token: ResumeToken) -> bool:
         key = self.thread_key(token)

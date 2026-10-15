@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -16,7 +17,26 @@ from ..commands import list_command_ids
 from ..directives import DirectiveError
 from ..logging import get_logger
 from ..model import EngineId, ResumeToken
-from ..runners.run_options import EngineRunOptions
+from ..runners.run_options import EngineRunOptions, apply_run_options
+from ..runners.pi import PiRunner
+from ..runners.pi_identity import session_header as pi_session_header
+from ..runners.pi_rpc import PiRpcRun, enable_live_claims
+from .live_conversation import (
+    LiveConversationService,
+    LiveOwner,
+    LiveRunner,
+    live_route_key,
+    legacy_session_busy,
+    live_session_path,
+    quick_pi_answer,
+    resolve_legacy_session,
+    session_header_id,
+    verify_bound_session,
+    verify_fresh_session,
+    verify_legacy_session,
+    verify_provisional_header,
+)
+from .live_inbox import InitialIntent, LiveInbox, Receipt, resolve_inbox_path
 from ..scheduler import ThreadJob, ThreadScheduler
 from ..progress import ProgressTracker
 from ..settings import TelegramTransportSettings
@@ -401,6 +421,8 @@ class _PendingPrompt:
     is_voice_transcribed: bool
     forwards: list[tuple[int, str]]
     cancel_scope: anyio.CancelScope | None = None
+    forward_barrier: anyio.Event | None = None
+    dispatch_cancel_requested: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,8 +562,10 @@ class ForwardCoalescer:
         sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
         dispatch: Callable[[_PendingPrompt], Awaitable[None]],
         pending: dict[ForwardKey, _PendingPrompt],
+        on_cancel: Callable[[_PendingPrompt], None] | None = None,
     ) -> None:
         self._task_group = task_group
+        self._on_cancel = on_cancel
         self._debounce_s = debounce_s
         self._sleep = sleep
         self._dispatch = dispatch
@@ -553,6 +577,8 @@ class ForwardCoalescer:
             return
         if pending.cancel_scope is not None:
             pending.cancel_scope.cancel()
+        if self._on_cancel is not None:
+            self._on_cancel(pending)
         logger.debug(
             "forward.prompt.cancelled",
             chat_id=pending.msg.chat_id,
@@ -679,6 +705,12 @@ class ForwardCoalescer:
                 await self._sleep(self._debounce_s)
         except anyio.get_cancelled_exc_class():
             return
+        if scope.cancel_called:
+            return  # CancelScope suppresses its own cancellation on exit.
+        if pending.forward_barrier is not None:
+            await pending.forward_barrier.wait()
+        if scope.cancel_called:
+            return  # Rescheduled while the old debounce waited on the barrier.
         if self._pending.get(key) is not pending:
             return
         self._pending.pop(key, None)
@@ -808,7 +840,12 @@ class MediaGroupBuffer:
             [TelegramIncomingMessage, str, RunContext | None],
             Awaitable[ResolvedMessage | None],
         ],
+        before_flush: Callable[[list[TelegramIncomingMessage]], Awaitable[bool]]
+        | None = None,
+        after_flush: Callable[[list[TelegramIncomingMessage]], None] | None = None,
     ) -> None:
+        self._before_flush = before_flush
+        self._after_flush = after_flush
         self._task_group = task_group
         self._debounce_s = debounce_s
         self._sleep = sleep
@@ -868,13 +905,21 @@ class MediaGroupBuffer:
                 for msg in messages
             ):
                 return
-            await handle_media_group(
-                self._cfg,
-                messages,
-                self._topic_store,
-                self._run_prompt_from_upload,
-                self._resolve_prompt_message,
-            )
+            if self._before_flush is not None and not await self._before_flush(
+                messages
+            ):
+                return
+            try:
+                await handle_media_group(
+                    self._cfg,
+                    messages,
+                    self._topic_store,
+                    self._run_prompt_from_upload,
+                    self._resolve_prompt_message,
+                )
+            finally:
+                if self._after_flush is not None:
+                    self._after_flush(messages)
             return
 
 
@@ -1010,6 +1055,41 @@ async def send_with_resume(
 
 
 async def run_main_loop(
+    cfg: TelegramBridgeConfig,
+    poller: Callable[
+        [TelegramBridgeConfig], AsyncIterator[TelegramIncomingUpdate]
+    ] = poll_updates,
+    *,
+    watch_config: bool | None = None,
+    default_engine_override: str | None = None,
+    transport_id: str | None = None,
+    transport_config: TelegramTransportSettings | None = None,
+    sleep: Callable[[float], Awaitable[None]] = anyio.sleep,
+) -> None:
+    if not cfg.pi_live_conversation:
+        await _run_main_loop_impl(
+            cfg,
+            poller,
+            watch_config=watch_config,
+            default_engine_override=default_engine_override,
+            transport_id=transport_id,
+            transport_config=transport_config,
+            sleep=sleep,
+        )
+        return
+    with enable_live_claims():
+        await _run_main_loop_impl(
+            cfg,
+            poller,
+            watch_config=watch_config,
+            default_engine_override=default_engine_override,
+            transport_id=transport_id,
+            transport_config=transport_config,
+            sleep=sleep,
+        )
+
+
+async def _run_main_loop_impl(
     cfg: TelegramBridgeConfig,
     poller: Callable[
         [TelegramBridgeConfig], AsyncIterator[TelegramIncomingUpdate]
@@ -1194,13 +1274,31 @@ async def run_main_loop(
                 topic_key: tuple[int, int] | None,
                 chat_session_key: tuple[int, int | None] | None,
                 running_task: RunningTask | None = None,
+                done_override: anyio.Event | None = None,
             ) -> Callable[[ResumeToken, anyio.Event], Awaitable[None]] | None:
                 if base_cb is None and topic_key is None and chat_session_key is None:
                     return None
 
                 async def _wrapped(token: ResumeToken, done: anyio.Event) -> None:
+                    if (
+                        state.topic_store is not None
+                        and topic_key is not None
+                        and live is not None
+                        and token.engine == "pi"
+                    ):
+                        active_owner = live.topic_owner(*topic_key)
+                        if (
+                            active_owner is not None
+                            and token.value != active_owner.session_key
+                        ) or (
+                            active_owner is None
+                            and any(key[:2] == topic_key for key in starting_live)
+                        ):
+                            raise ValueError(
+                                "Pi session token cannot replace a live topic owner"
+                            )
                     if base_cb is not None:
-                        await base_cb(token, done)
+                        await base_cb(token, done_override or done)
                     if state.topic_store is not None and topic_key is not None:
                         await state.topic_store.set_session_resume(
                             topic_key[0], topic_key[1], token
@@ -1257,6 +1355,9 @@ async def run_main_loop(
                 | None = None,
                 engine_override: EngineId | None = None,
                 progress_ref: MessageRef | None = None,
+                recovery_rpc: PiRpcRun | None = None,
+                recovery_initial_id: tuple[int, int, int] | None = None,
+                allow_live: bool = True,
             ) -> None:
                 topic_key = (
                     (chat_id, thread_id)
@@ -1267,6 +1368,16 @@ async def run_main_loop(
                     )
                     else None
                 )
+                if topic_key is not None:
+                    recovery = recovery_cancel.get((chat_id, topic_key[1], user_msg_id))
+                    if (
+                        chat_id,
+                        topic_key[1],
+                        user_msg_id,
+                    ) in cancelled_initial_ids or (
+                        recovery is not None and recovery[0].is_set()
+                    ):
+                        return
                 stateful_mode = topic_key is not None or chat_session_key is not None
                 show_resume_line = should_show_resume_line(
                     show_resume_line=cfg.show_resume_line,
@@ -1291,46 +1402,836 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
+                if (
+                    live is not None
+                    and topic_key in plugin_inflight
+                    and engine_for_overrides == "pi"
+                ):
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=thread_id,
+                        text="Plugin command is still running in this topic; Pi task not accepted. Resend after it completes.",
+                    )
+                    return
+                # All Pi launch paths (including media, directives and queued
+                # one-shot jobs) pass this gate, not just the opt-in RPC branch.
+                # Otherwise a legacy prompt can overtake an unresolved live
+                # instruction or write a Pi file bound to another topic.
+                if (
+                    live is not None
+                    and engine_for_overrides == "pi"
+                    and recovery_initial_id is None
+                    and recovery_rpc is None
+                ):
+                    if topic_key is not None:
+                        intent = await live.inbox.initial_for_topic(*topic_key)
+                        original_scheduled = (
+                            intent is not None
+                            and allow_live
+                            and resume_token is None
+                            and intent.state == "scheduled"
+                            and intent.message_id == user_msg_id
+                            and fresh_pending.get(topic_key, (None, 0))[0]
+                            == Path(intent.session_key)
+                            and intent.prompt == text
+                        )
+                        if intent is not None and not original_scheduled:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text=f"Initial Pi task #{intent.message_id} remains unresolved; no prompt submitted. Use scoped recovery.",
+                            )
+                            return
+                        outstanding = [
+                            receipt
+                            for receipt in await live.inbox.unresolved_all()
+                            if receipt.chat_id == chat_id
+                            and receipt.thread_id == topic_key[1]
+                            and receipt.message_id <= user_msg_id
+                        ]
+                        if outstanding and not original_scheduled:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Prior Pi update is unresolved; no prompt submitted. Reconcile, retry or defer its receipt first.",
+                            )
+                            return
+                    if resume_token is not None and state.topic_store is not None:
+                        try:
+                            cwd_for_claim = (
+                                cfg.runtime.resolve_run_cwd(context) or Path.cwd()
+                            )
+                            candidate_path = Path(resume_token.value)
+                            if not candidate_path.is_absolute():
+                                candidate_path = (
+                                    (cwd_for_claim / candidate_path).resolve()
+                                    if candidate_path.suffix == ".jsonl"
+                                    else resolve_legacy_session(
+                                        resume_token.value, cwd_for_claim
+                                    )
+                                )
+                            candidate_path = candidate_path.resolve()
+                            other_owners = await state.topic_store.session_owners(
+                                "pi",
+                                str(candidate_path),
+                                session_header_id(candidate_path)
+                                if candidate_path.is_file()
+                                else None,
+                                relative_resolver=resolve_stored_pi_alias,
+                            )
+                        except (ValueError, OSError, ConfigError):
+                            other_owners = None
+                        if other_owners is None or (
+                            other_owners
+                            and (topic_key is None or other_owners - {topic_key})
+                        ):
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text=(
+                                    "Pi session ID не найден однозначно в этом проекте; no prompt submitted."
+                                    if not Path(resume_token.value).is_absolute()
+                                    and Path(resume_token.value).suffix != ".jsonl"
+                                    else "Pi session identity or topic owner cannot be verified; no prompt submitted."
+                                ),
+                            )
+                            return
                 from ..runner_bridge import RunningTask
 
-                running_task = RunningTask(context=context)
-                await run_engine(
-                    exec_cfg=cfg.exec_cfg,
-                    runtime=cfg.runtime,
-                    running_tasks=state.running_tasks,
-                    chat_id=chat_id,
-                    user_msg_id=user_msg_id,
-                    text=text,
-                    resume_token=resume_token,
+                running_task = RunningTask(
                     context=context,
-                    reply_ref=reply_ref,
-                    running_task=running_task,
-                    on_thread_known=wrap_on_thread_known(
-                        on_thread_known, topic_key, chat_session_key, running_task
-                    ),
-                    engine_override=engine_override,
                     thread_id=thread_id,
-                    show_resume_line=show_resume_line,
-                    progress_ref=progress_ref,
-                    run_options=run_options,
+                    user_message_id=user_msg_id,
                 )
+                live_runner: LiveRunner | None = None
+                owner: LiveOwner | None = None
+                owner_done = anyio.Event()
+                if (
+                    live is not None
+                    and allow_live
+                    and topic_key is not None
+                    and engine_for_overrides == "pi"
+                    and config_path is not None
+                ):
+                    entry = cfg.runtime.resolve_runner(
+                        resume_token=resume_token, engine_override=engine_override
+                    )
+                    root = (config_path.parent / "pi-live-sessions").resolve()
+                    cwd = cfg.runtime.resolve_run_cwd(context) or Path.cwd()
+                    path = (
+                        (cwd / resume_token.value).resolve()
+                        if resume_token is not None
+                        else fresh_pending.get(topic_key, (None, 0))[0]
+                        or live_session_path(config_path, chat_id, topic_key[1])
+                    )
+                    # A short ID is only a lookup hint. Resolve to one local
+                    # project file before claiming the canonical RPC owner.
+                    bound = (
+                        await state.topic_store.get_session_resume(
+                            chat_id, topic_key[1], "pi"
+                        )
+                        if state.topic_store is not None
+                        else None
+                    )
+                    fresh = (
+                        path.parent == root
+                        and path.name.startswith(f"{chat_id}-{topic_key[1]}-")
+                        and resume_token is None
+                    )
+                    existing = (
+                        resume_token is not None
+                        and Path(resume_token.value).suffix == ".jsonl"
+                        and path.suffix == ".jsonl"
+                        and path.is_file()
+                        and bound == resume_token
+                    )
+                    unresolved_initial = await live.inbox.initial_for_topic(
+                        chat_id, topic_key[1]
+                    )
+                    if unresolved_initial is not None and not (
+                        unresolved_initial.session_key == str(path)
+                        and (
+                            recovery_initial_id == unresolved_initial.id
+                            or (
+                                recovery_initial_id is None
+                                and resume_token is None
+                                and user_msg_id == unresolved_initial.message_id
+                            )
+                        )
+                    ):
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text=f"Initial Pi task #{unresolved_initial.message_id} remains unresolved; no new prompt submitted. Explicitly retry-initial or defer-initial in this topic.",
+                        )
+                        return
+                    legacy_id: str | None = None
+                    if (
+                        resume_token is not None
+                        and not Path(resume_token.value).is_absolute()
+                        and Path(resume_token.value).suffix != ".jsonl"
+                        and bound == resume_token
+                        and isinstance(entry.runner, PiRunner)
+                        and entry.available
+                    ):
+                        legacy_id = resume_token.value
+                        try:
+                            path = resolve_legacy_session(legacy_id, cwd)
+                        except ValueError:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Pi session ID не найден однозначно в этом проекте. Работа не запущена; уточните путь к сессии.",
+                            )
+                            return
+                        if legacy_session_busy(state.running_tasks, path):
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Эта Pi-сессия уже выполняется; дождитесь завершения текущего запуска.",
+                            )
+                            return
+                    if (
+                        resume_token is not None
+                        and recovery_rpc is None
+                        and any(
+                            receipt.message_id <= user_msg_id
+                            for receipt in await live.inbox.unresolved_for_topic(
+                                chat_id, topic_key[1], str(path)
+                            )
+                        )
+                    ):
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Prior Pi update remains unresolved; no new writable prompt submitted. Reconcile, retry or defer the exact receipt first.",
+                        )
+                        return
+                    if existing and state.topic_store is not None:
+                        try:
+                            owners = await state.topic_store.session_owners(
+                                "pi",
+                                str(path),
+                                session_header_id(path),
+                                relative_resolver=resolve_stored_pi_alias,
+                            )
+                            if owners - {(chat_id, topic_key[1])}:
+                                raise ValueError("Another topic owns this Pi session")
+                        except ValueError:
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Pi session identity or topic ownership is conflicting; no prompt submitted.",
+                            )
+                            return
+                    if resume_token is not None and not existing and legacy_id is None:
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Bound Pi session is missing or mismatched; no prompt submitted. Verify this exact topic before retrying.",
+                        )
+                        return
+                    if (
+                        isinstance(entry.runner, PiRunner)
+                        and entry.available
+                        and (fresh or existing or legacy_id is not None)
+                    ):
+                        if recovery_rpc is not None:
+                            if Path(recovery_rpc.client.session_path).resolve() != path:
+                                raise ValueError("Retry RPC owner path mismatch")
+                            rpc = recovery_rpc
+                        else:
+                            with apply_run_options(run_options):
+                                rpc = entry.runner.rpc_run(path, cwd=cwd)
+                        provisional_id: str | None = None
+                        startup_key = (chat_id, topic_key[1], user_msg_id)
+                        recovery = recovery_cancel.get(startup_key)
+                        if startup_key in cancelled_initial_ids or (
+                            recovery is not None and recovery[0].is_set()
+                        ):
+                            running_task.cancel_requested.set()
+                        startup_cancel[startup_key] = running_task
+                        if resume_token is None or existing:
+                            try:
+                                if existing:
+                                    await verify_bound_session(rpc, path, cwd)
+                                else:
+                                    provisional_id = await verify_fresh_session(
+                                        rpc, path, cwd
+                                    )
+                                if (
+                                    existing
+                                    and resume_token is not None
+                                    and resume_token.value != str(path)
+                                ):
+                                    resume_token = ResumeToken(
+                                        engine="pi", value=str(path)
+                                    )
+                                    assert state.topic_store is not None
+                                    await state.topic_store.set_session_resume(
+                                        chat_id, topic_key[1], resume_token
+                                    )
+                            except BaseException as exc:  # noqa: BLE001 - cancellation must close the claimed RPC too
+                                startup_cancel.pop(startup_key, None)
+                                await rpc.client.close()
+                                if not isinstance(exc, Exception):
+                                    raise
+                                await send_plain(
+                                    cfg.exec_cfg.transport,
+                                    chat_id=chat_id,
+                                    user_msg_id=user_msg_id,
+                                    thread_id=thread_id,
+                                    text=f"Pi session identity could not be verified ({type(exc).__name__}); no prompt submitted. Confirm recovery in this topic.",
+                                )
+                                return
+                        live_runner = LiveRunner(
+                            entry.runner,
+                            rpc,
+                            running_task.resume_ready,
+                            initial_recovery=recovery_rpc is not None,
+                        )
+                        live_runner.cancel_requested = running_task.cancel_requested
+                        rpc.cancel_requested = running_task.cancel_requested
+                        owner = LiveOwner(
+                            chat_id,
+                            topic_key[1],
+                            str(path),
+                            live_runner,
+                            text[:1500],
+                            running_task=running_task,
+                            identity_verified=provisional_id is None,
+                        )
+                        if topic_key in plugin_inflight or topic_key in legacy_pending:
+                            startup_cancel.pop(startup_key, None)
+                            await rpc.client.close()
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Plugin or forwarded task became active during Pi startup; no prompt submitted. Resend after it completes.",
+                            )
+                            return
+                        if not live.register(owner):
+                            startup_cancel.pop(startup_key, None)
+                            await rpc.client.close()
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="This Pi session is already active; try your message again.",
+                            )
+                            return
+                        startup_cancel.pop(startup_key, None)
+                        if running_task.cancel_requested.is_set():
+                            live.unregister(owner)
+                            await rpc.client.close()
+                            initial = await live.inbox.initial_for_topic(*topic_key)
+                            if (
+                                initial is not None
+                                and initial.message_id == user_msg_id
+                            ):
+                                await live.inbox.mark_initial_deferred(
+                                    initial.id,
+                                    initial.session_key,
+                                    "User cancelled Pi startup before prompt",
+                                )
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=thread_id,
+                                text="Pi startup cancelled before prompt; no prompt submitted.",
+                            )
+                            return
+                        if legacy_id is not None:
+                            try:
+                                await verify_legacy_session(rpc, path, legacy_id, cwd)
+                                assert state.topic_store is not None
+                                owners = await state.topic_store.session_owners(
+                                    "pi",
+                                    str(path),
+                                    session_header_id(path),
+                                    relative_resolver=resolve_stored_pi_alias,
+                                )
+                                if owners - {(chat_id, topic_key[1])}:
+                                    raise ValueError(
+                                        "Another topic owns this Pi session"
+                                    )
+                                canonical = ResumeToken(engine="pi", value=str(path))
+                                await state.topic_store.set_session_resume(
+                                    chat_id, topic_key[1], canonical
+                                )
+                                resume_token = canonical
+                            except BaseException as exc:  # noqa: BLE001 - no prompt on failed identity or cancellation
+                                live.unregister(owner)
+                                await rpc.client.close()
+                                if not isinstance(exc, Exception):
+                                    raise
+                                logger.warning(
+                                    "live.legacy_identity.failed", error=str(exc)
+                                )
+                                await send_plain(
+                                    cfg.exec_cfg.transport,
+                                    chat_id=chat_id,
+                                    user_msg_id=user_msg_id,
+                                    thread_id=thread_id,
+                                    text="Идентичность Pi-сессии не подтверждена. Работа не запущена; привязка темы сохранена.",
+                                )
+                                return
+                        starting_live.discard(
+                            (chat_id, topic_key[1], owner.session_key)
+                        )
+                        if fresh_pending.get(topic_key, (None, 0))[0] == path:
+                            fresh_pending.pop(topic_key, None)
+                        try:
+                            await live.flush(owner)
+                            initial_intent = await live.inbox.initial_for_topic(
+                                chat_id, topic_key[1]
+                            )
+                            if (
+                                initial_intent is not None
+                                and initial_intent.session_key == owner.session_key
+                            ):
+                                await live.inbox.mark_initial_uncertain(
+                                    initial_intent.id, owner.session_key
+                                )
+                        except BaseException:
+                            live.unregister(owner)
+                            await rpc.client.close()
+                            raise
+
+                        owned_live = live
+                        assert owned_live is not None
+
+                        async def finalize_owned() -> bool:
+                            if not await verify_owned_header():
+                                owner.closing = True
+                                live_runner.final_failure = "New Pi session header missing/mismatched; task result incomplete. Initial task and updates require scoped recovery."
+                                return False
+                            result = await owned_live.finalize(owner)
+                            if (
+                                result
+                                and not live_runner._followups
+                                and live_runner.settlement_ok
+                                and initial_intent is not None
+                                and initial_intent.session_key == owner.session_key
+                            ):
+                                await owned_live.inbox.mark_initial_completed(
+                                    initial_intent.id, owner.session_key
+                                )
+                            return result
+
+                        live_runner.before_final = finalize_owned
+                        live_runner.on_progress = lambda status: setattr(
+                            owner, "progress", status
+                        )
+                        live_runner.on_followup_started = partial(
+                            live.followup_started, owner
+                        )
+                    elif resume_token is not None:
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Не удалось безопасно открыть Pi live для этой сессии; проверьте привязку темы и путь к файлу JSONL. Работа не запущена.",
+                        )
+                        return
+
+                known_callback = wrap_on_thread_known(
+                    on_thread_known,
+                    topic_key,
+                    chat_session_key,
+                    running_task,
+                    owner_done if owner is not None else None,
+                )
+
+                async def guarded_thread_known(
+                    token: ResumeToken, done: anyio.Event
+                ) -> None:
+                    if owner is not None and not owner.identity_verified:
+                        if token.engine != "pi" or token.value != owner.session_key:
+                            raise ValueError(
+                                "Provisional Pi owner produced a different session"
+                            )
+                        return
+                    if known_callback is not None:
+                        await known_callback(token, done)
+
+                async def verify_owned_header() -> bool:
+                    if owner is None:
+                        return True
+                    async with owner.lock:
+                        if owner.identity_verified:
+                            return True
+                        if provisional_id is None or not path.is_file():
+                            return False
+                        try:
+                            verify_provisional_header(path, provisional_id, cwd)
+                        except ValueError:
+                            return False
+                        if known_callback is not None:
+                            await known_callback(
+                                ResumeToken(engine="pi", value=owner.session_key),
+                                owner_done,
+                            )
+                        owner.identity_verified = True
+                        return True
+
+                async def monitor() -> None:
+                    assert live is not None and owner is not None
+                    while not running_task.done.is_set():
+                        await anyio.sleep(1)
+                        try:
+                            if not await verify_owned_header():
+                                continue
+                            await live.reconcile(owner)
+                        except Exception as exc:  # noqa: BLE001 - RPC can exit while observed
+                            logger.debug("live.reconcile.failed", error=str(exc))
+
+                try:
+                    if owner is not None and (
+                        running_task.cancel_requested.is_set()
+                        or (
+                            (
+                                recovery := recovery_cancel.get(
+                                    (chat_id, owner.thread_id, user_msg_id)
+                                )
+                            )
+                            is not None
+                            and recovery[0].is_set()
+                        )
+                    ):
+                        assert live is not None
+                        if (
+                            recovery_initial_id is None
+                            and initial_intent is not None
+                            and initial_intent.state == "scheduled"
+                            and initial_intent.session_key == owner.session_key
+                        ):
+                            await live.inbox.mark_initial_deferred(
+                                initial_intent.id,
+                                owner.session_key,
+                                "User cancelled Pi startup before prompt",
+                            )
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=thread_id,
+                            text="Pi startup cancelled before prompt; no prompt submitted.",
+                        )
+                        return
+                    async with anyio.create_task_group() as live_group:
+                        if owner is not None:
+                            live_group.start_soon(monitor)
+                        await run_engine(
+                            exec_cfg=cfg.exec_cfg,
+                            runtime=cfg.runtime,
+                            running_tasks=state.running_tasks,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            text=text,
+                            resume_token=resume_token,
+                            context=context,
+                            reply_ref=reply_ref,
+                            running_task=running_task,
+                            on_thread_known=guarded_thread_known,
+                            engine_override=engine_override,
+                            thread_id=thread_id,
+                            show_resume_line=show_resume_line,
+                            progress_ref=progress_ref,
+                            run_options=run_options,
+                            runner_override=live_runner,
+                        )
+                        live_group.cancel_scope.cancel()
+                    if live is not None and owner is not None:
+                        try:
+                            await live.reconcile(owner)
+                        except Exception as exc:  # noqa: BLE001 - retain receipts on failure
+                            logger.warning(
+                                "live.final_reconcile.failed", error=str(exc)
+                            )
+                finally:
+                    try:
+                        if live_runner is not None:
+                            await live_runner.client.close()
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            try:
+                                if (
+                                    live is not None
+                                    and owner is not None
+                                    and topic_key is not None
+                                ):
+                                    token = ResumeToken(
+                                        engine="pi", value=owner.session_key
+                                    )
+                                    if await scheduler.has_pending_for_topic(
+                                        token, chat_id, topic_key[1]
+                                    ):
+                                        starting_live.add(
+                                            (chat_id, topic_key[1], owner.session_key)
+                                        )
+                            finally:
+                                if live is not None and owner is not None:
+                                    live.unregister(owner)
+                                owner_done.set()
 
             async def run_thread_job(job: ThreadJob) -> None:
-                await run_job(
-                    cast(int, job.chat_id),
-                    cast(int, job.user_msg_id),
-                    job.text,
-                    job.resume_token,
-                    job.context,
-                    cast(int | None, job.thread_id),
-                    job.session_key,
-                    None,
-                    scheduler.note_thread_known,
-                    None,
-                    job.progress_ref,
-                )
+                try:
+                    await run_job(
+                        cast(int, job.chat_id),
+                        cast(int, job.user_msg_id),
+                        job.text,
+                        job.resume_token,
+                        job.context,
+                        cast(int | None, job.thread_id),
+                        job.session_key,
+                        None,
+                        scheduler.note_thread_known,
+                        None,
+                        job.progress_ref,
+                        allow_live=job.allow_live,
+                    )
+                finally:
+                    if job.legacy_fallback:
+                        release_legacy_queued(job)
+                    if isinstance(job.chat_id, int) and isinstance(job.thread_id, int):
+                        start_key = reserved_pi_start_key(
+                            job.chat_id, job.thread_id, job.resume_token, job.context
+                        )
+                        if (
+                            start_key is not None
+                            and start_key not in retry_starting
+                            and not await scheduler.has_pending_for_topic(
+                                job.resume_token, job.chat_id, job.thread_id
+                            )
+                        ):
+                            starting_live.discard(start_key)
 
-            scheduler = ThreadScheduler(task_group=tg, run_job=run_thread_job)
+            def release_legacy_topic_if_idle(topic: tuple[int, int]) -> None:
+                if any(key[:2] == topic for key in legacy_dispatching):
+                    return
+                if any(key[:2] == topic for key in legacy_queued):
+                    return
+                if any(
+                    pending.topic_key == topic and pending.forwards
+                    for pending in state.pending_prompts.values()
+                ):
+                    return
+                legacy_pending.discard(topic)
+
+            def release_legacy_queued(job: ThreadJob) -> None:
+                if (
+                    isinstance(job.chat_id, int)
+                    and isinstance(job.thread_id, int)
+                    and isinstance(job.user_msg_id, int)
+                ):
+                    legacy_queued.discard((job.chat_id, job.thread_id, job.user_msg_id))
+                    release_legacy_topic_if_idle((job.chat_id, job.thread_id))
+
+            async def on_cancel_queued(job: ThreadJob) -> None:
+                if job.legacy_fallback:
+                    release_legacy_queued(job)
+                if (
+                    job.allow_live
+                    and job.resume_token.engine == "pi"
+                    and isinstance(job.chat_id, int)
+                    and isinstance(job.thread_id, int)
+                ):
+                    start_key = reserved_pi_start_key(
+                        job.chat_id, job.thread_id, job.resume_token, job.context
+                    )
+                    if (
+                        start_key is not None
+                        and start_key not in retry_starting
+                        and (
+                            live is None
+                            or not live.has_topic_owner(job.chat_id, job.thread_id)
+                        )
+                        and not await scheduler.has_pending_for_topic(
+                            job.resume_token, job.chat_id, job.thread_id
+                        )
+                        and not any(
+                            key[:2] == (job.chat_id, job.thread_id)
+                            for key in startup_cancel
+                        )
+                        and not any(
+                            ref.channel_id == job.chat_id
+                            and task.thread_id == job.thread_id
+                            for ref, task in state.running_tasks.items()
+                        )
+                    ):
+                        starting_live.discard(start_key)
+
+            scheduler = ThreadScheduler(
+                task_group=tg,
+                run_job=run_thread_job,
+                on_cancel_queued=on_cancel_queued,
+            )
+            starting_live: set[tuple[int, int, str]] = set()
+
+            def resolve_stored_pi_alias(
+                chat: int,
+                _thread: int,
+                context: RunContext | None,
+                value: str,
+            ) -> Path | None:
+                try:
+                    cwd = cfg.runtime.resolve_run_cwd(
+                        context or cfg.runtime.default_context_for_chat(chat)
+                    )
+                except ConfigError:
+                    return None
+                if cwd is None:
+                    return None
+                path = (cwd / value).resolve()
+                header = pi_session_header(path)
+                if (
+                    header is None
+                    or not isinstance(header.get("cwd"), str)
+                    or Path(header["cwd"]).resolve() != cwd.resolve()
+                ):
+                    return None
+                return path
+
+            def scoped_live_key(
+                chat: int,
+                thread: int | None,
+                token: ResumeToken | None,
+                context: RunContext | None,
+            ) -> tuple[int, int, str] | None:
+                if token is not None and token.engine == "pi":
+                    candidate = Path(token.value)
+                    if not candidate.is_absolute() and candidate.suffix == ".jsonl":
+                        path = resolve_stored_pi_alias(
+                            chat, thread or 0, context, token.value
+                        )
+                        if path is None:
+                            return None
+                        token = ResumeToken(engine="pi", value=str(path))
+                return live_route_key(chat, thread, token)
+
+            def reserved_pi_start_key(
+                chat: int,
+                thread: int | None,
+                token: ResumeToken | None,
+                context: RunContext | None,
+            ) -> tuple[int, int, str] | None:
+                key = scoped_live_key(chat, thread, token, context)
+                if (
+                    key is None
+                    and token is not None
+                    and token.engine == "pi"
+                    and thread is not None
+                ):
+                    # Short IDs have no canonical path until identity inspection.
+                    # Reserve the topic itself before that asynchronous migration.
+                    return (chat, thread, f"unresolved-pi-id:{token.value}")
+                return key
+
+            startup_cancel: dict[tuple[int, int, int], RunningTask] = {}
+            cancelled_initial_ids: set[tuple[int, int, int]] = set()
+            recovery_cancel: dict[
+                tuple[int, int, int], tuple[asyncio.Event, int | None]
+            ] = {}
+            plugin_inflight: set[tuple[int, int]] = set()
+            media_inflight: set[tuple[int, int]] = set()
+            media_admission_locks: dict[tuple[int, int], asyncio.Lock] = {}
+            retry_starting: set[tuple[int, int, str]] = set()
+            fresh_pending: dict[tuple[int, int], tuple[Path, int]] = {}
+            legacy_pending: set[tuple[int, int]] = set()
+            legacy_queued: set[tuple[int, int, int]] = set()
+            legacy_dispatching: dict[tuple[int, int, int], _PendingPrompt] = {}
+            recovery_queue: asyncio.Queue[Callable[[], Awaitable[None]]] = (
+                asyncio.Queue(maxsize=32)
+            )
+            recovery_notice = asyncio.Event()
+            recovery_stopping = False
+
+            def enqueue_recovery(work: Callable[[], Awaitable[None]]) -> bool:
+                try:
+                    recovery_queue.put_nowait(work)
+                    recovery_notice.set()
+                    return True
+                except asyncio.QueueFull:
+                    return False
+
+            async def recovery_worker() -> None:
+                while True:
+                    await recovery_notice.wait()
+                    recovery_notice.clear()
+                    while not recovery_queue.empty():
+                        work = recovery_queue.get_nowait()
+                        try:
+                            await work()
+                        except Exception as exc:  # noqa: BLE001 - other topics stay available
+                            logger.warning(
+                                "live.recovery.worker.failed",
+                                error_type=type(exc).__name__,
+                            )
+                    if recovery_stopping:
+                        return
+
+            if cfg.pi_live_conversation:
+                tg.start_soon(recovery_worker)
+                tg.start_soon(recovery_worker)
+
+            async def _run_quick(coro: Awaitable[None]) -> None:
+                await coro
+
+            def spawn_quick(coro: Awaitable[None]) -> None:
+                tg.start_soon(_run_quick, coro)
+
+            live: LiveConversationService | None = None
+            if cfg.pi_live_conversation:
+                if config_path is None:
+                    raise ConfigError(
+                        "Pi live conversation needs a config path for durable receipts"
+                    )
+
+                async def live_reply(
+                    chat: int, thread: int, message: int, text: str
+                ) -> None:
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat,
+                        user_msg_id=message,
+                        thread_id=thread,
+                        text=text,
+                        notify=False,
+                    )
+
+                live = LiveConversationService(
+                    LiveInbox(resolve_inbox_path(config_path)),
+                    quick_pi_answer,
+                    live_reply,
+                )
+                live.attach_workers(tg)
+                tg.start_soon(live.notify_recovery)
 
             def resolve_topic_key(
                 msg: TelegramIncomingMessage,
@@ -1367,6 +2268,8 @@ async def run_main_loop(
                     else None
                 )
                 _, ok = await ensure_topic_context(
+                    raw_text=text,
+                    message_id=msg.message_id,
                     resolved=resolved,
                     ambient_context=ambient_context,
                     topic_key=topic_key,
@@ -1394,14 +2297,93 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                 )
 
+            async def active_topic_rejection(
+                *,
+                raw_text: str,
+                message_id: int,
+                resolved: ResolvedMessage,
+                ambient_context: RunContext | None,
+                topic_key: tuple[int, int] | None,
+            ) -> str | None:
+                if live is None or topic_key is None:
+                    return None
+                active = live.topic_owner(*topic_key)
+                if active is None and not any(
+                    key[:2] == topic_key for key in starting_live
+                ):
+                    return None
+                owner_context = (
+                    active.running_task.context
+                    if active is not None and active.running_task is not None
+                    else await state.topic_store.get_context(*topic_key)
+                    if state.topic_store is not None
+                    else None
+                )
+                try:
+                    explicit = cfg.runtime.resolve_message(
+                        text=raw_text,
+                        reply_text=None,
+                        ambient_context=ambient_context,
+                        chat_id=topic_key[0],
+                    )
+                except DirectiveError:
+                    explicit = None  # The ordinary resolver reports invalid directives.
+                target = (
+                    explicit
+                    if explicit is not None and explicit.context_source == "directives"
+                    else resolved
+                )
+                rejection = "Directive cannot rebind the active or starting Pi topic; no prompt sent. Use another topic or wait for completion."
+                effective_engine = await resolve_engine_defaults(
+                    explicit_engine=target.engine_override,
+                    context=target.context,
+                    chat_id=topic_key[0],
+                    topic_key=topic_key,
+                )
+                if effective_engine.engine != "pi":
+                    return rejection
+                if owner_context is None:
+                    if active is not None:
+                        return rejection  # Closing owner: binding cannot be inferred.
+                    initial = await live.inbox.initial_for_topic(*topic_key)
+                    if initial is not None:
+                        try:
+                            target_cwd = cfg.runtime.resolve_run_cwd(target.context)
+                        except ConfigError:
+                            return rejection
+                        return (
+                            None
+                            if target_cwd is not None
+                            and str(target_cwd.resolve()) == initial.cwd
+                            else rejection
+                        )
+                    # The first fresh prompt establishes identity; a different
+                    # message must not change its context before that happens.
+                    if fresh_pending.get(topic_key, (None, None))[1] == message_id:
+                        return None
+                    return rejection
+                return rejection if target.context != owner_context else None
+
             async def ensure_topic_context(
                 *,
+                raw_text: str,
+                message_id: int,
                 resolved: ResolvedMessage,
                 ambient_context: RunContext | None,
                 topic_key: tuple[int, int] | None,
                 chat_project: str | None,
                 reply: Callable[..., Awaitable[None]],
             ) -> tuple[RunContext | None, bool]:
+                rejection = await active_topic_rejection(
+                    raw_text=raw_text,
+                    message_id=message_id,
+                    resolved=resolved,
+                    ambient_context=ambient_context,
+                    topic_key=topic_key,
+                )
+                if rejection is not None:
+                    await reply(text=rejection)
+                    return ambient_context, False
                 effective_context = ambient_context
                 if (
                     state.topic_store is not None
@@ -1450,6 +2432,9 @@ async def run_main_loop(
                 chat_session_key: tuple[int, int | None] | None,
                 reply_ref: MessageRef | None,
                 reply_id: int | None,
+                live_eligible: bool = True,
+                legacy_fallback: bool = False,
+                cancel_requested: Callable[[], bool] | None = None,
             ) -> None:
                 chat_id = msg.chat_id
                 user_msg_id = msg.message_id
@@ -1461,6 +2446,150 @@ async def run_main_loop(
                     topic_key=topic_key,
                 )
                 engine_override = engine_resolution.engine
+                if (
+                    live is not None
+                    and resolved.resume_token is not None
+                    and resolved.resume_token.engine == "pi"
+                    and config_path is not None
+                ):
+                    explicit_path = Path(resolved.resume_token.value)
+                    root = (config_path.parent / "pi-live-sessions").resolve()
+                    if (
+                        explicit_path.is_absolute()
+                        and explicit_path.resolve().parent == root
+                        and (
+                            topic_key is None
+                            or not explicit_path.name.startswith(
+                                f"{chat_id}-{topic_key[1]}-"
+                            )
+                        )
+                    ):
+                        await send_plain(
+                            cfg.exec_cfg.transport,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=msg.thread_id,
+                            text="Pi live session belongs to a different topic.",
+                        )
+                        return
+                if (
+                    live_eligible
+                    and live is not None
+                    and topic_key is not None
+                    and engine_override == "pi"
+                ):
+                    candidate = resolved.resume_token
+                    if candidate is None and state.topic_store is not None:
+                        candidate = await state.topic_store.get_session_resume(
+                            chat_id, topic_key[1], "pi"
+                        )
+                    key = scoped_live_key(chat_id, msg.thread_id, candidate, context)
+                    initial_fresh = False
+                    if candidate is None and topic_key in fresh_pending:
+                        provisional, first_id = fresh_pending[topic_key]
+                        key = (chat_id, topic_key[1], str(provisional))
+                        initial_fresh = user_msg_id == first_id
+                    replied_task = (
+                        state.running_tasks.get(reply_ref) if reply_ref else None
+                    )
+                    active = (
+                        live.owner(*key)
+                        if key is not None
+                        else (
+                            live.owner_for_topic(chat_id, topic_key[1])
+                            if candidate is None
+                            else None
+                        )
+                    )
+                    if active is not None and key is None:
+                        key = (chat_id, topic_key[1], active.session_key)
+                    if active is not None and (
+                        active.running_task is None
+                        or resolved.context != active.running_task.context
+                    ):
+                        await live._startup_reply(
+                            chat_id,
+                            topic_key[1],
+                            user_msg_id,
+                            "Project/branch directive was not sent to the active Pi task. Wait for completion or use a separate topic.",
+                        )
+                        return
+                    if (
+                        key is not None
+                        and active is None
+                        and key in starting_live
+                        and not initial_fresh
+                    ):
+                        await live.buffer_starting(
+                            chat_id, key[1], user_msg_id, key[2], prompt_text
+                        )
+                        return
+                    if key is not None and active is None and not initial_fresh:
+                        unresolved = await live.inbox.unresolved_for_topic(*key)
+                        if unresolved:
+                            ids = ", ".join(str(r.message_id) for r in unresolved[:10])
+                            await send_plain(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=user_msg_id,
+                                thread_id=topic_key[1],
+                                text=f"Pi has unresolved receipts #{ids}; no new prompt sent. "
+                                "Check the scoped recovery notice and explicitly defer or reconcile first.",
+                            )
+                            return
+                    if active is not None and active.closing and key is not None:
+                        if await live.inbox.unresolved_for_topic(
+                            *key
+                        ) or await live.inbox.initial_for_topic(chat_id, key[1]):
+                            await live._startup_reply(
+                                chat_id,
+                                key[1],
+                                user_msg_id,
+                                "Prior Pi task or update remains unresolved; this new prompt was not queued or submitted. Reconcile it before retrying.",
+                            )
+                            return
+                        token = ResumeToken(engine="pi", value=active.session_key)
+                        progress_ref = await _send_queued_progress(
+                            cfg,
+                            chat_id=chat_id,
+                            user_msg_id=user_msg_id,
+                            thread_id=msg.thread_id,
+                            resume_token=token,
+                            context=context,
+                            steerable=False,
+                        )
+                        await scheduler.enqueue_resume(
+                            chat_id,
+                            user_msg_id,
+                            prompt_text,
+                            token,
+                            context,
+                            msg.thread_id,
+                            chat_session_key,
+                            progress_ref,
+                        )
+                        return
+                    if (
+                        active is not None
+                        and (
+                            replied_task is None
+                            or replied_task is active.running_task
+                            or (
+                                replied_task.resume is not None
+                                and replied_task.resume.value == active.session_key
+                            )
+                        )
+                        and key is not None
+                        and await live.handle(
+                            chat_id,
+                            key[1],
+                            user_msg_id,
+                            key[2],
+                            prompt_text,
+                            spawn_quick=spawn_quick,
+                        )
+                    ):
+                        return
                 resume_decision = await resume_resolver.resolve(
                     resume_token=resolved.resume_token,
                     reply_id=reply_id,
@@ -1474,40 +2603,138 @@ async def run_main_loop(
                 )
                 if resume_decision.handled_by_running_task:
                     return
+                if cancel_requested is not None and cancel_requested():
+                    await make_reply(cfg, msg)(
+                        text="Forwarded task cancelled before submission; no prompt sent."
+                    )
+                    return
                 resume_token = resume_decision.resume_token
+                if live_eligible and live is not None and resume_token is not None:
+                    key = scoped_live_key(chat_id, msg.thread_id, resume_token, context)
+                    if key is not None and await live.handle(
+                        chat_id,
+                        key[1],
+                        user_msg_id,
+                        key[2],
+                        prompt_text,
+                        spawn_quick=spawn_quick,
+                    ):
+                        return
                 if resume_token is None:
-                    await run_job(
+                    try:
+                        await run_job(
+                            chat_id,
+                            user_msg_id,
+                            prompt_text,
+                            None,
+                            context,
+                            msg.thread_id,
+                            chat_session_key,
+                            reply_ref,
+                            scheduler.note_thread_known,
+                            engine_override,
+                            allow_live=live_eligible,
+                        )
+                    finally:
+                        if topic_key is not None and topic_key in fresh_pending:
+                            provisional, first_id = fresh_pending[topic_key]
+                            if first_id == user_msg_id:
+                                fresh_pending.pop(topic_key, None)
+                                starting_live.discard(
+                                    (chat_id, topic_key[1], str(provisional))
+                                )
+                    return
+                start_key = reserved_pi_start_key(
+                    chat_id, msg.thread_id, resume_token, context
+                )
+                if live_eligible and live is not None and start_key is not None:
+                    starting_live.add(start_key)
+                try:
+                    progress_ref = await _send_queued_progress(
+                        cfg,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=msg.thread_id,
+                        resume_token=resume_token,
+                        context=context,
+                        steerable=await scheduler.is_busy(resume_token),
+                    )
+                except BaseException as exc:
+                    if live_eligible and start_key is not None:
+                        starting_live.discard(start_key)
+                    if not isinstance(exc, Exception):
+                        raise
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=msg.thread_id,
+                        text="Could not queue task; no prompt submitted. Resend after checking the topic.",
+                    )
+                    return
+                if cancel_requested is not None and cancel_requested():
+                    await make_reply(cfg, msg)(
+                        text="Forwarded task cancelled before queueing; no prompt sent."
+                    )
+                    return
+                legacy_key = (
+                    (chat_id, topic_key[1], user_msg_id)
+                    if legacy_fallback and topic_key is not None
+                    else None
+                )
+                if legacy_key is not None:
+                    legacy_queued.add(legacy_key)
+                try:
+                    await scheduler.enqueue_resume(
                         chat_id,
                         user_msg_id,
                         prompt_text,
-                        None,
+                        resume_token,
                         context,
                         msg.thread_id,
                         chat_session_key,
-                        reply_ref,
-                        scheduler.note_thread_known,
-                        engine_override,
+                        progress_ref,
+                        allow_live=live_eligible,
+                        legacy_fallback=legacy_fallback,
+                    )
+                except BaseException as exc:
+                    with anyio.CancelScope(shield=True):
+                        if progress_ref is not None:
+                            queued = (
+                                await scheduler.get_queued(
+                                    chat_id, progress_ref.message_id
+                                )
+                                is not None
+                            )
+                        elif msg.thread_id is not None:
+                            queued = await scheduler.has_pending_for_topic(
+                                resume_token, chat_id, msg.thread_id
+                            )
+                        else:
+                            queued = True  # No scoped proof that enqueue failed.
+                    if (
+                        not queued
+                        and topic_key is not None
+                        and not any(
+                            ref.channel_id == chat_id and task.thread_id == topic_key[1]
+                            for ref, task in state.running_tasks.items()
+                        )
+                    ):
+                        if live_eligible and start_key is not None:
+                            starting_live.discard(start_key)
+                        if legacy_key is not None:
+                            legacy_queued.discard(legacy_key)
+                            release_legacy_topic_if_idle(topic_key)
+                    if not isinstance(exc, Exception):
+                        raise
+                    await send_plain(
+                        cfg.exec_cfg.transport,
+                        chat_id=chat_id,
+                        user_msg_id=user_msg_id,
+                        thread_id=msg.thread_id,
+                        text="Task queue outcome could not be confirmed; check this topic before retrying.",
                     )
                     return
-                progress_ref = await _send_queued_progress(
-                    cfg,
-                    chat_id=chat_id,
-                    user_msg_id=user_msg_id,
-                    thread_id=msg.thread_id,
-                    resume_token=resume_token,
-                    context=context,
-                    steerable=await scheduler.is_busy(resume_token),
-                )
-                await scheduler.enqueue_resume(
-                    chat_id,
-                    user_msg_id,
-                    prompt_text,
-                    resume_token,
-                    context,
-                    msg.thread_id,
-                    chat_session_key,
-                    progress_ref,
-                )
 
             async def run_prompt_from_upload(
                 msg: TelegramIncomingMessage,
@@ -1536,9 +2763,37 @@ async def run_main_loop(
                     chat_session_key=chat_session_key,
                     reply_ref=reply_ref,
                     reply_id=reply_id,
+                    live_eligible=False,
                 )
 
             async def _dispatch_pending_prompt(pending: _PendingPrompt) -> None:
+                dispatch_key = (
+                    (pending.topic_key[0], pending.topic_key[1], pending.msg.message_id)
+                    if pending.topic_key is not None and pending.forwards
+                    else None
+                )
+                if dispatch_key is not None:
+                    legacy_dispatching[dispatch_key] = pending
+                try:
+                    await _dispatch_pending_prompt_impl(pending)
+                finally:
+                    if dispatch_key is not None:
+                        legacy_dispatching.pop(dispatch_key, None)
+                    if (
+                        pending.topic_key is not None
+                        and pending.forwards
+                        and (
+                            pending.topic_key[0],
+                            pending.topic_key[1],
+                            pending.msg.message_id,
+                        )
+                        not in legacy_queued
+                    ):
+                        release_legacy_topic_if_idle(pending.topic_key)
+
+            async def _dispatch_pending_prompt_impl(pending: _PendingPrompt) -> None:
+                if pending.forward_barrier is not None:
+                    await pending.forward_barrier.wait()
                 msg = pending.msg
                 reply = make_reply(cfg, msg)
                 try:
@@ -1575,6 +2830,8 @@ async def run_main_loop(
                     )
 
                 _effective_context, ok = await ensure_topic_context(
+                    raw_text=pending.text,
+                    message_id=msg.message_id,
                     resolved=resolved,
                     ambient_context=pending.ambient_context,
                     topic_key=pending.topic_key,
@@ -1582,16 +2839,65 @@ async def run_main_loop(
                     reply=reply,
                 )
                 if not ok:
+                    if pending.topic_key is not None and pending.forwards:
+                        release_legacy_topic_if_idle(pending.topic_key)
                     return
-                await dispatch_prompt_run(
-                    msg=msg,
-                    prompt_text=prompt_text,
-                    resolved=resolved,
-                    topic_key=pending.topic_key,
-                    chat_session_key=pending.chat_session_key,
-                    reply_ref=pending.reply_ref,
-                    reply_id=pending.reply_id,
-                )
+                if pending.dispatch_cancel_requested:
+                    await reply(
+                        text="Forwarded task cancelled before submission; no prompt sent."
+                    )
+                    return
+                initial_directive = False
+                if (
+                    live is not None
+                    and pending.topic_key is not None
+                    and resolved.engine_override in (None, "pi")
+                    and not pending.forwards
+                    and not pending.is_voice_transcribed
+                    and fresh_pending.get(pending.topic_key, (None, 0))[1]
+                    == msg.message_id
+                ):
+                    intent = await live.inbox.initial_for_topic(*pending.topic_key)
+                    initial_directive = (
+                        intent is not None
+                        and intent.message_id == msg.message_id
+                        and intent.prompt == prompt_text
+                    )
+                try:
+                    await dispatch_prompt_run(
+                        msg=msg,
+                        prompt_text=prompt_text,
+                        resolved=resolved,
+                        topic_key=pending.topic_key,
+                        chat_session_key=pending.chat_session_key,
+                        reply_ref=pending.reply_ref,
+                        reply_id=pending.reply_id,
+                        live_eligible=not pending.is_voice_transcribed
+                        and not pending.forwards
+                        and (
+                            initial_directive
+                            or (
+                                resolved.prompt == pending.text.strip()
+                                and resolved.context_source != "directives"
+                            )
+                        ),
+                        legacy_fallback=bool(pending.forwards),
+                        cancel_requested=(lambda: pending.dispatch_cancel_requested)
+                        if pending.forwards
+                        else None,
+                    )
+                finally:
+                    if (
+                        pending.topic_key is not None
+                        and pending.forwards
+                        and (
+                            pending.topic_key[0],
+                            pending.topic_key[1],
+                            pending.msg.message_id,
+                        )
+                        not in legacy_queued
+                    ):
+                        release_legacy_topic_if_idle(pending.topic_key)
 
             forward_coalescer = ForwardCoalescer(
                 task_group=tg,
@@ -1599,6 +2905,11 @@ async def run_main_loop(
                 sleep=sleep,
                 dispatch=_dispatch_pending_prompt,
                 pending=state.pending_prompts,
+                on_cancel=lambda pending: release_legacy_topic_if_idle(
+                    pending.topic_key
+                )
+                if pending.topic_key is not None and pending.forwards
+                else None,
             )
 
             async def handle_prompt_upload(
@@ -1627,8 +2938,41 @@ async def run_main_loop(
                 prompt = _build_upload_prompt(resolved.prompt, annotation)
                 await run_prompt_from_upload(msg, prompt, resolved)
 
+            async def guard_media_group_before_flush(
+                messages: list[TelegramIncomingMessage],
+            ) -> bool:
+                if live is None:
+                    return True
+                topic_key = resolve_topic_key(messages[0])
+                if topic_key is None:
+                    return True
+                async with media_admission_locks.setdefault(topic_key, asyncio.Lock()):
+                    if (
+                        topic_key not in fresh_pending
+                        and not live_topic_running(topic_key)
+                        and topic_key not in media_inflight
+                        and topic_key not in legacy_pending
+                        and topic_key not in plugin_inflight
+                        and await live.inbox.initial_for_topic(*topic_key) is None
+                    ):
+                        # Reserve through download and dispatch. This lock also
+                        # covers receive_initial, including its durable I/O.
+                        media_inflight.add(topic_key)
+                        return True
+                await make_reply(cfg, messages[0])(
+                    text="Media not accepted while this topic is busy; resend after the active task finishes."
+                )
+                return False
+
+            def release_media_group(messages: list[TelegramIncomingMessage]) -> None:
+                topic_key = resolve_topic_key(messages[0])
+                if topic_key is not None:
+                    media_inflight.discard(topic_key)
+
             media_group_buffer = MediaGroupBuffer(
                 task_group=tg,
+                before_flush=guard_media_group_before_flush,
+                after_flush=release_media_group,
                 debounce_s=state.media_group_debounce_s,
                 sleep=sleep,
                 cfg=cfg,
@@ -1690,15 +3034,156 @@ async def run_main_loop(
                     ambient_context=ambient_context,
                 )
 
+            def live_topic_running(topic_key: tuple[int, int] | None) -> bool:
+                return (
+                    live is not None
+                    and topic_key is not None
+                    and (
+                        live.has_topic_owner(*topic_key)
+                        or any(key[:2] == topic_key for key in starting_live)
+                    )
+                )
+
+            async def live_plugin_blocked(topic_key: tuple[int, int] | None) -> bool:
+                if live is None or topic_key is None:
+                    return False
+                if (
+                    topic_key in plugin_inflight
+                    or topic_key in legacy_pending
+                    or topic_key in media_inflight
+                    or live_topic_running(topic_key)
+                    or any(
+                        ref.channel_id == topic_key[0]
+                        and task.thread_id == topic_key[1]
+                        for ref, task in state.running_tasks.items()
+                    )
+                ):
+                    return True
+                if await live.inbox.initial_for_topic(*topic_key) is not None:
+                    return True
+                receipts = await live.inbox.unresolved_all()
+                # This is the final check before callers synchronously reserve
+                # plugin_inflight; owner registration may have raced either await.
+                return (
+                    topic_key in plugin_inflight
+                    or topic_key in legacy_pending
+                    or topic_key in media_inflight
+                    or live_topic_running(topic_key)
+                    or any(
+                        ref.channel_id == topic_key[0]
+                        and task.thread_id == topic_key[1]
+                        for ref, task in state.running_tasks.items()
+                    )
+                    or any(
+                        receipt.chat_id == topic_key[0]
+                        and receipt.thread_id == topic_key[1]
+                        for receipt in receipts
+                    )
+                )
+
+            async def run_guarded_plugin(
+                topic_key: tuple[int, int] | None,
+                work: Callable[[], Awaitable[None]],
+            ) -> None:
+                try:
+                    await work()
+                finally:
+                    if topic_key is not None:
+                        plugin_inflight.discard(topic_key)
+
             async def route_message(msg: TelegramIncomingMessage) -> None:
                 reply = make_reply(cfg, msg)
                 classification = _classify_message(msg, files_enabled=cfg.files.enabled)
                 text = classification.text
                 is_voice_transcribed = False
                 if classification.is_forward_candidate:
-                    forward_coalescer.attach_forward(msg)
+                    # A captionless forward cannot be attached by the coalescer.
+                    # Never defer the durable initial intent or reserve the topic
+                    # for an update that the transport will silently ignore.
+                    if msg.sender_id is None or not msg.text.strip():
+                        forward_coalescer.attach_forward(msg)
+                        return
+                    pending_forward = forward_coalescer._pending.get(_forward_key(msg))
+                    if (
+                        live is not None
+                        and pending_forward is not None
+                        and pending_forward.topic_key is not None
+                    ):
+                        forward_topic = pending_forward.topic_key
+                        if pending_forward.forward_barrier is not None:
+                            await live._startup_reply(
+                                msg.chat_id,
+                                forward_topic[1],
+                                msg.message_id,
+                                "Forwarded composition is already being resolved; resend this forward.",
+                            )
+                            return
+                        barrier = anyio.Event()
+                        pending_forward.forward_barrier = barrier
+                        try:
+                            intent = await live.inbox.initial_for_topic(*forward_topic)
+                            if (
+                                intent is not None
+                                and intent.message_id == pending_forward.msg.message_id
+                            ):
+                                dependent = await live.inbox.unresolved_for_topic(
+                                    forward_topic[0],
+                                    forward_topic[1],
+                                    intent.session_key,
+                                )
+                                if dependent or intent.state != "scheduled":
+                                    await live._startup_reply(
+                                        msg.chat_id,
+                                        forward_topic[1],
+                                        msg.message_id,
+                                        "Forwarded message not accepted: initial Pi task has dependent updates or may already have started. Resend after resolving the live task.",
+                                    )
+                                    return
+                            current = forward_coalescer._pending.get(_forward_key(msg))
+                            if current is not pending_forward:
+                                await live._startup_reply(
+                                    msg.chat_id,
+                                    forward_topic[1],
+                                    msg.message_id,
+                                    "Forwarded composition changed; resend this forward.",
+                                )
+                                return
+                            forward_coalescer.attach_forward(msg)
+                            legacy_pending.add(forward_topic)
+                            if (
+                                intent is not None
+                                and intent.message_id == pending_forward.msg.message_id
+                            ):
+                                await live.inbox.mark_initial_deferred(
+                                    intent.id,
+                                    intent.session_key,
+                                    "Transport rerouted forwarded composition to legacy one-shot before Pi submission",
+                                )
+                                fresh_pending.pop(forward_topic, None)
+                                starting_live.discard(
+                                    (
+                                        forward_topic[0],
+                                        forward_topic[1],
+                                        intent.session_key,
+                                    )
+                                )
+                        finally:
+                            barrier.set()
+                            pending_forward.forward_barrier = None
+                    else:
+                        forward_coalescer.attach_forward(msg)
                     return
                 forward_key = _forward_key(msg)
+                if live is not None and msg.media_group_id is not None:
+                    album_topic = resolve_topic_key(msg)
+                    if album_topic is not None and album_topic in fresh_pending:
+                        await live._startup_reply(
+                            msg.chat_id,
+                            album_topic[1],
+                            msg.message_id,
+                            "Media not accepted during Pi startup; resend after the first task starts. Original task is still queued.",
+                        )
+                        return
                 if classification.is_media_group_document:
                     media_group_buffer.add(msg)
                     return
@@ -1707,21 +3192,407 @@ async def run_main_loop(
                 reply_id = ctx.reply_id
                 reply_ref = ctx.reply_ref
                 topic_key = ctx.topic_key
+                if (
+                    live is not None
+                    and topic_key in media_inflight
+                    and not classification.is_cancel
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Media group is being processed in this topic; this message was not accepted. Resend after it completes.",
+                    )
+                    return
+                if (
+                    live is not None
+                    and topic_key in legacy_pending
+                    and not classification.is_cancel
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Forwarded task is running through legacy one-shot; this message was not accepted. Resend after the final reply.",
+                    )
+                    return
                 chat_session_key = ctx.chat_session_key
                 stateful_mode = ctx.stateful_mode
                 chat_project = ctx.chat_project
                 ambient_context = ctx.ambient_context
 
                 if classification.is_cancel:
+                    if live is not None and topic_key is not None:
+                        cancel_reply_id = (
+                            None if reply_id == topic_key[1] else reply_id
+                        )  # Telegram's implicit topic-root reply is not a run target.
+                        forwarded_pending = [
+                            key
+                            for key, pending in state.pending_prompts.items()
+                            if pending.topic_key == topic_key
+                            and pending.forwards
+                            and (
+                                cancel_reply_id is None
+                                or pending.msg.message_id == cancel_reply_id
+                                or any(
+                                    forwarded_id == cancel_reply_id
+                                    for forwarded_id, _ in pending.forwards
+                                )
+                            )
+                        ]
+                        if (
+                            cancel_reply_id is None
+                            and forwarded_pending
+                            and (
+                                len(forwarded_pending) != 1
+                                or any(
+                                    ref.channel_id == chat_id
+                                    and task.thread_id == topic_key[1]
+                                    for ref, task in state.running_tasks.items()
+                                )
+                                or any(key[:2] == topic_key for key in legacy_queued)
+                                or any(
+                                    key[:2] == topic_key for key in legacy_dispatching
+                                )
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the original prompt or progress message to cancel one."
+                            )
+                            return
+                        if len(forwarded_pending) == 1:
+                            forward_coalescer.cancel(forwarded_pending[0])
+                            await reply(
+                                text="Pending forwarded task cancelled before submission; no prompt sent."
+                            )
+                            return
+                        dispatching_matches = [
+                            pending
+                            for key, pending in legacy_dispatching.items()
+                            if key[:2] == topic_key
+                            and (
+                                cancel_reply_id is None
+                                or pending.msg.message_id == cancel_reply_id
+                                or any(
+                                    fid == cancel_reply_id
+                                    for fid, _ in pending.forwards
+                                )
+                            )
+                        ]
+                        if (
+                            cancel_reply_id is None
+                            and dispatching_matches
+                            and (
+                                len(dispatching_matches) != 1
+                                or any(key[:2] == topic_key for key in legacy_queued)
+                                or any(
+                                    ref.channel_id == chat_id
+                                    and task.thread_id == topic_key[1]
+                                    for ref, task in state.running_tasks.items()
+                                )
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the original prompt or progress message to cancel one."
+                            )
+                            return
+                        if len(dispatching_matches) == 1:
+                            dispatching_matches[0].dispatch_cancel_requested = True
+                            await reply(
+                                text="Cancellation requested during forwarded dispatch. If progress appears, reply to it to cancel the run."
+                            )
+                            return
+                        candidates = [
+                            task
+                            for (chat, thread, first), task in startup_cancel.items()
+                            if (chat, thread) == topic_key
+                            and (cancel_reply_id is None or first == cancel_reply_id)
+                        ]
+                        owner = live.topic_owner(*topic_key)
+                        if (
+                            owner is not None
+                            and owner.running_task is not None
+                            and not any(
+                                task is owner.running_task
+                                for task in state.running_tasks.values()
+                            )
+                            and (
+                                cancel_reply_id is None
+                                or owner.running_task.user_message_id == cancel_reply_id
+                            )
+                            and not any(
+                                task is owner.running_task for task in candidates
+                            )
+                        ):
+                            candidates.append(owner.running_task)
+                        if (
+                            cancel_reply_id is None
+                            and candidates
+                            and any(
+                                ref.channel_id == chat_id
+                                and task.thread_id == topic_key[1]
+                                and all(
+                                    task is not candidate for candidate in candidates
+                                )
+                                for ref, task in state.running_tasks.items()
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the progress message to cancel one."
+                            )
+                            return
+                        if len(candidates) == 1:
+                            candidates[0].cancel_requested.set()
+                            await reply(
+                                text="Cancelling Pi startup; no new prompt will be submitted."
+                            )
+                            return
+                        if (
+                            owner is not None
+                            and owner.running_task is not None
+                            and any(
+                                task is owner.running_task
+                                for task in state.running_tasks.values()
+                            )
+                            and (
+                                (
+                                    cancel_reply_id is None
+                                    and sum(
+                                        task.thread_id == topic_key[1]
+                                        and ref.channel_id == chat_id
+                                        for ref, task in state.running_tasks.items()
+                                    )
+                                    == 1
+                                )
+                                or cancel_reply_id == owner.running_task.user_message_id
+                                or any(
+                                    (chat, thread, command)
+                                    == (
+                                        chat_id,
+                                        topic_key[1],
+                                        owner.running_task.user_message_id,
+                                    )
+                                    and original == cancel_reply_id
+                                    for (chat, thread, command), (
+                                        _,
+                                        original,
+                                    ) in recovery_cancel.items()
+                                )
+                            )
+                        ):
+                            tg.start_soon(
+                                handle_cancel,
+                                cfg,
+                                replace(
+                                    msg,
+                                    reply_to_message_id=owner.running_task.user_message_id,
+                                    reply_to_text=None,
+                                ),
+                                state.running_tasks,
+                                scheduler,
+                            )
+                            return
+                        if (
+                            owner is not None
+                            and owner.running_task is not None
+                            and any(
+                                task is owner.running_task
+                                for task in state.running_tasks.values()
+                            )
+                        ):
+                            # Already running: a recovery event only fences a
+                            # future prompt and cannot interrupt the active task.
+                            # Let handle_cancel require an unambiguous target.
+                            cancel_msg = (
+                                replace(
+                                    msg, reply_to_message_id=None, reply_to_text=None
+                                )
+                                if cancel_reply_id is None
+                                else msg
+                            )
+                            tg.start_soon(
+                                handle_cancel,
+                                cfg,
+                                cancel_msg,
+                                state.running_tasks,
+                                scheduler,
+                            )
+                            return
+                        recovery_pending = [
+                            event
+                            for (chat, thread, command), (
+                                event,
+                                original,
+                            ) in recovery_cancel.items()
+                            if (chat, thread) == topic_key
+                            and (
+                                cancel_reply_id is None
+                                or cancel_reply_id in (command, original)
+                            )
+                        ]
+                        if (
+                            cancel_reply_id is None
+                            and recovery_pending
+                            and any(
+                                ref.channel_id == chat_id
+                                and task.thread_id == topic_key[1]
+                                for ref, task in state.running_tasks.items()
+                            )
+                        ):
+                            await reply(
+                                text="multiple runs are active; reply to the progress message to cancel one."
+                            )
+                            return
+                        if len(recovery_pending) == 1:
+                            recovery_pending[0].set()
+                            for (chat, thread, command), task in startup_cancel.items():
+                                if (
+                                    (chat, thread) == topic_key
+                                    and (
+                                        event := recovery_cancel.get(
+                                            (chat, thread, command)
+                                        )
+                                    )
+                                    is not None
+                                    and event[0] is recovery_pending[0]
+                                ):
+                                    task.cancel_requested.set()
+                            await reply(
+                                text="Cancelling Pi recovery inspection; no retry prompt will be submitted."
+                            )
+                            return
+                        initial = await live.inbox.initial_for_topic(*topic_key)
+                        pending_fresh = fresh_pending.get(topic_key)
+                        if (
+                            not candidates
+                            and initial is not None
+                            and initial.state == "scheduled"
+                            and pending_fresh is not None
+                            and initial.message_id == pending_fresh[1]
+                            and (
+                                cancel_reply_id is None
+                                or cancel_reply_id == initial.message_id
+                            )
+                        ):
+                            if cancel_reply_id is None and any(
+                                ref.channel_id == chat_id
+                                and task.thread_id == topic_key[1]
+                                for ref, task in state.running_tasks.items()
+                            ):
+                                await reply(
+                                    text="multiple runs are active; reply to the progress message to cancel one."
+                                )
+                                return
+                            cancelled_initial_ids.add(initial.id)
+                            for key, pending in list(state.pending_prompts.items()):
+                                if (
+                                    pending.topic_key == topic_key
+                                    and pending.msg.message_id == initial.message_id
+                                ):
+                                    forward_coalescer.cancel(key)
+                            fresh_pending.pop(topic_key, None)
+                            starting_live.discard(
+                                (chat_id, topic_key[1], initial.session_key)
+                            )
+                            await live.inbox.mark_initial_deferred(
+                                initial.id,
+                                initial.session_key,
+                                "User cancelled scheduled Pi startup before dispatch",
+                            )
+                            await reply(
+                                text="Scheduled Pi startup cancelled before prompt; no prompt submitted."
+                            )
+                            return
+                    cancel_msg = (
+                        replace(msg, reply_to_message_id=None, reply_to_text=None)
+                        if topic_key is not None and reply_id == topic_key[1]
+                        else msg
+                    )
                     tg.start_soon(
-                        handle_cancel, cfg, msg, state.running_tasks, scheduler
+                        handle_cancel, cfg, cancel_msg, state.running_tasks, scheduler
                     )
                     return
 
                 command_id = classification.command_id
                 args_text = classification.args_text
+                # Project commands can bypass ordinary-text live interception via
+                # dispatch_command. Never let a command for another project/branch
+                # run or steer under this topic's active Pi session identity.
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and command_id is not None
+                ):
+                    active_pi = live.owner_for_topic(chat_id, topic_key[1])
+                    if active_pi is not None:
+                        try:
+                            command_target = cfg.runtime.resolve_message(
+                                text=text,
+                                reply_text=msg.reply_to_text,
+                                ambient_context=ambient_context,
+                                chat_id=chat_id,
+                            )
+                        except DirectiveError:
+                            command_target = None
+                        if (
+                            command_target is not None
+                            and command_target.context_source == "directives"
+                            and (
+                                active_pi.running_task is None
+                                or command_target.context
+                                != active_pi.running_task.context
+                            )
+                        ):
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Project/branch command cannot target the active Pi task; use another topic or wait for completion.",
+                            )
+                            return
+                if live_topic_running(topic_key) and (
+                    command_id in ("new", "ctx")
+                    or command_id == "agent"
+                    and args_text.lower().split(maxsplit=1)[:1] in (["set"], ["clear"])
+                ):
+                    await reply(
+                        text=f"/{command_id} cannot change a topic with an active or starting Pi task. Wait for completion."
+                    )
+                    return
                 if command_id == "new":
+                    if topic_key is not None and live is not None:
+                        initial = await live.inbox.initial_for_topic(
+                            chat_id, topic_key[1]
+                        )
+                        if initial is not None:
+                            await reply(
+                                text=f"Cannot /new while initial Pi task #{initial.message_id} is unresolved. Explicitly retry or defer it first."
+                            )
+                            return
+                    if topic_key is not None and live is not None:
+                        provisional = fresh_pending.get(topic_key, (None, 0))[0]
+                        if (
+                            provisional is not None
+                            and await live.inbox.unresolved_for_topic(
+                                chat_id, topic_key[1], str(provisional)
+                            )
+                        ):
+                            await reply(
+                                text="Cannot /new while startup has unresolved live updates. Wait for Pi or explicitly defer the receipt first."
+                            )
+                            return
+                        if any(
+                            r.chat_id == chat_id and r.thread_id == topic_key[1]
+                            for r in await live.inbox.unresolved_all()
+                        ):
+                            await reply(
+                                text="Cannot /new with unresolved live receipts in this topic. Reconcile/retry or explicitly defer them first."
+                            )
+                            return
                     forward_coalescer.cancel(forward_key)
+                    if topic_key is not None and topic_key in fresh_pending:
+                        provisional, _ = fresh_pending.pop(topic_key)
+                        starting_live.discard((chat_id, topic_key[1], str(provisional)))
                     if state.topic_store is not None and topic_key is not None:
                         tg.start_soon(
                             partial(
@@ -1778,15 +3649,37 @@ async def run_main_loop(
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                if trigger_mode == "mentions" and not should_trigger_run(
-                    msg,
-                    bot_username=state.bot_username,
-                    runtime=cfg.runtime,
-                    command_ids=state.command_ids,
-                    reserved_chat_commands=state.reserved_chat_commands,
+                if (
+                    trigger_mode == "mentions"
+                    and not (
+                        live is not None
+                        and topic_key is not None
+                        and classification.command_id == "update"
+                    )
+                    and not should_trigger_run(
+                        msg,
+                        bot_username=state.bot_username,
+                        runtime=cfg.runtime,
+                        command_ids=state.command_ids,
+                        reserved_chat_commands=state.reserved_chat_commands,
+                    )
                 ):
                     return
 
+                # A reserved initial prompt cannot be replaced by unsupported
+                # media. Refuse before transcription or upload has side effects.
+                if (
+                    live is not None
+                    and topic_key in fresh_pending
+                    and (msg.voice is not None or msg.document is not None)
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Media not accepted during Pi startup; resend after the first task starts. Original task is still queued.",
+                    )
+                    return
                 if msg.voice is not None:
                     text = await transcribe_voice(
                         bot=cfg.bot,
@@ -1829,10 +3722,446 @@ async def run_main_loop(
                             partial(reply, text=FILE_PUT_USAGE),
                         )
                     return
+                if command_id == "update" and live is not None:
+                    candidate = (
+                        await state.topic_store.get_session_resume(
+                            chat_id, topic_key[1], "pi"
+                        )
+                        if state.topic_store is not None and topic_key is not None
+                        else None
+                    )
+                    key = scoped_live_key(
+                        chat_id, msg.thread_id, candidate, ambient_context
+                    )
+                    if key is None and candidate is None and topic_key in fresh_pending:
+                        provisional, _ = fresh_pending[topic_key]
+                        key = (chat_id, topic_key[1], str(provisional))
+                    active = (
+                        live.owner(*key)
+                        if key is not None
+                        else (
+                            live.owner_for_topic(chat_id, topic_key[1])
+                            if topic_key is not None and candidate is None
+                            else None
+                        )
+                    )
+                    parts = args_text.strip().split(" ", 2)
+                    if (
+                        key is None
+                        and candidate is None
+                        and topic_key is not None
+                        and parts[0] in ("defer", "retry")
+                        and len(parts) >= 2
+                        and parts[1].isdigit()
+                    ):
+                        try:
+                            orphan = await live.inbox.get(
+                                (chat_id, topic_key[1], int(parts[1]))
+                            )
+                        except KeyError:
+                            orphan = None
+                        if orphan is not None:
+                            key = (chat_id, topic_key[1], orphan.session_key)
+                            if (
+                                parts[0] == "retry"
+                                and await live.inbox.initial_for_topic(
+                                    chat_id, topic_key[1]
+                                )
+                                is not None
+                            ):
+                                await reply(
+                                    text="Initial Pi task must be reconciled before retrying its dependent update."
+                                )
+                                return
+                    if (
+                        topic_key is not None
+                        and parts[0] in ("retry-initial", "defer-initial")
+                        and len(parts) >= 2
+                        and parts[1].isdigit()
+                    ):
+                        initial = await live.inbox.initial_by_id(
+                            (chat_id, topic_key[1], int(parts[1]))
+                        )
+                        if initial is None or initial.state not in (
+                            "scheduled",
+                            "uncertain",
+                        ):
+                            await reply(
+                                text="Initial Pi task ID is not unresolved in this exact topic; nothing changed."
+                            )
+                            return
+                        intent_key = (chat_id, topic_key[1], initial.session_key)
+                        if parts[0] == "defer-initial":
+                            if len(parts) < 3 or not parts[2].strip():
+                                await reply(
+                                    text="Explicit initial-task deferral requires a reason."
+                                )
+                            elif (
+                                intent_key in starting_live
+                                or live.owner(*intent_key) is not None
+                            ):
+                                await reply(
+                                    text="Initial Pi task is in flight; deferral refused until ownership settles."
+                                )
+                            else:
+                                await live.inbox.mark_initial_deferred(
+                                    initial.id, initial.session_key, parts[2].strip()
+                                )
+                                await reply(
+                                    text=f"Initial Pi task #{initial.message_id} explicitly deferred. Pi may already have acted; dependent updates must be resolved separately."
+                                )
+                            return
+                        if len(parts) != 3 or parts[2] != "confirm":
+                            await reply(
+                                text=f"Retry may duplicate tool effects. Confirm with /update retry-initial {initial.message_id} confirm."
+                            )
+                            return
+                        if (
+                            intent_key in starting_live
+                            or live.owner(*intent_key) is not None
+                        ):
+                            await reply(
+                                text="Initial Pi owner already starting; no duplicate retry scheduled."
+                            )
+                            return
+                        if candidate is not None and (
+                            scoped_live_key(
+                                chat_id, msg.thread_id, candidate, ambient_context
+                            )
+                            != intent_key
+                        ):
+                            await reply(
+                                text="Topic is bound to another Pi session; initial retry refused."
+                            )
+                            return
+
+                        retry_cancel = asyncio.Event()
+
+                        async def run_initial_retry(intent: InitialIntent) -> None:
+                            rpc: PiRpcRun | None = None
+                            try:
+                                if retry_cancel.is_set():
+                                    return
+                                if config_path is None:
+                                    raise ValueError("Live config path unavailable")
+                                cwd = (
+                                    cfg.runtime.resolve_run_cwd(ambient_context)
+                                    or Path.cwd()
+                                )
+                                if str(cwd.resolve()) != intent.cwd:
+                                    raise ValueError("Initial task project changed")
+                                path = Path(intent.session_key)
+                                assert state.topic_store is not None
+                                owners = await state.topic_store.session_owners(
+                                    "pi",
+                                    str(path),
+                                    session_header_id(path) if path.exists() else None,
+                                    relative_resolver=resolve_stored_pi_alias,
+                                )
+                                if owners - {(chat_id, topic_key[1])}:
+                                    raise ValueError(
+                                        "Initial Pi session is bound to another topic"
+                                    )
+                                token: ResumeToken | None = None
+                                if path.exists():
+                                    entry = cfg.runtime.resolve_runner(
+                                        resume_token=ResumeToken(
+                                            engine="pi", value=str(path)
+                                        ),
+                                        engine_override="pi",
+                                    )
+                                    if (
+                                        not isinstance(entry.runner, PiRunner)
+                                        or not entry.available
+                                    ):
+                                        raise ValueError("Pi runner unavailable")
+                                    opts = await _resolve_engine_run_options(
+                                        chat_id,
+                                        topic_key[1],
+                                        "pi",
+                                        chat_prefs=state.chat_prefs,
+                                        topic_store=state.topic_store,
+                                    )
+                                    with apply_run_options(opts):
+                                        rpc = entry.runner.rpc_run(path, cwd=cwd)
+                                decision = await live.inspect_initial_retry(
+                                    intent, rpc, cwd, config_path.parent
+                                )
+                                if retry_cancel.is_set():
+                                    return
+                                if decision == "fresh":
+                                    prompt = intent.prompt
+                                else:
+                                    token = ResumeToken(
+                                        engine="pi", value=intent.session_key
+                                    )
+                                    assert state.topic_store is not None
+                                    await state.topic_store.set_session_resume(
+                                        chat_id, topic_key[1], token
+                                    )
+                                    prompt = (
+                                        intent.prompt
+                                        if decision == "retry"
+                                        else "Continue the original task from its observed main-session state; do not redo finished tool effects. Consider queued updates before finalizing."
+                                    )
+                                await run_job(
+                                    chat_id,
+                                    msg.message_id,
+                                    prompt,
+                                    token,
+                                    ambient_context,
+                                    topic_key[1],
+                                    chat_session_key,
+                                    None,
+                                    scheduler.note_thread_known,
+                                    "pi",
+                                    None,
+                                    recovery_rpc=rpc,
+                                    recovery_initial_id=intent.id,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - preserve ambiguous initial task
+                                logger.warning(
+                                    "live.initial_retry.failed",
+                                    error_type=type(exc).__name__,
+                                )
+                                await reply(
+                                    text=f"Initial Pi task #{intent.message_id}: retry failed/owner conflicted; no success claimed. Inspect the scoped state before another explicit retry."
+                                )
+                            finally:
+                                if rpc is not None:
+                                    await rpc.client.close()
+                                recovery_cancel.pop(
+                                    (chat_id, topic_key[1], msg.message_id), None
+                                )
+                                retry_starting.discard(intent_key)
+                                if fresh_pending.get(topic_key, (None, 0))[0] == Path(
+                                    intent.session_key
+                                ):
+                                    fresh_pending.pop(topic_key, None)
+                                if not await scheduler.has_pending_for_topic(
+                                    ResumeToken(engine="pi", value=intent.session_key),
+                                    chat_id,
+                                    topic_key[1],
+                                ):
+                                    starting_live.discard(intent_key)
+
+                        confirmed_initial = cast(InitialIntent, initial)
+
+                        async def initial_work() -> None:
+                            await run_initial_retry(confirmed_initial)
+
+                        if not enqueue_recovery(initial_work):
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Pi recovery queue full; initial retry not started. Please retry later.",
+                            )
+                            return
+                        recovery_cancel[(chat_id, topic_key[1], msg.message_id)] = (
+                            retry_cancel,
+                            initial.message_id,
+                        )
+                        fresh_pending[topic_key] = (
+                            Path(initial.session_key),
+                            initial.message_id,
+                        )
+                        starting_live.add(intent_key)
+                        retry_starting.add(intent_key)
+                        await live._startup_reply(
+                            chat_id,
+                            topic_key[1],
+                            msg.message_id,
+                            f"Initial Pi task #{initial.message_id}: canonical inspection scheduled. Your explicit confirmation permits a duplicate-risk prompt only if unobserved; no automatic replay.",
+                        )
+                        return
+                    if key is not None and args_text.startswith(("defer ", "retry ")):
+                        recovery_key = cast(tuple[int, int, str], key)
+                        if (
+                            args_text.startswith("retry ")
+                            and recovery_key in starting_live
+                        ):
+                            await reply(
+                                text="Pi owner is starting; retry already pending. No second replay started."
+                            )
+                            return
+
+                        idle_cancel = asyncio.Event()
+                        idle_retry_spawned = False
+
+                        async def run_idle_retry(receipt: Receipt) -> None:
+                            rpc: PiRpcRun | None = None
+                            token = ResumeToken(engine="pi", value=receipt.session_key)
+                            try:
+                                if idle_cancel.is_set():
+                                    return
+                                entry = cfg.runtime.resolve_runner(
+                                    resume_token=token, engine_override="pi"
+                                )
+                                if (
+                                    not isinstance(entry.runner, PiRunner)
+                                    or not entry.available
+                                ):
+                                    raise ValueError(
+                                        "Pi runner unavailable for recovery"
+                                    )
+                                cwd = (
+                                    cfg.runtime.resolve_run_cwd(ambient_context)
+                                    or Path.cwd()
+                                )
+                                opts = await _resolve_engine_run_options(
+                                    chat_id,
+                                    recovery_key[1],
+                                    "pi",
+                                    chat_prefs=state.chat_prefs,
+                                    topic_store=state.topic_store,
+                                )
+                                with apply_run_options(opts):
+                                    rpc = entry.runner.rpc_run(
+                                        Path(receipt.session_key), cwd=cwd
+                                    )
+                                if not await live.begin_idle_retry(receipt, rpc, cwd):
+                                    return
+                                if idle_cancel.is_set():
+                                    return
+                                await run_job(
+                                    chat_id,
+                                    msg.message_id,
+                                    await live.inbox.delivery_text(receipt.id),
+                                    token,
+                                    ambient_context,
+                                    recovery_key[1],
+                                    chat_session_key,
+                                    None,
+                                    scheduler.note_thread_known,
+                                    "pi",
+                                    None,
+                                    recovery_rpc=rpc,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - unknown RPC outcome stays durable
+                                logger.warning(
+                                    "live.retry.failed", error_type=type(exc).__name__
+                                )
+                                await reply(
+                                    text=f"Receipt #{receipt.message_id}: retry failed or owner conflicted; no success claimed. Inspect state before confirming again."
+                                )
+                            finally:
+                                if rpc is not None:
+                                    await rpc.client.close()
+                                recovery_cancel.pop(
+                                    (chat_id, recovery_key[1], msg.message_id), None
+                                )
+                                retry_starting.discard(recovery_key)
+                                if not await scheduler.has_pending_for_topic(
+                                    token, chat_id, recovery_key[1]
+                                ):
+                                    starting_live.discard(recovery_key)
+
+                        def spawn_idle_retry(receipt: Receipt) -> None:
+                            nonlocal idle_retry_spawned
+                            if idle_cancel.is_set():
+                                return
+
+                            async def work() -> None:
+                                await run_idle_retry(receipt)
+
+                            if not enqueue_recovery(work):
+                                raise RuntimeError("Pi recovery queue is full")
+                            idle_retry_spawned = True
+                            starting_live.add(recovery_key)
+                            retry_starting.add(recovery_key)
+
+                        async def inspect_receipt() -> None:
+                            try:
+                                if idle_cancel.is_set():
+                                    return
+                                handled = await live.recover_receipt(
+                                    chat_id,
+                                    recovery_key[1],
+                                    msg.message_id,
+                                    recovery_key[2],
+                                    args_text,
+                                    spawn_idle_retry=spawn_idle_retry,
+                                )
+                                if not handled:
+                                    await reply(
+                                        text="Receipt not found in this exact topic/session; nothing changed."
+                                    )
+                            except RuntimeError:
+                                await live._startup_reply(
+                                    chat_id,
+                                    recovery_key[1],
+                                    msg.message_id,
+                                    "Pi recovery queue full; no retry started. Please try later.",
+                                )
+                            finally:
+                                if not idle_retry_spawned:
+                                    recovery_cancel.pop(
+                                        (chat_id, recovery_key[1], msg.message_id), None
+                                    )
+
+                        if not enqueue_recovery(inspect_receipt):
+                            await live._startup_reply(
+                                chat_id,
+                                key[1],
+                                msg.message_id,
+                                "Pi recovery queue full; nothing submitted. Please retry later.",
+                            )
+                        else:
+                            recovery_cancel[
+                                (chat_id, recovery_key[1], msg.message_id)
+                            ] = (
+                                idle_cancel,
+                                int(parts[1])
+                                if len(parts) > 1 and parts[1].isdigit()
+                                else None,
+                            )
+                        return
+                    if active is not None and (
+                        active.running_task is None
+                        or ambient_context != active.running_task.context
+                    ):
+                        await reply(
+                            text="/update was not sent: topic context differs from the active Pi task. Restore its project/branch or wait for completion."
+                        )
+                        return
+                    if active is None and key is not None and key in starting_live:
+                        await live.buffer_starting(
+                            chat_id,
+                            key[1],
+                            msg.message_id,
+                            key[2],
+                            f"/update {args_text}",
+                        )
+                    elif active is not None and not active.closing:
+                        await live.handle(
+                            chat_id,
+                            active.thread_id,
+                            msg.message_id,
+                            active.session_key,
+                            f"/update {args_text}",
+                            spawn_quick=spawn_quick,
+                        )
+                    elif active is not None:
+                        await reply(
+                            text="Pi is finalizing; update was not accepted. Please resend after the final reply."
+                        )
+                    else:
+                        tg.start_soon(
+                            partial(
+                                reply, text="/update requires an active Pi live topic."
+                            )
+                        )
+                    return
                 if command_id is not None and command_id not in state.reserved_commands:
                     if command_id not in state.command_ids:
                         refresh_commands()
                     if command_id in state.command_ids:
+                        if await live_plugin_blocked(topic_key):
+                            await reply(
+                                text="Plugin command not accepted while this Pi live topic has active or unresolved work. Use another topic or resolve the task first."
+                            )
+                            return
                         engine_resolution = await resolve_engine_defaults(
                             explicit_engine=None,
                             context=ambient_context,
@@ -1855,26 +4184,51 @@ async def run_main_loop(
                             chat_prefs=state.chat_prefs,
                             topic_store=state.topic_store,
                         )
+                        if live is not None and topic_key is not None:
+                            async with media_admission_locks.setdefault(
+                                topic_key, asyncio.Lock()
+                            ):
+                                if await live_plugin_blocked(topic_key):
+                                    await reply(
+                                        text="Plugin command not accepted: Pi live topic became busy."
+                                    )
+                                    return
+                                plugin_inflight.add(topic_key)
+                        elif await live_plugin_blocked(topic_key):
+                            await reply(
+                                text="Plugin command not accepted: Pi live topic became busy."
+                            )
+                            return
                         tg.start_soon(
-                            dispatch_command,
-                            cfg,
-                            msg,
-                            text,
-                            command_id,
-                            args_text,
-                            state.running_tasks,
-                            scheduler,
-                            wrap_on_thread_known(
-                                scheduler.note_thread_known,
-                                topic_key,
-                                chat_session_key,
-                                None,
+                            run_guarded_plugin,
+                            topic_key,
+                            partial(
+                                dispatch_command,
+                                cfg,
+                                msg,
+                                text,
+                                command_id,
+                                args_text,
+                                state.running_tasks,
+                                scheduler,
+                                wrap_on_thread_known(
+                                    scheduler.note_thread_known,
+                                    topic_key,
+                                    chat_session_key,
+                                    None,
+                                ),
+                                stateful_mode,
+                                default_engine_override,
+                                engine_overrides_resolver,
                             ),
-                            stateful_mode,
-                            default_engine_override,
-                            engine_overrides_resolver,
                         )
                         return
+
+                if live is not None and topic_key in plugin_inflight and text.strip():
+                    await reply(
+                        text="Plugin command is still running here; this message was not accepted. Resend after it completes."
+                    )
+                    return
 
                 pending = _PendingPrompt(
                     msg=msg,
@@ -1888,9 +4242,42 @@ async def run_main_loop(
                     is_voice_transcribed=is_voice_transcribed,
                     forwards=[],
                 )
-                if reply_id is not None and state.running_tasks.get(
-                    MessageRef(channel_id=chat_id, message_id=reply_id)
-                ):
+                reply_task = state.running_tasks.get(reply_ref) if reply_ref else None
+                if reply_task is not None:
+                    if live is not None and topic_key is not None:
+                        if reply_task.thread_id != topic_key[1]:
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Reply targets a run in another topic; no prompt sent.",
+                            )
+                            return
+                        try:
+                            resolved_reply = cfg.runtime.resolve_message(
+                                text=text,
+                                reply_text=msg.reply_to_text,
+                                ambient_context=ambient_context,
+                                chat_id=chat_id,
+                            )
+                        except DirectiveError:
+                            resolved_reply = None  # Dispatch reports parse errors.
+                        if resolved_reply is not None:
+                            rejection = await active_topic_rejection(
+                                raw_text=text,
+                                message_id=msg.message_id,
+                                resolved=resolved_reply,
+                                ambient_context=ambient_context,
+                                topic_key=topic_key,
+                            )
+                            if rejection is not None:
+                                await live._startup_reply(
+                                    chat_id,
+                                    topic_key[1],
+                                    msg.message_id,
+                                    rejection,
+                                )
+                                return
                     logger.debug(
                         "forward.prompt.bypass",
                         chat_id=chat_id,
@@ -1900,6 +4287,268 @@ async def run_main_loop(
                         reason="reply_resume",
                     )
                     tg.start_soon(_dispatch_pending_prompt, pending)
+                    return
+                # Active ordinary text must be accepted before the destructive
+                # forward debounce can replace it with a later status question.
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and not is_voice_transcribed
+                    and msg.voice is None
+                    and msg.document is None
+                    and msg.media_group_id is None
+                    and text.strip()
+                ):
+                    try:
+                        resolved_live = cfg.runtime.resolve_message(
+                            text=text,
+                            reply_text=msg.reply_to_text,
+                            ambient_context=ambient_context,
+                            chat_id=chat_id,
+                        )
+                    except DirectiveError:
+                        resolved_live = None
+                    if resolved_live is not None and resolved_live.prompt.strip():
+                        rejection = await active_topic_rejection(
+                            raw_text=text,
+                            message_id=msg.message_id,
+                            resolved=resolved_live,
+                            ambient_context=ambient_context,
+                            topic_key=topic_key,
+                        )
+                        if rejection is not None:
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                rejection,
+                            )
+                            return
+                    if (
+                        resolved_live is not None
+                        and resolved_live.context_source == "directives"
+                        and (initial := await live.inbox.initial_for_topic(*topic_key))
+                        is not None
+                        and initial.message_id != msg.message_id
+                    ):
+                        await live._startup_reply(
+                            chat_id,
+                            topic_key[1],
+                            msg.message_id,
+                            f"Directive not accepted: initial Pi task #{initial.message_id} remains unresolved. Retry or defer it first.",
+                        )
+                        return
+                    if (
+                        resolved_live is not None
+                        and resolved_live.prompt.strip()
+                        and resolved_live.engine_override not in (None, "pi")
+                        and live_topic_running(topic_key)
+                    ):
+                        await live._startup_reply(
+                            chat_id,
+                            topic_key[1],
+                            msg.message_id,
+                            "Non-Pi directive cannot rebind an active or starting Pi topic. Use another topic or wait for completion.",
+                        )
+                        return
+                    if (
+                        resolved_live is not None
+                        and resolved_live.prompt.strip()
+                        and resolved_live.engine_override in (None, "pi")
+                    ):
+                        engine_live = await resolve_engine_defaults(
+                            explicit_engine=resolved_live.engine_override,
+                            context=resolved_live.context,
+                            chat_id=chat_id,
+                            topic_key=topic_key,
+                        )
+                        candidate = (
+                            resolved_live.resume_token
+                            or await state.topic_store.get_session_resume(  # type: ignore[union-attr]
+                                chat_id, topic_key[1], "pi"
+                            )
+                        )
+                        key = scoped_live_key(
+                            chat_id, msg.thread_id, candidate, resolved_live.context
+                        )
+                        if (
+                            key is None
+                            and candidate is None
+                            and topic_key in fresh_pending
+                        ):
+                            provisional, _ = fresh_pending[topic_key]
+                            key = (chat_id, topic_key[1], str(provisional))
+                        active = (
+                            live.owner(*key)
+                            if key is not None
+                            else (
+                                live.owner_for_topic(chat_id, topic_key[1])
+                                if candidate is None
+                                else None
+                            )
+                        )
+                        if active is not None and key is None:
+                            key = (chat_id, topic_key[1], active.session_key)
+                        if active is not None and (
+                            active.running_task is None
+                            or resolved_live.context != active.running_task.context
+                        ):
+                            await live._startup_reply(
+                                chat_id,
+                                topic_key[1],
+                                msg.message_id,
+                                "Project/branch directive was not sent to the active Pi task. Wait for completion or use a separate topic.",
+                            )
+                            return
+                        replied_task = (
+                            state.running_tasks.get(reply_ref) if reply_ref else None
+                        )
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is None
+                            and key in starting_live
+                            and state.topic_store is not None
+                        ):
+                            bound_context = await state.topic_store.get_context(
+                                *topic_key
+                            )
+                            initial = await live.inbox.initial_for_topic(*topic_key)
+                            context_mismatch = (
+                                bound_context is not None
+                                and resolved_live.context != bound_context
+                            )
+                            if bound_context is None and initial is not None:
+                                try:
+                                    target_cwd = cfg.runtime.resolve_run_cwd(
+                                        resolved_live.context
+                                    )
+                                    context_mismatch = (
+                                        target_cwd is None
+                                        or str(target_cwd.resolve()) != initial.cwd
+                                    )
+                                except ConfigError:
+                                    context_mismatch = True
+                            if context_mismatch:
+                                await live._startup_reply(
+                                    chat_id,
+                                    topic_key[1],
+                                    msg.message_id,
+                                    "Project/branch directive was not sent to the starting Pi task. Use another topic or wait for completion.",
+                                )
+                                return
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is None
+                            and key in starting_live
+                        ):
+                            await live.buffer_starting(
+                                chat_id,
+                                key[1],
+                                msg.message_id,
+                                key[2],
+                                resolved_live.prompt,
+                            )
+                            return
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is not None
+                            and active.closing
+                        ):
+                            await _dispatch_pending_prompt(pending)
+                            return
+                        if (
+                            engine_live.engine == "pi"
+                            and key is not None
+                            and active is not None
+                            and (
+                                replied_task is None
+                                or replied_task is active.running_task
+                                or (
+                                    replied_task.resume is not None
+                                    and replied_task.resume.value == active.session_key
+                                )
+                            )
+                            and await live.handle(
+                                chat_id,
+                                key[1],
+                                msg.message_id,
+                                key[2],
+                                resolved_live.prompt,
+                                spawn_quick=spawn_quick,
+                            )
+                        ):
+                            return
+                        if (
+                            engine_live.engine == "pi"
+                            and candidate is None
+                            and active is None
+                            and topic_key not in fresh_pending
+                            and config_path is not None
+                        ):
+                            async with media_admission_locks.setdefault(
+                                topic_key, asyncio.Lock()
+                            ):
+                                if (
+                                    topic_key in media_inflight
+                                    or topic_key in plugin_inflight
+                                    or topic_key in legacy_pending
+                                    or live_topic_running(topic_key)
+                                ):
+                                    await live._startup_reply(
+                                        chat_id,
+                                        topic_key[1],
+                                        msg.message_id,
+                                        "Another task is active in this topic; this message was not accepted. Resend after it completes.",
+                                    )
+                                    return
+                                existing_initial = await live.inbox.initial_for_topic(
+                                    chat_id, topic_key[1]
+                                )
+                                if existing_initial is not None:
+                                    await reply(
+                                        text=f"Initial Pi task #{existing_initial.message_id} is unresolved after restart; no new prompt started. Use scoped retry-initial or defer-initial."
+                                    )
+                                    return
+                                provisional = live_session_path(
+                                    config_path, chat_id, topic_key[1]
+                                )
+                                try:
+                                    cwd = (
+                                        cfg.runtime.resolve_run_cwd(
+                                            resolved_live.context
+                                        )
+                                        or Path.cwd()
+                                    )
+                                except ConfigError as exc:
+                                    await reply(text=f"error: {exc}")
+                                    return
+                                await live.inbox.receive_initial(
+                                    chat_id,
+                                    topic_key[1],
+                                    msg.message_id,
+                                    str(provisional),
+                                    resolved_live.prompt,
+                                    str(cwd.resolve()),
+                                )
+                                fresh_pending[topic_key] = (provisional, msg.message_id)
+                                starting_live.add(
+                                    (chat_id, topic_key[1], str(provisional))
+                                )
+                if (
+                    live is not None
+                    and topic_key is not None
+                    and (reserved := fresh_pending.get(topic_key)) is not None
+                    and reserved[1] != msg.message_id
+                ):
+                    await live._startup_reply(
+                        chat_id,
+                        topic_key[1],
+                        msg.message_id,
+                        "Message not accepted during Pi startup; original task is still queued. Resend after it starts.",
+                    )
                     return
                 forward_coalescer.schedule(pending)
 
@@ -1972,6 +4621,27 @@ async def run_main_loop(
                         if command_id in state.command_ids:
                             callback_msg = _callback_message(update)
                             ctx = await build_message_context(callback_msg)
+                            if (
+                                live is not None
+                                and ctx.topic_key is None
+                                and cfg.topics.enabled
+                                and _topics_chat_allowed(
+                                    cfg,
+                                    ctx.chat_id,
+                                    scope_chat_ids=state.topics_chat_ids,
+                                )
+                            ):
+                                await cfg.bot.answer_callback_query(
+                                    callback_query_id=update.callback_query_id,
+                                    text="Topic cannot be verified; command not accepted.",
+                                )
+                                return
+                            if await live_plugin_blocked(ctx.topic_key):
+                                await cfg.bot.answer_callback_query(
+                                    callback_query_id=update.callback_query_id,
+                                    text="Pi live task active or unresolved; command not accepted.",
+                                )
+                                return
                             engine_resolution = await resolve_engine_defaults(
                                 explicit_engine=None,
                                 context=ctx.ambient_context,
@@ -2000,24 +4670,45 @@ async def run_main_loop(
                                 cfg.bot.answer_callback_query,
                                 update.callback_query_id,
                             )
+                            if live is not None and ctx.topic_key is not None:
+                                async with media_admission_locks.setdefault(
+                                    ctx.topic_key, asyncio.Lock()
+                                ):
+                                    if await live_plugin_blocked(ctx.topic_key):
+                                        await cfg.bot.answer_callback_query(
+                                            callback_query_id=update.callback_query_id,
+                                            text="Pi live topic became busy; command not accepted.",
+                                        )
+                                        return
+                                    plugin_inflight.add(ctx.topic_key)
+                            elif await live_plugin_blocked(ctx.topic_key):
+                                await cfg.bot.answer_callback_query(
+                                    callback_query_id=update.callback_query_id,
+                                    text="Pi live topic became busy; command not accepted.",
+                                )
+                                return
                             tg.start_soon(
-                                dispatch_command,
-                                cfg,
-                                callback_msg,
-                                update.data,
-                                command_id,
-                                args_text,
-                                state.running_tasks,
-                                scheduler,
-                                wrap_on_thread_known(
-                                    scheduler.note_thread_known,
-                                    ctx.topic_key,
-                                    ctx.chat_session_key,
-                                    None,
+                                run_guarded_plugin,
+                                ctx.topic_key,
+                                partial(
+                                    dispatch_command,
+                                    cfg,
+                                    callback_msg,
+                                    update.data,
+                                    command_id,
+                                    args_text,
+                                    state.running_tasks,
+                                    scheduler,
+                                    wrap_on_thread_known(
+                                        scheduler.note_thread_known,
+                                        ctx.topic_key,
+                                        ctx.chat_session_key,
+                                        None,
+                                    ),
+                                    ctx.stateful_mode,
+                                    default_engine_override,
+                                    engine_overrides_resolver,
                                 ),
-                                ctx.stateful_mode,
-                                default_engine_override,
-                                engine_overrides_resolver,
                             )
                         else:
                             tg.start_soon(
@@ -2032,7 +4723,13 @@ async def run_main_loop(
                     return
                 await route_message(update)
 
-            async for update in poller_fn(cfg):
-                await route_update(update)
+            try:
+                async for update in poller_fn(cfg):
+                    await route_update(update)
+            finally:
+                if live is not None:
+                    live.stop_workers()
+                    recovery_stopping = True
+                    recovery_notice.set()
     finally:
         await cfg.exec_cfg.transport.close()

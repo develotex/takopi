@@ -1,14 +1,118 @@
+import asyncio
+from typing import cast
+
 import anyio
 import pytest
 
-from takopi.model import ResumeToken, TitleChangedEvent
-from takopi.runner_bridge import RunningTask, run_runner_with_cancel
+from takopi.model import CompletedEvent, ResumeToken, StartedEvent, TitleChangedEvent
+from takopi.runner import Runner
+from takopi.runner_bridge import ProgressEdits, RunningTask, run_runner_with_cancel
 from takopi.runners.mock import Emit, Return, ScriptRunner
 
 
 class _Edits:
     async def on_event(self, _event) -> None:
         pass
+
+
+@pytest.mark.anyio
+async def test_unanswered_interrupt_is_bounded_even_after_runner_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import takopi.runner_bridge as bridge
+
+    monkeypatch.setattr(bridge, "_INTERRUPT_TIMEOUT_S", 0.02)
+    token = ResumeToken(engine="codex", value="test-session")
+    started, settled = anyio.Event(), anyio.Event()
+
+    class Control:
+        async def interrupt(self):
+            started.set()
+            await anyio.sleep_forever()
+
+    class FakeRunner:
+        async def run(self, _prompt, _resume):
+            yield StartedEvent(
+                engine="codex", resume=token, meta={"control": Control()}
+            )
+            await settled.wait()
+            yield CompletedEvent(
+                engine="codex", ok=True, answer="settled", resume=token
+            )
+
+    running = RunningTask()
+    run = asyncio.create_task(
+        run_runner_with_cancel(
+            cast(Runner, FakeRunner()),
+            prompt="task",
+            resume_token=None,
+            edits=cast(ProgressEdits, _Edits()),
+            running_task=running,
+            on_thread_known=None,
+        )
+    )
+    await running.resume_ready.wait()
+    running.cancel_requested.set()
+    with anyio.fail_after(1):
+        await started.wait()
+    settled.set()
+    outcome = await asyncio.wait_for(run, 1)
+    assert outcome.cancelled and outcome.cancel_unconfirmed
+
+
+@pytest.mark.anyio
+async def test_cancelled_completion_waits_for_interrupt_and_never_reports_success() -> (
+    None
+):
+    settled, interrupt_entered, allow_abort = (
+        anyio.Event(),
+        anyio.Event(),
+        anyio.Event(),
+    )
+    token = ResumeToken(engine="pi", value="test-session")
+
+    class Control:
+        aborted = False
+
+        async def interrupt(self):
+            interrupt_entered.set()
+            await allow_abort.wait()
+            self.aborted = True
+            return True
+
+    control = Control()
+
+    class FakeRunner:
+        async def run(self, _prompt, _resume):
+            yield StartedEvent(engine="pi", resume=token, meta={"control": control})
+            await settled.wait()
+            yield CompletedEvent(engine="pi", ok=True, answer="settled", resume=token)
+
+    running = RunningTask()
+    run = asyncio.create_task(
+        run_runner_with_cancel(
+            cast(Runner, FakeRunner()),
+            prompt="task",
+            resume_token=None,
+            edits=cast(ProgressEdits, _Edits()),
+            running_task=running,
+            on_thread_known=None,
+        )
+    )
+    try:
+        with anyio.fail_after(1):
+            await running.resume_ready.wait()
+        running.cancel_requested.set()
+        with anyio.fail_after(1):
+            await interrupt_entered.wait()
+        settled.set()
+        await anyio.sleep(0.03)
+        assert not run.done(), "Observed cancel cannot discard an in-flight abort"
+    finally:
+        allow_abort.set()
+    outcome = await asyncio.wait_for(run, 1)
+    assert control.aborted
+    assert outcome.cancelled
 
 
 def test_title_changed_event() -> None:

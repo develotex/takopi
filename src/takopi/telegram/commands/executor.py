@@ -161,6 +161,7 @@ async def _run_engine(
     show_resume_line: bool = True,
     progress_ref: MessageRef | None = None,
     run_options: EngineRunOptions | None = None,
+    runner_override: Runner | None = None,
 ) -> None:
     reply = partial(
         send_plain,
@@ -178,7 +179,9 @@ async def _run_engine(
         except RunnerUnavailableError as exc:
             await reply(text=f"error:\n{exc}")
             return
-        runner: Runner = entry.runner
+        runner: Runner = (
+            runner_override if runner_override is not None else entry.runner
+        )
         if not show_resume_line:
             runner = cast(Runner, _ResumeLineProxy(runner))
         warning = _reasoning_warning(engine=runner.engine, run_options=run_options)

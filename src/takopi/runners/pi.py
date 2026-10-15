@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from pathlib import Path, PurePath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import msgspec
@@ -32,6 +33,9 @@ from .run_options import get_run_options
 from ..schemas import pi as pi_schema
 from ..utils.paths import get_run_base_dir
 from .tool_actions import tool_kind_and_title
+
+if TYPE_CHECKING:
+    from .pi_rpc import PiRpcRun
 
 logger = get_logger(__name__)
 
@@ -305,6 +309,61 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         self, prompt: str, resume: ResumeToken | None
     ) -> AsyncIterator[TakopiEvent]:
         return super().run(prompt, resume)
+
+    def shield_subprocess_start(self) -> bool:
+        from .pi_rpc import live_claims_enabled
+
+        return live_claims_enabled()
+
+    @asynccontextmanager
+    async def pre_spawn_scope(
+        self, state: PiStreamState, resume: ResumeToken | None
+    ) -> AsyncIterator[None]:
+        from .pi_rpc import claim_one_shot, live_claims_enabled
+
+        if not live_claims_enabled():
+            yield  # Live opt-in off: preserve legacy one-shot semantics.
+            return
+        from .pi_identity import resolve_legacy_session, session_header
+
+        token = state.resume.value
+        path = Path(token)
+        cwd = (get_run_base_dir() or Path.cwd()).resolve()
+        if not path.is_absolute():
+            path = (
+                (cwd / path).resolve()
+                if path.suffix == ".jsonl"
+                else resolve_legacy_session(token, cwd)
+            )
+        async with claim_one_shot(path):
+            if resume is None:
+                if path.exists():
+                    raise ValueError("Pi fresh session path already exists")
+                yield  # New Pi writes its header only after the first prompt.
+                return
+            header = session_header(path)
+            if (
+                header is None
+                or not isinstance(header.get("cwd"), str)
+                or Path(header["cwd"]).resolve() != cwd
+            ):
+                raise ValueError("Pi session path is not a same-project JSONL")
+            yield
+
+    def rpc_run(self, session_path: Path, *, cwd: Path) -> PiRpcRun:
+        """Create an explicit opt-in RPC owner; the one-shot run remains the default."""
+        from .pi_rpc import PiRpcClient, PiRpcRun
+
+        options = get_run_options()
+        args = list(self.extra_args)
+        if self.provider:
+            args.extend(["--provider", self.provider])
+        model = options.model if options is not None and options.model else self.model
+        if model:
+            args.extend(["--model", model])
+        if options is not None and options.reasoning:
+            args.extend(["--thinking", str(options.reasoning)])
+        return PiRpcRun(PiRpcClient(session_path, cwd, args))
 
     def extract_resume(self, text: str | None) -> ResumeToken | None:
         if not text:

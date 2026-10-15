@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import msgspec
 
@@ -173,6 +175,59 @@ class TopicStateStore(JsonStateStore[_TopicState]):
             if entry is None or not entry.resume:
                 return None
             return ResumeToken(engine=engine, value=entry.resume)
+
+    async def session_owners(
+        self,
+        engine: str,
+        resume: str,
+        session_id: str | None = None,
+        *,
+        relative_resolver: Callable[[int, int, RunContext | None, str], Path | None]
+        | None = None,
+    ) -> set[tuple[int, int]]:
+        """Return exact-path owners, verified relative aliases and short IDs."""
+        async with self._lock:
+            self._reload_locked_if_needed()
+            owners: set[tuple[int, int]] = set()
+            for key, thread in self._state.threads.items():
+                entry = thread.sessions.get(engine)
+                if entry is None:
+                    continue
+                try:
+                    chat, topic = (int(part) for part in key.split(":", 1))
+                except ValueError:
+                    raise ValueError("Invalid persisted topic key") from None
+                alias = Path(entry.resume)
+                relative_path = (
+                    relative_resolver(
+                        chat, topic, _context_from_state(thread.context), entry.resume
+                    )
+                    if relative_resolver is not None
+                    and not alias.is_absolute()
+                    and alias.suffix == ".jsonl"
+                    and Path(resume).is_absolute()
+                    else None
+                )
+                if (
+                    entry.resume == resume
+                    or (
+                        alias.is_absolute()
+                        and Path(resume).is_absolute()
+                        and alias.resolve() == Path(resume).resolve()
+                    )
+                    or (
+                        relative_path is not None
+                        and relative_path.resolve() == Path(resume).resolve()
+                    )
+                    or (
+                        session_id is not None
+                        and re.fullmatch(r"[a-fA-F0-9-]{8,36}", entry.resume)
+                        is not None
+                        and session_id.lower().startswith(entry.resume.lower())
+                    )
+                ):
+                    owners.add((chat, topic))
+            return owners
 
     async def get_default_engine(self, chat_id: int, thread_id: int) -> str | None:
         async with self._lock:

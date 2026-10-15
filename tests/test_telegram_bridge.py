@@ -894,6 +894,38 @@ async def test_handle_cancel_cancels_queued_job() -> None:
 
 
 @pytest.mark.anyio
+async def test_cancel_queued_forwarded_fallback_releases_topic_reservation() -> None:
+    released: list[tuple[int, int, int]] = []
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    async def on_cancel(job) -> None:
+        assert job.legacy_fallback
+        released.append((job.chat_id, job.thread_id, job.user_msg_id))
+
+    scheduler = ThreadScheduler(
+        task_group=_NoopTaskGroup(),
+        run_job=_noop_run_job,
+        on_cancel_queued=on_cancel,
+    )
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=10,
+        text="forwarded",
+        thread_id=77,
+        resume_token=ResumeToken(engine="pi", value="existing.jsonl"),
+        progress_ref=MessageRef(channel_id=123, message_id=55),
+        legacy_fallback=True,
+    )
+    job = await scheduler.cancel_queued(123, 55)
+    assert job is not None
+    assert released == [(123, 77, 10)]
+    assert await scheduler.cancel_queued(123, 55) is None
+    assert released == [(123, 77, 10)]
+
+
+@pytest.mark.anyio
 async def test_handle_file_put_writes_file(tmp_path: Path) -> None:
     payload = b"hello"
 
@@ -1086,7 +1118,10 @@ async def test_handle_callback_cancel_cancels_queued_job() -> None:
 
 
 @pytest.mark.anyio
-async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
+@pytest.mark.parametrize("legacy_fallback", [False, True])
+async def test_handle_callback_steer_sends_queued_text_to_active_turn(
+    legacy_fallback: bool,
+) -> None:
     transport = FakeTransport()
     cfg = replace(
         make_cfg(transport),
@@ -1110,7 +1145,16 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
         async def interrupt(self) -> bool:
             return True
 
-    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    released: list[int] = []
+
+    async def on_cancel(job) -> None:
+        released.append(job.user_msg_id)
+
+    scheduler = ThreadScheduler(
+        task_group=_NoopTaskGroup(),
+        run_job=_noop_run_job,
+        on_cancel_queued=on_cancel,
+    )
     progress_id = 88
     progress_ref = MessageRef(channel_id=123, message_id=progress_id)
     resume = ResumeToken(engine=CODEX_ENGINE, value="sid")
@@ -1120,6 +1164,7 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
         text="queued prompt",
         resume_token=resume,
         progress_ref=progress_ref,
+        legacy_fallback=legacy_fallback,
     )
     control = _Control()
     running_task = RunningTask(resume=resume, control=control)
@@ -1136,6 +1181,7 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
     await telegram_loop.handle_callback_steer(cfg, query, running_tasks, scheduler)
 
     assert control.steered == ["queued prompt"]
+    assert released == ([10] if legacy_fallback else [])
     assert transport.edit_calls
     steered_text = transport.edit_calls[0]["message"].text.lower()
     assert "steered" in steered_text
@@ -1147,6 +1193,156 @@ async def test_handle_callback_steer_sends_queued_text_to_active_turn() -> None:
     bot = cast(FakeBot, cfg.bot)
     assert bot.callback_calls
     assert bot.callback_calls[-1]["text"] == "steered active turn."
+
+
+@pytest.mark.anyio
+async def test_live_pi_queued_callback_never_steers_or_drops_a_cross_topic_job() -> (
+    None
+):
+    transport = FakeTransport()
+    cfg = replace(
+        make_cfg(transport),
+        pi_live_conversation=True,
+        show_resume_line=False,
+        session_mode="chat",
+    )
+
+    async def _noop_run_job(_) -> None:
+        return None
+
+    class _Control(RunnerTurnControl):
+        def __init__(self) -> None:
+            self.steered: list[str] = []
+
+        async def steer(self, text: str) -> None:
+            self.steered.append(text)
+
+        async def interrupt(self) -> bool:
+            return True
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=_noop_run_job)
+    token = ResumeToken(engine="pi", value="/tmp/existing-pi.jsonl")
+    progress_id = 91
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=10,
+        text="instruction from other topic",
+        resume_token=token,
+        thread_id=222,
+        progress_ref=MessageRef(channel_id=123, message_id=progress_id),
+    )
+    control = _Control()
+    running = RunningTask(resume=token, control=control)
+    query = TelegramCallbackQuery(
+        transport="telegram",
+        chat_id=123,
+        message_id=progress_id,
+        callback_query_id="cbq-live-cross-topic",
+        data="takopi:steer",
+        sender_id=123,
+    )
+    await telegram_loop.handle_callback_steer(
+        cfg,
+        query,
+        {MessageRef(channel_id=123, message_id=7, thread_id=111): running},
+        scheduler,
+    )
+    assert control.steered == []
+    assert await scheduler.get_queued(123, progress_id) is not None
+    assert "queued" in cast(FakeBot, cfg.bot).callback_calls[-1]["text"]
+
+
+@pytest.mark.anyio
+async def test_live_rpc_queued_button_remains_queued_without_durable_receipt() -> None:
+    from takopi.runners.pi_rpc import PiRpcRun
+
+    transport = FakeTransport()
+    cfg = replace(make_cfg(transport), pi_live_conversation=True)
+
+    async def run_job(_) -> None:
+        return None
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=run_job)
+    token = ResumeToken(engine="pi", value="/tmp/live.jsonl")
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=10,
+        text="use green",
+        resume_token=token,
+        thread_id=77,
+        progress_ref=MessageRef(channel_id=123, message_id=91),
+    )
+    rpc = object.__new__(PiRpcRun)
+    query = TelegramCallbackQuery(
+        transport="telegram",
+        chat_id=123,
+        message_id=91,
+        callback_query_id="live-rpc-steer",
+        data="takopi:steer",
+        sender_id=123,
+    )
+    await telegram_loop.handle_callback_steer(
+        cfg,
+        query,
+        {
+            MessageRef(channel_id=123, message_id=7, thread_id=77): RunningTask(
+                resume=token, control=rpc, thread_id=77
+            )
+        },
+        scheduler,
+    )
+    assert await scheduler.get_queued(123, 91) is not None
+    assert "/update" in cast(FakeBot, cfg.bot).callback_calls[-1]["text"]
+
+
+@pytest.mark.anyio
+async def test_live_flag_keeps_legacy_pi_private_chat_queued_steer() -> None:
+    transport = FakeTransport()
+    cfg = replace(
+        make_cfg(transport),
+        pi_live_conversation=True,
+        show_resume_line=False,
+        session_mode="chat",
+    )
+
+    async def run_job(_) -> None:
+        return None
+
+    class Control(RunnerTurnControl):
+        def __init__(self) -> None:
+            self.received: list[str] = []
+
+        async def steer(self, text: str) -> None:
+            self.received.append(text)
+
+        async def interrupt(self) -> bool:
+            return True
+
+    scheduler = ThreadScheduler(task_group=_NoopTaskGroup(), run_job=run_job)
+    token = ResumeToken(engine="pi", value="/tmp/private-legacy.jsonl")
+    await scheduler.enqueue_resume(
+        chat_id=123,
+        user_msg_id=10,
+        text="use green",
+        resume_token=token,
+        thread_id=None,
+        progress_ref=MessageRef(channel_id=123, message_id=91),
+    )
+    control = Control()
+    running = RunningTask(resume=token, control=control, thread_id=None)
+    query = TelegramCallbackQuery(
+        transport="telegram",
+        chat_id=123,
+        message_id=91,
+        callback_query_id="legacy-steer",
+        data="takopi:steer",
+        sender_id=123,
+    )
+    await telegram_loop.handle_callback_steer(
+        cfg, query, {MessageRef(channel_id=123, message_id=7): running}, scheduler
+    )
+    assert control.received == ["use green"]
+    assert await scheduler.get_queued(123, 91) is None
 
 
 @pytest.mark.anyio
