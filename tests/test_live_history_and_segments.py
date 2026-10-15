@@ -12,6 +12,13 @@ from takopi.telegram.live_inbox import LiveInbox
 from tests.test_telegram_live_integration import FakePi, FakeRun
 
 
+class BufferedRun(FakeRun):
+    def __init__(self):
+        super().__init__()
+        self.assistant_outputs: list[tuple[str, bool]] = []
+        self.output_generation = 0
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("ack_before_user", [False, True])
 async def test_fresh_rpc_owner_recovers_only_valid_historical_receipt_evidence(
@@ -19,9 +26,7 @@ async def test_fresh_rpc_owner_recovers_only_valid_historical_receipt_evidence(
 ):
     inbox = LiveInbox(tmp_path / "i.json")
     r = await inbox.receive(1, 10, 7, "a", "Use 20")
-    rpc = FakeRun()
-    rpc.assistant_outputs = []
-    rpc.output_generation = 0
+    rpc = BufferedRun()
     user = {"role": "user", "content": await inbox.delivery_text(r.id)}
     ack = {
         "role": "assistant",
@@ -50,7 +55,7 @@ async def test_mixed_completed_event_preserves_prefix_marker_suffix_order(tmp_pa
     inbox = LiveInbox(tmp_path / "i.json")
     r = await inbox.receive(1, 10, 7, "a", "Use 20")
     text = f"Earlier result: limit=10\n[takopi-considered:{r.marker}] Corrected result: limit=20\nFinal details: limit=20"
-    rpc = FakeRun()
+    rpc = BufferedRun()
     rpc.assistant_outputs = [(text, True)]
     rpc.output_generation = 1
     rpc.entries = [
