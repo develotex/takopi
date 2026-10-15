@@ -115,9 +115,15 @@ async def test_failure_timeout_and_exit_release_waiters(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("stop_reason", ["stop", "length"])
 async def test_run_starts_from_state_and_only_completes_at_settled(
-    fake_pi: Path, tmp_path: Path
+    fake_pi: Path, tmp_path: Path, stop_reason: str
 ) -> None:
+    fake_pi.write_text(
+        fake_pi.read_text().replace(
+            '"stopReason":"stop"', f'"stopReason":"{stop_reason}"'
+        )
+    )
     rpc = client(fake_pi, tmp_path)
     run = PiRpcRun(rpc)
     try:
@@ -131,6 +137,7 @@ async def test_run_starts_from_state_and_only_completes_at_settled(
         completed = [event for event in remaining if isinstance(event, CompletedEvent)]
         assert len(completed) == 1
         assert completed[0].answer == "final\u2028answer"
+        assert run.completed_answers == ["final\u2028answer"]
         assert completed[0].resume == started.resume
     finally:
         await rpc.close()

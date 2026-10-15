@@ -380,7 +380,9 @@ async def test_startup_buffer_persists_later_receipts_while_ack_network_is_held(
         async with anyio.create_task_group() as tg:
             if hasattr(svc, "attach_workers"):
                 svc.attach_workers(tg)
-            tg.start_soon(svc.buffer_starting, 1, 10, 33, "session", "/update First")
+            await svc.buffer_starting(1, 10, 33, "session", "/update First")
+            assert not entered.is_set(), "normal intake must be silent"
+            await svc._startup_reply(1, 10, 30, "An unrelated recovery failure")
             with anyio.fail_after(1):
                 await entered.wait()
             with anyio.fail_after(0.2):
@@ -751,7 +753,7 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
 
         monkeypatch.setattr(loop, "dispatch_command", fake_dispatch)
 
-    slow_quick = mode == "bound" and not command_first
+    slow_quick = False  # Questions now use the same durable owner as corrections.
     quick_entered = anyio.Event()
     quick_release = anyio.Event()
     cancel_entered = anyio.Event()
@@ -1033,6 +1035,13 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                     assert not steer_release.is_set(), (
                         "cancel must pass a held Pi steer response"
                     )
+            assert (
+                sum(
+                    call["message"].text.startswith("starting ·")
+                    for call in transport.send_calls
+                )
+                <= 1
+            ), "follow-ups must not announce additional starts"
             pending = await LiveInbox(resolve_inbox_path(config)).pending(str(rpc.path))
             if plugin_mode or mode in (
                 "bound_new_during_active",
@@ -1051,16 +1060,17 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                         await store.get_session_resume(-100, 77, "pi")
                     ) == ResumeToken("pi", str(path))
                     assert all(r.message_id != 2 for r in pending)
-                    if command_first:
-                        with anyio.fail_after(2):
-                            while not any(r.message_id == 3 for r in pending):
-                                await anyio.sleep(0.01)
-                                pending = await LiveInbox(
-                                    resolve_inbox_path(config)
-                                ).pending(str(rpc.path))
-                    assert [(r.message_id, r.text) for r in pending] == (
-                        [(3, "Не трогай авторизацию")] if command_first else []
-                    ), "message after rejected /new must retain the old live owner"
+                    with anyio.fail_after(2):
+                        while len(pending) != (2 if command_first else 1):
+                            await anyio.sleep(0.01)
+                            pending = await LiveInbox(
+                                resolve_inbox_path(config)
+                            ).pending(str(rpc.path))
+                    assert sorted((r.message_id, r.text) for r in pending) == (
+                        [(3, "Не трогай авторизацию"), (4, "Как дела?")]
+                        if command_first
+                        else [(3, "Как дела?")]
+                    ), "messages after rejected /new must retain the old live owner"
                 else:
                     assert all(r.message_id != 2 for r in pending)
                     assert (
@@ -1102,8 +1112,10 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 return
             if mode in ("bound_other_project", "unbound_other_project"):
                 assert [(r.message_id, r.text) for r in pending] == (
-                    [(3, "Не трогай авторизацию")] if command_first else []
-                ), "other-project directive must not reach this Pi"
+                    [(3, "Не трогай авторизацию"), (4, "Как дела?")]
+                    if command_first
+                    else [(3, "Как дела?")]
+                ), "other-project directive must not reach this Pi; questions must"
                 assert all("Please deploy change" not in text for text in rpc.sent)
                 assert (await store.get_context(-100, 77)) == RunContext(project="test")
                 return
@@ -1115,6 +1127,10 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 else ["Используй синий", "Не трогай авторизацию"]
                 if command_first
                 else ["Не трогай авторизацию"]
+            ) + (
+                ["Как дела?"]
+                if mode != "unbound_forward_after_update" or command_first
+                else []
             )
             if mode == "unbound_forward_after_update":
                 assert any(
@@ -1133,7 +1149,9 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 assert rpc.prompts[0].endswith("start")
             elif predebounce:
                 assert [item.state for item in pending] == (
-                    ["uncertain", "received"] if command_first else ["uncertain"]
+                    ["uncertain", "received", "received"]
+                    if command_first
+                    else ["uncertain", "received"]
                 )
                 assert rpc.prompts[0].endswith(
                     "Build original task"
@@ -1142,17 +1160,39 @@ async def test_real_loop_accepts_rapid_live_text_before_forward_coalescing(
                 ), "initial task must not be replaced by rapid text"
                 assert not rpc.sent
             elif command_first and not unbound:
-                assert [item.state for item in pending] == ["uncertain", "received"]
+                assert [item.state for item in pending] == [
+                    "uncertain",
+                    "received",
+                    "received",
+                ]
                 assert not rpc.sent, "local startup queue is not an accepted Pi prompt"
                 rpc.release.set()
                 with anyio.fail_after(2):
-                    while len(rpc.prompts) != 3:
+                    while len(rpc.prompts) != 4:
                         await anyio.sleep(0.01)
                 assert rpc.prompts[1].endswith("Используй синий")
                 assert rpc.prompts[2].endswith("Не трогай авторизацию")
             else:
-                assert all(item.state in ("submitted", "uncertain") for item in pending)
+                with anyio.fail_after(2):
+                    while any(r.state == "received" for r in pending) and not any(
+                        r.state == "uncertain" for r in pending
+                    ):
+                        await anyio.sleep(0.01)
+                        pending = await LiveInbox(resolve_inbox_path(config)).pending(
+                            str(rpc.path)
+                        )
+                assert all(
+                    item.state in ("submitted", "uncertain", "received")
+                    for item in pending
+                )
                 if any(item.state == "uncertain" for item in pending):
+                    first_uncertain = next(
+                        i for i, item in enumerate(pending) if item.state == "uncertain"
+                    )
+                    assert all(
+                        item.state == "received"
+                        for item in pending[first_uncertain + 1 :]
+                    ), "later questions cannot overtake ambiguous delivery"
                     assert not rpc.sent, "startup/cancel ambiguity is not acceptance"
                     if mode == "legacy" and not slow_quick:
                         rpc.release.set()
@@ -1416,6 +1456,12 @@ async def test_settlement_continuation_is_rendered_before_final_and_cancellable(
     receipt = await svc.inbox.receive(1, 10, 33, owner.session_key, "use green")
     runner.before_final = lambda: svc.flush(owner)
     runner.on_followup_started = lambda text: svc.followup_started(owner, text)
+    intermediate: list[str] = []
+
+    async def save_intermediate(text: str):
+        intermediate.append(text)
+
+    runner.on_intermediate_answer = save_intermediate
     emitted: list[CompletedEvent] = []
 
     async def consume():
@@ -1441,6 +1487,9 @@ async def test_settlement_continuation_is_rendered_before_final_and_cancellable(
         rpc.release_followup.set()
         await asyncio.wait_for(task, 1)
         assert [event.answer for event in emitted] == ["UPDATED FINAL RESULT"]
+        assert intermediate == ["outdated result"], (
+            "the earlier result was published before the correction, never as the final state"
+        )
 
 
 @pytest.mark.anyio

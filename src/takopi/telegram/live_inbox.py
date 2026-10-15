@@ -44,6 +44,9 @@ class Receipt:
     state: ReceiptState = "received"
     reason: str | None = None
     ever_attempted: bool | None = None  # None for pre-migration records: fail closed.
+    reply_pending: bool = False  # Old terminal records must not be reannounced.
+    reply_offset: int = 0
+    reply_sequence: int = 0
 
     @property
     def id(self) -> ReceiptId:
@@ -88,6 +91,20 @@ class _Record(msgspec.Struct):
     state: ReceiptState
     reason: str | None
     ever_attempted: bool | None = None
+    reply_pending: bool = False
+    reply_offset: int = 0
+    reply_sequence: int = 0
+
+
+class OutputReply(msgspec.Struct, frozen=True):
+    id: str
+    chat_id: int
+    thread_id: int
+    message_id: int
+    session_key: str
+    text: str
+    sequence: int
+    offset: int = 0
 
 
 class _State(msgspec.Struct):
@@ -95,6 +112,7 @@ class _State(msgspec.Struct):
     next_sequence: int
     receipts: list[_Record]
     initial_intents: list[_InitialRecord] = msgspec.field(default_factory=list)
+    outputs: list[OutputReply] = msgspec.field(default_factory=list)
 
 
 def _fresh_state() -> _State:
@@ -146,8 +164,22 @@ class LiveInbox(JsonStateStore[_State]):
                 state = msgspec.json.decode(self._path.read_bytes(), type=_State)
                 if state.version != STATE_VERSION:
                     raise ValueError(f"unsupported version {state.version}")
-                seen: set[ReceiptId] = set()
+                output_ids: set[str] = set()
                 sequences: set[int] = set()
+                for output in state.outputs:
+                    if (
+                        not output.id
+                        or output.id in output_ids
+                        or not output.session_key
+                        or output.sequence <= 0
+                        or output.sequence in sequences
+                        or not output.text
+                        or not 0 <= output.offset <= len(output.text)
+                    ):
+                        raise ValueError("Invalid durable output")
+                    output_ids.add(output.id)
+                    sequences.add(output.sequence)
+                seen: set[ReceiptId] = set()
                 markers: set[str] = set()
                 for item in state.receipts:
                     ident = (item.chat_id, item.thread_id, item.message_id)
@@ -156,6 +188,7 @@ class LiveInbox(JsonStateStore[_State]):
                         or item.sequence in sequences
                         or item.marker in markers
                         or not item.session_key
+                        or not 0 <= item.reply_offset <= len(item.reason or "")
                         or item.state
                         not in (
                             "received",
@@ -170,6 +203,10 @@ class LiveInbox(JsonStateStore[_State]):
                     seen.add(ident)
                     sequences.add(item.sequence)
                     markers.add(item.marker)
+                    if item.reply_sequence:
+                        if item.reply_sequence < 0 or item.reply_sequence in sequences:
+                            raise ValueError("Invalid answer sequence")
+                        sequences.add(item.reply_sequence)
                 if state.next_sequence <= max(sequences, default=0):
                     raise ValueError("invalid sequence cursor")
                 seen_intents: set[ReceiptId] = set()
@@ -463,6 +500,7 @@ class LiveInbox(JsonStateStore[_State]):
         reason: str | None = None,
         from_states: tuple[ReceiptState, ...],
         preserve_states: tuple[ReceiptState, ...] = (),
+        reply_pending: bool = False,
     ) -> Receipt:
         async with self._lock:
             self._reload_locked_if_needed()
@@ -473,6 +511,11 @@ class LiveInbox(JsonStateStore[_State]):
                 raise ValueError(f"Cannot move receipt from {item.state} to {state}")
             item.state = state
             item.reason = reason
+            item.reply_pending = reply_pending
+            item.reply_offset = 0
+            if reply_pending:
+                item.reply_sequence = self._state.next_sequence
+                self._state.next_sequence += 1
             self._save_locked()
             return _receipt(item)
 
@@ -576,10 +619,16 @@ class LiveInbox(JsonStateStore[_State]):
         if not reason.strip():
             raise ValueError("Consideration needs explicit main-agent evidence")
         return await self._transition(
-            receipt_id, "considered", reason=reason, from_states=("delivered",)
+            receipt_id,
+            "considered",
+            reason=reason,
+            from_states=("delivered",),
+            reply_pending=True,
         )
 
-    async def mark_deferred(self, receipt_id: ReceiptId, reason: str) -> Receipt:
+    async def mark_deferred(
+        self, receipt_id: ReceiptId, reason: str, *, reply_pending: bool = False
+    ) -> Receipt:
         if not reason.strip():
             raise ValueError("Deferral needs an explicit reason")
         return await self._transition(
@@ -587,4 +636,82 @@ class LiveInbox(JsonStateStore[_State]):
             "deferred",
             reason=reason,
             from_states=("received", "uncertain", "submitted", "delivered"),
+            reply_pending=reply_pending,
         )
+
+    async def pending_replies(self, session_key: str | None = None) -> list[Receipt]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                _receipt(r)
+                for r in self._state.receipts
+                if r.reply_pending
+                and r.state in ("considered", "deferred")
+                and (session_key is None or r.session_key == session_key)
+            ]
+
+    async def queue_output(
+        self, chat: int, thread: int, message: int, session: str, text: str
+    ) -> OutputReply:
+        if not text.strip():
+            raise ValueError("Cannot enqueue an empty substantive output")
+        async with self._lock:
+            self._reload_locked_if_needed()
+            output = OutputReply(
+                uuid4().hex,
+                chat,
+                thread,
+                message,
+                session,
+                text,
+                self._state.next_sequence,
+            )
+            self._state.next_sequence += 1
+            self._state.outputs.append(output)
+            self._save_locked()
+            return output
+
+    async def pending_outputs(self) -> list[OutputReply]:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            return [
+                output
+                for output in self._state.outputs
+                if output.offset < len(output.text)
+            ]
+
+    async def advance_output(self, output_id: str, offset: int) -> None:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            for index, output in enumerate(self._state.outputs):
+                if output.id == output_id:
+                    if not output.offset <= offset <= len(output.text):
+                        raise ValueError("Invalid output delivery offset")
+                    self._state.outputs[index] = msgspec.structs.replace(
+                        output, offset=offset
+                    )
+                    self._save_locked()
+                    return
+            raise ValueError("Unknown output")
+
+    async def advance_reply(self, receipt_id: ReceiptId, offset: int) -> None:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = self._required(receipt_id)
+            if not item.reply_pending or not item.reply_offset <= offset <= len(
+                item.reason or ""
+            ):
+                raise ValueError("Invalid reply delivery offset")
+            item.reply_offset = offset
+            self._save_locked()
+
+    async def mark_reply_sent(self, receipt_id: ReceiptId) -> None:
+        async with self._lock:
+            self._reload_locked_if_needed()
+            item = self._required(receipt_id)
+            if item.state not in ("considered", "deferred"):
+                raise ValueError(
+                    "Cannot acknowledge an answer before actual consideration"
+                )
+            item.reply_pending = False
+            self._save_locked()
