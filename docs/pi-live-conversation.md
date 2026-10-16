@@ -75,3 +75,11 @@ inference context and active steer with a synthetic task, conflicting correction
 (10 → 20), and a subsequent question remembering the corrected value; its Telegram
 callback is in-memory. This is not a production Telegram end-to-end or background-tool test.
 Deployment/restart is a separate operation, not implied by opening the PR.
+
+Successful durable publication can leave an intentionally empty final. The production
+executor wraps runners to hide resume lines and to prepend unsupported-option
+warnings; both wrappers must forward the live runner's dynamic
+`suppress_empty_final` property. Otherwise a correctly sent answer is followed by a
+false `error` card. Executor-level tests cover visible/hidden resume, warning on/off,
+progress none/once and published/absent/failed terminal answers. Actual empty or
+failed answers are still errors; the wrappers do not suppress them.
