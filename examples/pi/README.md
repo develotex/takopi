@@ -9,8 +9,8 @@ an active Takopi task merely to load it.
 
 The original JSON-only extension may remain installed: the new one runs only in
 RPC mode. Do not load a second RPC namer. It generates one name for a fresh,
-unnamed session, never renames a session with user history (including recovered
-sessions), and never overwrites a name set while generation was running.
+unnamed session, never renames a session with user history anywhere in the session
+(including recovered or branch-summary-only active branches), and never overwrites a name set while generation was running.
 Existing unnamed topics are not backfilled.
 
 ## Model and data
@@ -33,8 +33,12 @@ short naming instructions. It does not send tools, history or the main system
 prompt. Switching from Google to OpenRouter changes the recipient of that text.
 The naming model does not change the main conversation's model.
 
-Naming has a 10-second deadline and is canceled on session shutdown or switch.
-Errors and malformed output are nonfatal: the existing topic title remains.
+The preflight handler only captures text; the naming request is awaited in the
+first active `turn_start`, where Pi supplies a real operation signal. Naming has
+a 10-second deadline and is canceled with the active turn, session shutdown or
+switch. In particular, RPC abort during naming cannot acknowledge cancellation
+and then start a delayed main model request. Errors and malformed output are
+nonfatal: the existing topic title remains.
 Only a fixed, non-sensitive warning is emitted, not prompts, credentials or raw
 provider errors. Takopi currently discards extension UI notifications; do not
 mistake this warning for new Telegram error reporting.
@@ -51,10 +55,21 @@ requests with `extension_ui_response` / `cancelled: true`. Nothing is forwarded
 to Telegram and no action is automatically approved. Confirmations resolve to
 `false`, other dialogs to `undefined`, as specified by Pi. This also works for
 dialogs raised before the prompt has been accepted, so the task cannot deadlock
-waiting for the UI response. Fire-and-forget notifications/status/widget updates
-get no response. This policy applies to all Takopi-owned RPC clients, not Pi's
-interactive terminal mode. An extension is still responsible for respecting a
-negative confirmation result.
+waiting for the UI response. UI response writes have a one-second deadline;
+a stalled stdin fails the transport and releases waiting commands instead of
+parking the stdout reader forever. Fire-and-forget notifications/status/widget
+updates get no response. This policy applies to all Takopi-owned RPC clients, not
+Pi's interactive terminal mode. An extension is still responsible for respecting
+a negative confirmation result.
+
+**Startup compatibility limitation:** installed Pi 0.99.2 starts reading stdin
+only after initial `session_start` handlers finish. A dialog awaited by one of
+those handlers cannot consume even a cancellation. If a dialog arrives before
+the first RPC response, Takopi sends cancellation and fails startup explicitly
+(`task was not started`), rather than hanging or claiming success. It does not
+patch Pi internals, bypass the confirmation or continue the task. Such extensions
+must avoid startup dialogs, or Pi must be fixed upstream. This limitation does
+not apply to dialogs from `before_agent_start` after successful `get_state`.
 
 ## Verification
 

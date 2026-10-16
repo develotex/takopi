@@ -36,16 +36,16 @@ function cleanTitle(raw: string): string | undefined {
   if ([...title].length > MAX_TITLE_CHARS) {
     title = [...title].slice(0, MAX_TITLE_CHARS).join("").replace(/\s+\S*$/, "").trim();
   }
-  return title || undefined;
+  return EMOJI.some((emoji) => title.startsWith(`${emoji} `) && title.slice(emoji.length + 1).trim()) ? title : undefined;
 }
 
 export default function (pi: ExtensionAPI) {
-  let state: { eligible: boolean; started: boolean; sessionId: string; controller?: AbortController } | undefined;
+  let state: { eligible: boolean; started: boolean; sessionId: string; prompt?: string; controller?: AbortController } | undefined;
 
   pi.on("session_start", (_event, ctx) => {
     state?.controller?.abort();
     state = {
-      eligible: ctx.mode === "rpc" && !pi.getSessionName() && !hasUserMessages(ctx.sessionManager.getBranch()),
+      eligible: ctx.mode === "rpc" && !pi.getSessionName() && !hasUserMessages(ctx.sessionManager.getEntries()),
       started: false,
       sessionId: ctx.sessionManager.getSessionId(),
     };
@@ -53,25 +53,32 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", () => { state?.controller?.abort(); });
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
+    if (ctx.mode === "rpc" && state?.eligible && !state.started && !state.prompt) {
+      state.prompt = userPrompt(event.prompt);
+    }
+  });
+
+  // Preflight has no operation signal in Pi. Await network work only inside an
+  // active turn, where RPC abort owns the signal and prevents delayed main work.
+  pi.on("turn_start", async (_event, ctx) => {
     const current = state;
-    if (ctx.mode !== "rpc" || !current?.eligible || current.started || pi.getSessionName()) return;
-    const text = userPrompt(event.prompt);
-    if (!text) return;
+    if (ctx.mode !== "rpc" || !current?.eligible || current.started || !current.prompt || pi.getSessionName()) return;
+    const text = current.prompt;
     current.started = true;
     current.controller = new AbortController();
     // Fail closed as metadata-only work: never log provider errors or prompt text.
     const failed = () => ctx.ui.notify("Automatic RPC session title unavailable; keeping the existing topic title.", "warning");
     try {
       const model = ctx.modelRegistry.find(PROVIDER, MODEL_ID);
-      if (!model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+      if (!ctx.signal || ctx.signal.aborted || !model || !ctx.modelRegistry.hasConfiguredAuth(model)) {
         failed();
         return;
       }
       const signal = AbortSignal.any([
         current.controller.signal,
         AbortSignal.timeout(10_000),
-        ...(ctx.signal ? [ctx.signal] : []),
+        ctx.signal,
       ]);
       const response = await ctx.modelRegistry.streamSimple(model, {
         messages: [{

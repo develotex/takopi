@@ -87,6 +87,57 @@ async def test_dialog_reply_pipe_failure_releases_prompt_waiter(
 
 
 @pytest.mark.anyio
+async def test_startup_dialog_fails_closed_when_pi_cannot_process_replies_yet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = tmp_path / "startup_dialog_pi.py"
+    child.write_text(
+        "import json, sys, time\n"
+        "print(json.dumps({'type':'extension_ui_request','id':'startup','method':'confirm'}),flush=True)\n"
+        "time.sleep(10)\n"
+    )
+    monkeypatch.setattr("takopi.runners.pi_rpc._PI_COMMAND", sys.executable)
+    rpc = PiRpcClient(tmp_path / "startup.jsonl", tmp_path, ["-u", str(child)])
+    try:
+        with pytest.raises(RuntimeError, match="before startup readiness"):
+            await rpc.request("get_state", timeout=2)
+        assert rpc._pending == {}
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.anyio
+async def test_full_stdin_during_dialog_cancellation_fails_all_waiters_within_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child = tmp_path / "backpressure_pi.py"
+    child.write_text(
+        "import json, sys, time\n"
+        "first=json.loads(sys.stdin.buffer.readline())\n"
+        "print(json.dumps({'type':'response','id':first['id'],'success':True}),flush=True)\n"
+        "pending=json.loads(sys.stdin.buffer.readline())\n"
+        "sys.stdin.buffer.read(1)\n"
+        "print(json.dumps({'type':'extension_ui_request','id':'blocked','method':'confirm'}),flush=True)\n"
+        "print(json.dumps({'type':'response','id':pending['id'],'success':True}),flush=True)\n"
+        "time.sleep(10)\n"
+    )
+    monkeypatch.setattr("takopi.runners.pi_rpc._PI_COMMAND", sys.executable)
+    rpc = PiRpcClient(tmp_path / "backpressure.jsonl", tmp_path, ["-u", str(child)])
+    try:
+        await rpc.request("ready")
+        pending = asyncio.create_task(rpc.request("pending", timeout=3))
+        # Yield once so pending's complete short command precedes the large one.
+        await asyncio.sleep(0)
+        with pytest.raises(TimeoutError):
+            await rpc.request("large", timeout=0.2, message="x" * 2_000_000)
+        with pytest.raises(RuntimeError, match="stream failed"):
+            await pending
+        assert rpc._pending == {}
+    finally:
+        await rpc.close()
+
+
+@pytest.mark.anyio
 async def test_rpc_does_not_respond_to_notifications_and_preserves_state_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

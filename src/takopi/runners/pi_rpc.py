@@ -79,6 +79,7 @@ class PiRpcClient:
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._error: RuntimeError | None = None
+        self._received_response = False
 
     async def start(self) -> None:
         # Serialize creation with close: shutdown must never miss a child in flight.
@@ -217,11 +218,28 @@ class PiRpcClient:
                                 )
                                 + b"\n"
                             )
-                            async with self._write_lock:
-                                await self._proc.stdin.send(payload)
+                            # A stalled peer must not park the stdout reader
+                            # forever while holding command responses behind it.
+                            async with asyncio.timeout(1):
+                                async with self._write_lock:
+                                    await self._proc.stdin.send(payload)
+                            if not self._received_response:
+                                # Pi 0.99.2 installs its stdin handler only after
+                                # session_start handlers finish. It cannot consume
+                                # even a cancellation while a startup dialog waits.
+                                # Fail closed, rather than falsely claiming ready
+                                # or leaving the initial request waiting forever.
+                                self._fail(
+                                    RuntimeError(
+                                        "Pi RPC extension dialog before startup readiness; "
+                                        "task was not started"
+                                    )
+                                )
+                                return
                         # Fire-and-forget UI updates need no response; do not
                         # expose dialog text or notifications to another topic.
                     elif record.get("type") == "response":
+                        self._received_response = True
                         waiter = self._pending.get(record.get("id"))
                         if waiter is not None and not waiter.done():
                             waiter.set_result(record)
