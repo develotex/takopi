@@ -79,6 +79,7 @@ class PiRpcClient:
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._error: RuntimeError | None = None
+        self._received_response = False
 
     async def start(self) -> None:
         # Serialize creation with close: shutdown must never miss a child in flight.
@@ -194,7 +195,51 @@ class PiRpcClient:
                     record = msgspec.json.decode(line)
                     if not isinstance(record, dict):
                         raise RuntimeError("Pi RPC emitted a non-object record")
-                    if record.get("type") == "response":
+                    if record.get("type") == "extension_ui_request":
+                        # Takopi has no extension-dialog UI. Decline even before
+                        # prompt acceptance (session/before_agent_start handlers
+                        # may await a dialog). This is a one-way protocol reply:
+                        # Pi does not send a response, so register no waiter and
+                        # never await a request from inside the stdout reader.
+                        if record.get("method") in {
+                            "select",
+                            "confirm",
+                            "input",
+                            "editor",
+                        } and isinstance(record.get("id"), str):
+                            assert self._proc.stdin is not None
+                            payload = (
+                                msgspec.json.encode(
+                                    {
+                                        "type": "extension_ui_response",
+                                        "id": record["id"],
+                                        "cancelled": True,
+                                    }
+                                )
+                                + b"\n"
+                            )
+                            # A stalled peer must not park the stdout reader
+                            # forever while holding command responses behind it.
+                            async with asyncio.timeout(1):
+                                async with self._write_lock:
+                                    await self._proc.stdin.send(payload)
+                            if not self._received_response:
+                                # Pi 0.99.2 installs its stdin handler only after
+                                # session_start handlers finish. It cannot consume
+                                # even a cancellation while a startup dialog waits.
+                                # Fail closed, rather than falsely claiming ready
+                                # or leaving the initial request waiting forever.
+                                self._fail(
+                                    RuntimeError(
+                                        "Pi RPC extension dialog before startup readiness; "
+                                        "task was not started"
+                                    )
+                                )
+                                return
+                        # Fire-and-forget UI updates need no response; do not
+                        # expose dialog text or notifications to another topic.
+                    elif record.get("type") == "response":
+                        self._received_response = True
                         waiter = self._pending.get(record.get("id"))
                         if waiter is not None and not waiter.done():
                             waiter.set_result(record)
@@ -206,7 +251,14 @@ class PiRpcClient:
             self._fail(RuntimeError(f"Pi RPC process exited (rc={rc})"))
         except asyncio.CancelledError:
             raise
-        except (RuntimeError, OSError, ValueError, msgspec.DecodeError) as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ValueError,
+            msgspec.DecodeError,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ) as exc:
             self._fail(RuntimeError(f"Pi RPC stream failed: {exc}"))
 
     async def _watch_parent(self) -> None:
