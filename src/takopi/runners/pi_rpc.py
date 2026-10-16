@@ -194,7 +194,34 @@ class PiRpcClient:
                     record = msgspec.json.decode(line)
                     if not isinstance(record, dict):
                         raise RuntimeError("Pi RPC emitted a non-object record")
-                    if record.get("type") == "response":
+                    if record.get("type") == "extension_ui_request":
+                        # Takopi has no extension-dialog UI. Decline even before
+                        # prompt acceptance (session/before_agent_start handlers
+                        # may await a dialog). This is a one-way protocol reply:
+                        # Pi does not send a response, so register no waiter and
+                        # never await a request from inside the stdout reader.
+                        if record.get("method") in {
+                            "select",
+                            "confirm",
+                            "input",
+                            "editor",
+                        } and isinstance(record.get("id"), str):
+                            assert self._proc.stdin is not None
+                            payload = (
+                                msgspec.json.encode(
+                                    {
+                                        "type": "extension_ui_response",
+                                        "id": record["id"],
+                                        "cancelled": True,
+                                    }
+                                )
+                                + b"\n"
+                            )
+                            async with self._write_lock:
+                                await self._proc.stdin.send(payload)
+                        # Fire-and-forget UI updates need no response; do not
+                        # expose dialog text or notifications to another topic.
+                    elif record.get("type") == "response":
                         waiter = self._pending.get(record.get("id"))
                         if waiter is not None and not waiter.done():
                             waiter.set_result(record)
@@ -206,7 +233,14 @@ class PiRpcClient:
             self._fail(RuntimeError(f"Pi RPC process exited (rc={rc})"))
         except asyncio.CancelledError:
             raise
-        except (RuntimeError, OSError, ValueError, msgspec.DecodeError) as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ValueError,
+            msgspec.DecodeError,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ) as exc:
             self._fail(RuntimeError(f"Pi RPC stream failed: {exc}"))
 
     async def _watch_parent(self) -> None:
