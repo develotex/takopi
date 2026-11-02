@@ -1,0 +1,39 @@
+{
+  "package": "pi-subagents",
+  "version": "0.74.0",
+  "piVersion": "0.99.2",
+  "files": {
+    "package.json": {
+      "original": "7edd6b3125bfbadc0bb5bfcace28a3da158ac74c8ab20d550fa24a5aa06fd598",
+      "patched": "7edd6b3125bfbadc0bb5bfcace28a3da158ac74c8ab20d550fa24a5aa06fd598"
+    },
+    "src/extension/index.js": {
+      "original": "5734febf926c7d589d51a2b390d073a592aa588b43df0e6a07bba51ce6d05388",
+      "patched": "8fbc31b6d4e7e34064d806d576802a9015d321c96387998d53df05600a7b9436"
+    },
+    "src/runs/background/auto-drain.js": {
+      "original": "5c840bb015b3809fdb9a69b6d9cfbe2e0e95811f9d54fa83278249b352b6e96a",
+      "patched": "f982ff0949b2d277b15cb2b4bc65c7b4c3123a23981983db86dbaf54b0404a52"
+    },
+    "src/runs/background/notify.js": {
+      "original": "9fa4ec50da0d41b4256349befe86c5d8e8eaaba122817a4c9a71c303fa45089f",
+      "patched": "87ceec66e826c25d208cd80ed9867611697d446c4100cd67a1bac6cfe43548d1"
+    },
+    "src/runs/background/result-watcher.js": {
+      "original": "667ddcc95906b332a6eaffcddb78da28e2d1e9f86d72ed2eb58f998f18ebb0fb",
+      "patched": "614fd8d92f402e0da53825defbbf57288828140267fd8e4bb3974c1db4b203c8"
+    },
+    "src/runs/background/subagent-wait.js": {
+      "original": "36e07ffaee8042b8abe58522574f5bca4f2d86ad5ccb1da541a98855db9de71e",
+      "patched": "14c029e9a5a051c09d5f334f273408a4ba4359471e4b73711676040ec7c5acda"
+    },
+    "src/intercom/native-supervisor-channel.js": {
+      "original": "e1acc475e45f0d81814a5b6774830c9d0d1a46dfd9de727efe2110cf2e192033",
+      "patched": "d41fe52452053a3dd2ee2b9d762982ba5980372d8035918cabc2e7b09aacc203"
+    },
+    "src/extension/takopi-rpc-lifetime.js": {
+      "original": null,
+      "patched": "5ebca2c9d485d43e6534e95edf8e0227c45751d5d008b21995fd43acbb6d5a49"
+    }
+  }
+}

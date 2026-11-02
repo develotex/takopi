@@ -69,6 +69,28 @@ jobs:
             uv run --no-sync python -m coverage report || true
           } >> "$GITHUB_STEP_SUMMARY"
 
+  pi-rpc-lifetime:
+    name: pinned Pi RPC lifetime
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.22.3"
+      - name: Install isolated pinned runtime packages
+        run: npm install --prefix "$RUNNER_TEMP/pi-rpc-packages" --ignore-scripts @earendil-works/pi-coding-agent@0.99.2 pi-subagents@0.74.0
+      - name: Prepare and verify compatibility copy
+        run: |
+          python3 scripts/prepare_pi_rpc_lifetime.py --source "$RUNNER_TEMP/pi-rpc-packages/node_modules/pi-subagents" --destination "$RUNNER_TEMP/pi-rpc-copy" --pi-package "$RUNNER_TEMP/pi-rpc-packages/node_modules/@earendil-works/pi-coding-agent"
+          python3 scripts/prepare_pi_rpc_lifetime.py --verify --destination "$RUNNER_TEMP/pi-rpc-copy" --pi-package "$RUNNER_TEMP/pi-rpc-packages/node_modules/@earendil-works/pi-coding-agent"
+      - name: Run all Pi example tests including real no-network lifecycle
+        env:
+          SUBAGENTS_ROOT: ${{ runner.temp }}/pi-rpc-copy
+          PI_PACKAGE_ROOT: ${{ runner.temp }}/pi-rpc-packages/node_modules/@earendil-works/pi-coding-agent
+          LIFETIME_SCRATCH_ROOT: ${{ runner.temp }}
+        run: node --test examples/pi/*.test.mjs
+
   notify-commit:
     name: notify-commit
     runs-on: ubuntu-latest

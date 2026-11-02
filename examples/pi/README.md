@@ -1,5 +1,11 @@
 # RPC session naming for Pi
 
+For the separate opt-in **Pi 0.99.2 / pi-subagents 0.74.0 background lifetime**
+integration, reproducible package-copy preparation, deployment limits and real
+no-network lifecycle tests, see
+[`patches/pi-subagents-0.74.0/README.md`](../../patches/pi-subagents-0.74.0/README.md).
+It is not installed automatically and does not replace the naming extension.
+
 `session-title-rpc.ts` is an optional, standalone Pi extension based on the
 personal JSON-mode `session-title.ts` pattern. Takopi does not install or enable
 it automatically. Copy **only** this `.ts` file into `~/.pi/agent/extensions/`,

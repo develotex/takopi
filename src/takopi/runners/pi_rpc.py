@@ -26,6 +26,18 @@ _LIVE_CLAIM_USERS = 0
 _END = object()
 
 
+def _check_lifetime_error(record: dict[str, Any]) -> None:
+    # Pi reports awaited extension-handler failures and may still emit a normal
+    # agent_settled. Only the opt-in compatibility contract is terminal here.
+    if (
+        record.get("type") == "extension_error"
+        and record.get("event") == "agent_end"
+        and isinstance(record.get("error"), str)
+        and record["error"].startswith("TAKOPI_RPC_LIFETIME:")
+    ):
+        raise RuntimeError(f"Pi RPC background lifetime failed: {record['error']}")
+
+
 @contextmanager
 def enable_live_claims() -> Iterator[None]:
     """Enable shared ownership only while a live-enabled Telegram loop is running."""
@@ -356,6 +368,7 @@ class PiRpcRun:
         # Never submit a new prompt until the old run's boundary is consumed.
         async with asyncio.timeout(30):
             async for record in self.client.events():
+                _check_lifetime_error(record)
                 if record.get("type") == "agent_settled":
                     self._unsettled = False
                     return
@@ -416,6 +429,7 @@ class PiRpcRun:
             self._prompt_started = True
             meta = {"cwd": str(self.client.cwd), "control": self}
             async for record in self.client.events():
+                _check_lifetime_error(record)
                 kind = record.get("type")
                 if kind == "message_end":
                     message = record.get("message")

@@ -1,0 +1,159 @@
+--- a/src/extension/index.js
++++ b/src/extension/index.js
+@@ -59,6 +59,7 @@
+ import { registerSubagentToolActivation } from "./tool-activation.js";
+ import { createWaitSubscriptionManager } from "../runs/background/wait-subscriptions.js";
+ import { drainOutstandingWork } from "../runs/background/auto-drain.js";
++import { drainRpcLifetime } from "./takopi-rpc-lifetime.js";
+ import registerSubagentNotify, { parseSubagentNotifyContent } from "../runs/background/notify.js";
+ import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE } from "./steering-notices.js";
+ import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.js";
+@@ -310,7 +311,12 @@
+     const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
+     const mainWatchdog = registerMainWatchdog(pi);
+     const resultDeliveryOwnership = createResultDeliveryOwnership(state);
+-    const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership });
++    let rpcLifetimeSignal;
++    const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership, canTriggerTurn: () => !rpcLifetimeSignal?.aborted });
++    pi.on("agent_start", (_event, ctx) => {
++        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true)
++            rpcLifetimeSignal = ctx.signal;
++    });
+     let retainedNestedRouteTracker;
+     const fleetStatus = fleetViewEnabled
+         ? new SubagentFleetStatus(state, async (itemKey) => {
+@@ -681,7 +687,15 @@
+             event.systemPromptOptions.sections.advertised_subagents = catalog;
+     });
+     registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager, waitToolConfig.defaultTimeoutMs, undefined, supervisorChannel.hasPendingRequests);
++    const rpcSupervisorReplies = new Map();
++    pi.on("tool_result", (event, ctx) => {
++        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true && event.toolName === "subagent_supervisor" && !event.isError && typeof event.details?.replyTo === "string")
++            rpcSupervisorReplies.set(event.details.runId, { ...event.details, deadline: Date.now() + 5000 });
++    });
++    pi.registerFlag("takopi-rpc-lifetime", { type: "boolean", default: false, description: "Keep per-turn Takopi RPC alive through owned background completion (Pi 0.99.2 compatibility)" });
+     pi.on("agent_end", async (_event, ctx) => {
++        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true)
++            await drainRpcLifetime({ ctx, state, events: pi.events, supervisorChannel, completionNotifier, resultWatcher, supervisorReplies: rpcSupervisorReplies });
+         if (!ctx.hasUI)
+             await drainOutstandingWork({ state, events: pi.events, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests });
+         const ownerSessionId = state.currentSessionId;
+--- a/src/runs/background/auto-drain.js
++++ b/src/runs/background/auto-drain.js
+@@ -31,6 +31,7 @@
+         const hasWork = deps.hasWork ?? ((id, time) => hasOutstandingWork(deps, id, time, observation));
+         const wait = deps.wait ?? waitForSubagents;
+         while (true) {
++            deps.signal?.throwIfAborted();
+             if (deps.state.currentSessionId !== sessionId)
+                 throw new Error("Auto-drain stopped because the active session changed.");
+             if (deps.hasPendingSupervisorRequest?.())
+@@ -43,7 +44,7 @@
+             if (remainingMs <= 0) {
+                 throw new Error(`Auto-drain timed out after ${timeoutMs}ms with background work still active in session '${sessionId}'.`);
+             }
+-            const waitResult = await wait({ all: true, timeoutMs: remainingMs }, undefined, {
++            const waitResult = await wait({ all: true, timeoutMs: remainingMs }, deps.signal, {
+                 state: deps.state,
+                 asyncDirRoot: deps.asyncDirRoot,
+                 resultsDir: deps.resultsDir,
+@@ -54,7 +55,9 @@
+                 failOnFailedRuns: true,
+                 failOnAttention: true,
+                 hasPendingSupervisorRequest: deps.hasPendingSupervisorRequest,
++                ...(deps.isAttention ? { isAttention: deps.isAttention } : {}),
+             });
++            deps.signal?.throwIfAborted();
+             if (waitResult.isError) {
+                 throw new Error(`Auto-drain failed for session '${sessionId}': ${resultText(waitResult) || "bg_wait returned an error without details"}.`);
+             }
+--- a/src/runs/background/notify.js
++++ b/src/runs/background/notify.js
+@@ -626,7 +626,9 @@
+             void claim.outcome.then((outcome) => settle([item], outcome, outcome ? undefined : "send_failed"));
+         }
+         const claimedItems = claimed.map(({ item }) => item);
+-        const sent = sendCompletion(pi, claimedItems);
++        const sent = sendCompletion(pi, options.canTriggerTurn?.() === false
++            ? claimedItems.map((item) => ({ ...item, triggerTurn: false }))
++            : claimedItems);
+         for (const { claim } of claimed)
+             claim.settle?.(sent);
+         settle(claimedItems, sent, sent ? "send_accepted" : "send_failed");
+@@ -717,6 +719,10 @@
+     return {
+         deliver,
+         hasPendingDelivery: () => pending.size > 0,
++        flushPendingDelivery() {
++            for (const batcher of batchers.values())
++                batcher.flush();
++        },
+         dispose() {
+             if (disposed)
+                 return;
+--- a/src/runs/background/result-watcher.js
++++ b/src/runs/background/result-watcher.js
+@@ -759,6 +759,6 @@
+         processing.clear();
+         identityCache.clear();
+     };
+-    return { startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
++    return { hasPendingDelivery: () => processing.size > 0 || pendingTriggerTurn.size > 0, startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
+ }
+ //# sourceMappingURL=result-watcher.js.map--- a/src/runs/background/subagent-wait.js
++++ b/src/runs/background/subagent-wait.js
+@@ -209,7 +209,7 @@
+ }
+ /** Runs (from the initial set) currently flagged needs_attention, for reporting. */
+ function attentionRunsForSession(params, deps, initialIds) {
+-    return activeRunsForSession(params, deps).filter((run) => needsAttention(run) && initialIds.has(run.id));
++    return activeRunsForSession(params, deps).filter((run) => (deps.isAttention ?? needsAttention)(run) && initialIds.has(run.id));
+ }
+ /** Exact initial runs in any state, for the final summary. */
+ function runsForIds(runIds, deps) {
+@@ -614,7 +614,7 @@
+     const initialProviderNames = new Set(providerActive.map((item) => item.provider));
+     const initialCount = initialAsyncIds.size + initialProviderIds.size;
+     const stopOnAttention = params.stopOnAttention ?? deps.stopOnAttention !== false;
+-    let attention = active.filter((run) => needsAttention(run));
++    let attention = active.filter((run) => (deps.isAttention ?? needsAttention)(run));
+     let supervisorBarrier = false;
+     const isDone = () => {
+         if (deps.hasPendingSupervisorRequest?.()) {
+--- a/src/intercom/native-supervisor-channel.js
++++ b/src/intercom/native-supervisor-channel.js
+@@ -557,6 +557,7 @@
+         return state;
+     };
+     const pending = new Map();
++    const queuedSupervisorWakes = new Set();
+     const requestCorrelations = new Map();
+     const correlationKey = (request) => {
+         if (!request.toolCallId)
+@@ -713,6 +714,7 @@
+                         replyHint: supervisorReplyHint(request.id),
+                     },
+                 }, { triggerTurn: true });
++                queuedSupervisorWakes.add(request.id);
+             }
+             catch (error) {
+                 console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
+@@ -889,11 +891,18 @@
+                 timers.clearImmediate(deferredWatcherRefresh);
+             deferredWatcherRefresh = undefined;
+             pending.clear();
++            queuedSupervisorWakes.clear();
+             requestCorrelations.clear();
+             seenFiles.clear();
+         },
+         pending,
+         getSupervisorRequestState,
++        hasQueuedSupervisorWake: () => {
++            for (const id of queuedSupervisorWakes)
++                if (!pending.has(id)) queuedSupervisorWakes.delete(id);
++            return pending.size > 0 && [...pending.keys()].every(id => queuedSupervisorWakes.has(id));
++        },
++        hasResolvedReply: ({ replyTo, runId, agent }) => [...requestCorrelations.values()].some(({ request, state: lifecycle }) => request.id === replyTo && request.runId === runId && request.agent === agent && lifecycle === "resolved"),
+     };
+ }
+ //# sourceMappingURL=native-supervisor-channel.js.map
