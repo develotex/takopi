@@ -1,0 +1,71 @@
+{
+  "package": "pi-subagents",
+  "version": "0.74.0",
+  "piVersion": "0.99.2",
+  "files": {
+    "package.json": {
+      "original": "7edd6b3125bfbadc0bb5bfcace28a3da158ac74c8ab20d550fa24a5aa06fd598",
+      "patched": "7edd6b3125bfbadc0bb5bfcace28a3da158ac74c8ab20d550fa24a5aa06fd598"
+    },
+    "src/extension/index.js": {
+      "original": "5734febf926c7d589d51a2b390d073a592aa588b43df0e6a07bba51ce6d05388",
+      "patched": "42d1eef9da1156434b694151ae00db1cf1368ec33951c9a0c1a59429e1f1cb5c"
+    },
+    "src/runs/background/auto-drain.js": {
+      "original": "5c840bb015b3809fdb9a69b6d9cfbe2e0e95811f9d54fa83278249b352b6e96a",
+      "patched": "75e26fd52d02f6de37f268dc80124a67728ce7dd9cc348aed53cea9f0a82fe0e"
+    },
+    "src/runs/background/notify.js": {
+      "original": "9fa4ec50da0d41b4256349befe86c5d8e8eaaba122817a4c9a71c303fa45089f",
+      "patched": "87ceec66e826c25d208cd80ed9867611697d446c4100cd67a1bac6cfe43548d1"
+    },
+    "src/runs/background/result-watcher.js": {
+      "original": "667ddcc95906b332a6eaffcddb78da28e2d1e9f86d72ed2eb58f998f18ebb0fb",
+      "patched": "614fd8d92f402e0da53825defbbf57288828140267fd8e4bb3974c1db4b203c8"
+    },
+    "src/runs/background/subagent-wait.js": {
+      "original": "36e07ffaee8042b8abe58522574f5bca4f2d86ad5ccb1da541a98855db9de71e",
+      "patched": "14c029e9a5a051c09d5f334f273408a4ba4359471e4b73711676040ec7c5acda"
+    },
+    "src/intercom/native-supervisor-channel.js": {
+      "original": "e1acc475e45f0d81814a5b6774830c9d0d1a46dfd9de727efe2110cf2e192033",
+      "patched": "167d17c0de1f6f203cbbfbd767f6191ff0edc76e8e8225960559aa8b07bc7589"
+    },
+    "src/extension/control-notices.js": {
+      "original": "c1ae88f8acc2a7bdc0ce0f485e3f49c6f65d7325632ea52b9d15b4d58cf4416c",
+      "patched": "58ee5d5a4d2e204c11660641817a6fd4ad269db91786f11cb2fb65c9d6a5d6da"
+    },
+    "src/extension/steering-notices.js": {
+      "original": "3cd4514b835015630a91ca022187b0bd90ef955f4bd4f50e95b47518f0d6bd15",
+      "patched": "7126408727da59603baf47f9c5f0a779ebdcf646524ad2e0b3756c2caa0e891e"
+    },
+    "src/runs/background/wait-subscriptions.js": {
+      "original": "26d11b5d9371830a6056d27a10fc8fa684b8a0768c9b72a4e7803a4b8e0192f6",
+      "patched": "259f17892151a40c30c66274154beb68726438e277a2c6cb488066c7e1b82d73"
+    },
+    "src/runs/foreground/subagent-executor.js": {
+      "original": "a75dfc6215c909c905f9cbc54773db92c493e3425beea42a932c79cf1d44d035",
+      "patched": "02e497a887f53732293b54c98fd47eb3109da2ed58e1ce42baa4a1cce12178e6"
+    },
+    "src/watchdog/register-main.js": {
+      "original": "f793d900d9780c76fc86dbc519dd6de85f19027b7e782b84956a2ad8750a78d0",
+      "patched": "ae5a9d6b367121baec7fffa3c3c88cfe6d63f50d386289bdb8e14aa60675591e"
+    },
+    "src/extension/takopi-rpc-lifetime.js": {
+      "original": null,
+      "patched": "c41b82fdb823e3165954744c4863ceb141e777d23b29cbc2936e5e7b62483b20"
+    },
+    "src/extension/schemas.js": {
+      "original": "ad2e2a7708fc2f5fcf06b94358f87c894c34dac8388c79f6f8931dfa7766f81e",
+      "patched": "b5f3915e9cb440ecbd83273690c4b179e2c5ed0bb409e6712b779bdebfb32cc7"
+    },
+    "src/runs/background/async-execution.js": {
+      "original": "52d54705ffce04e8714c615c89409b56b913f09e3efa1a13891f33c29478cb03",
+      "patched": "5a284af9df9112425163bb8a96d28dff79073779a06ef16ed4a9be5fa322006c"
+    },
+    "src/runs/shared/subagent-prompt-runtime.js": {
+      "original": "cb20768f7c3f1f842ce941b5e351a15de273a5791778a0a44b7d1a1ff63f2888",
+      "patched": "a256d950356c298fd1c94d4b08c3ae018aec29544b45182f17de161b543a2645"
+    }
+  }
+}

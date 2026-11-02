@@ -26,6 +26,27 @@ _LIVE_CLAIM_USERS = 0
 _END = object()
 
 
+def _check_lifetime_error(
+    record: dict[str, Any], *, expected_cancel: bool = False
+) -> None:
+    # Pi reports awaited extension-handler failures and may still emit a normal
+    # agent_settled. Only the opt-in compatibility contract is terminal here.
+    if (
+        record.get("type") == "extension_error"
+        and record.get("event") == "agent_end"
+        and isinstance(record.get("error"), str)
+        and record["error"].startswith("TAKOPI_RPC_LIFETIME:")
+    ):
+        # Only a machine-coded abort for our own explicit cancellation is
+        # expected. Still consume agent_settled; do not hide child/drain errors
+        # or an unsolicited/foreign cancellation marker.
+        if expected_cancel and record["error"].startswith(
+            "TAKOPI_RPC_LIFETIME:CANCELLED:"
+        ):
+            return
+        raise RuntimeError(f"Pi RPC background lifetime failed: {record['error']}")
+
+
 @contextmanager
 def enable_live_claims() -> Iterator[None]:
     """Enable shared ownership only while a live-enabled Telegram loop is running."""
@@ -79,6 +100,7 @@ class PiRpcClient:
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._error: RuntimeError | None = None
+        self._received_response = False
 
     async def start(self) -> None:
         # Serialize creation with close: shutdown must never miss a child in flight.
@@ -194,7 +216,51 @@ class PiRpcClient:
                     record = msgspec.json.decode(line)
                     if not isinstance(record, dict):
                         raise RuntimeError("Pi RPC emitted a non-object record")
-                    if record.get("type") == "response":
+                    if record.get("type") == "extension_ui_request":
+                        # Takopi has no extension-dialog UI. Decline even before
+                        # prompt acceptance (session/before_agent_start handlers
+                        # may await a dialog). This is a one-way protocol reply:
+                        # Pi does not send a response, so register no waiter and
+                        # never await a request from inside the stdout reader.
+                        if record.get("method") in {
+                            "select",
+                            "confirm",
+                            "input",
+                            "editor",
+                        } and isinstance(record.get("id"), str):
+                            assert self._proc.stdin is not None
+                            payload = (
+                                msgspec.json.encode(
+                                    {
+                                        "type": "extension_ui_response",
+                                        "id": record["id"],
+                                        "cancelled": True,
+                                    }
+                                )
+                                + b"\n"
+                            )
+                            # A stalled peer must not park the stdout reader
+                            # forever while holding command responses behind it.
+                            async with asyncio.timeout(1):
+                                async with self._write_lock:
+                                    await self._proc.stdin.send(payload)
+                            if not self._received_response:
+                                # Pi 0.99.2 installs its stdin handler only after
+                                # session_start handlers finish. It cannot consume
+                                # even a cancellation while a startup dialog waits.
+                                # Fail closed, rather than falsely claiming ready
+                                # or leaving the initial request waiting forever.
+                                self._fail(
+                                    RuntimeError(
+                                        "Pi RPC extension dialog before startup readiness; "
+                                        "task was not started"
+                                    )
+                                )
+                                return
+                        # Fire-and-forget UI updates need no response; do not
+                        # expose dialog text or notifications to another topic.
+                    elif record.get("type") == "response":
+                        self._received_response = True
                         waiter = self._pending.get(record.get("id"))
                         if waiter is not None and not waiter.done():
                             waiter.set_result(record)
@@ -206,7 +272,14 @@ class PiRpcClient:
             self._fail(RuntimeError(f"Pi RPC process exited (rc={rc})"))
         except asyncio.CancelledError:
             raise
-        except (RuntimeError, OSError, ValueError, msgspec.DecodeError) as exc:
+        except (
+            RuntimeError,
+            OSError,
+            ValueError,
+            msgspec.DecodeError,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ) as exc:
             self._fail(RuntimeError(f"Pi RPC stream failed: {exc}"))
 
     async def _watch_parent(self) -> None:
@@ -304,6 +377,14 @@ class PiRpcRun:
         # Never submit a new prompt until the old run's boundary is consumed.
         async with asyncio.timeout(30):
             async for record in self.client.events():
+                _check_lifetime_error(
+                    record,
+                    expected_cancel=self._interrupting
+                    or (
+                        self.cancel_requested is not None
+                        and self.cancel_requested.is_set()
+                    ),
+                )
                 if record.get("type") == "agent_settled":
                     self._unsettled = False
                     return
@@ -364,6 +445,14 @@ class PiRpcRun:
             self._prompt_started = True
             meta = {"cwd": str(self.client.cwd), "control": self}
             async for record in self.client.events():
+                _check_lifetime_error(
+                    record,
+                    expected_cancel=self._interrupting
+                    or (
+                        self.cancel_requested is not None
+                        and self.cancel_requested.is_set()
+                    ),
+                )
                 kind = record.get("type")
                 if kind == "message_end":
                     message = record.get("message")
