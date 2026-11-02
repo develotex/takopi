@@ -88,6 +88,7 @@ def prepare(source: Path, destination: Path, pi: Path) -> None:
                 "patch",
                 "--batch",
                 "--forward",
+                "--fuzz=0",
                 "-p1",
                 "-i",
                 str((PATCH_ROOT / "rpc-lifetime.patch").resolve()),

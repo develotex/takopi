@@ -1,3 +1,14 @@
+--- a/src/extension/control-notices.js
++++ b/src/extension/control-notices.js
+@@ -18,7 +18,7 @@
+         content: noticeText,
+         display: true,
+         details: { ...input.details, childIntercomTarget, noticeText },
+-    }, { triggerTurn: input.details.source === "async" });
++    }, { triggerTurn: input.details.source === "async" && input.canTriggerTurn?.() !== false });
+ }
+ export function handleSubagentControlNotice(input) {
+     if (!input.details?.event || input.details.event.type === "active_long_running")
 --- a/src/extension/index.js
 +++ b/src/extension/index.js
 @@ -59,6 +59,7 @@
@@ -41,7 +52,7 @@
          pi,
          state,
          config,
-@@ -681,7 +690,20 @@
+@@ -681,9 +690,22 @@
              event.systemPromptOptions.sections.advertised_subagents = catalog;
      });
      registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager, waitToolConfig.defaultTimeoutMs, undefined, supervisorChannel.hasPendingRequests);
@@ -60,8 +71,11 @@
 +        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true)
 +            await drainRpcLifetime({ ctx, state, events: pi.events, supervisorChannel, completionNotifier, resultWatcher, supervisorReplies: rpcSupervisorReplies });
          if (!ctx.hasUI)
-             await drainOutstandingWork({ state, events: pi.events, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests });
+-            await drainOutstandingWork({ state, events: pi.events, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests });
++            await drainOutstandingWork({ state, events: pi.events, signal: ctx.signal, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests });
          const ownerSessionId = state.currentSessionId;
+         if (!ownerSessionId)
+             return;
 @@ -695,6 +717,7 @@
                  handleSubagentControlNotice({
                      pi,
@@ -108,9 +122,130 @@
          try {
              await disposeChildSessions();
          }
+--- a/src/extension/schemas.js
++++ b/src/extension/schemas.js
+@@ -217,7 +217,7 @@
+         description: "fresh/fork overrides every child; profile requires agent's declared defaultContext, ignoring config. Omitted: defaultSubagentContext wins over each agent defaultContext; implicit fork needs persisted parent + leaf, else fresh. forkContext may prune forks before spawn.",
+     })),
+     async: Type.Optional(Type.Boolean({ description: "Background; default asyncByDefault. false only to block parent." })),
+-    timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs; must agree." })),
++    timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional runtime deadline in ms. Omitted means no runtime deadline unless explicitly configured by agent/config or inherited from a parent. Async composites have no default parent deadline. Alias maxRuntimeMs; must agree." })),
+     maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs (same defaults)." })),
+     checkpointBeforeDeadlineMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 2_147_483_647, description: "Async single-agent runs only: the runner requests that the child checkpoint and stop this many ms before the run deadline (best-effort; the deadline kill still applies)." })),
+     toolTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Per-tool deadline (ms); fast builtins default 5m." })),
+--- a/src/extension/steering-notices.js
++++ b/src/extension/steering-notices.js
+@@ -18,6 +18,6 @@
+         content: noticeText,
+         display: true,
+         details: { ...input.details, noticeText },
+-    }, { triggerTurn: true });
++    }, { triggerTurn: input.canTriggerTurn?.() !== false });
+ }
+ //# sourceMappingURL=steering-notices.js.map
+\ No newline at end of file
+--- a/src/intercom/native-supervisor-channel.js
++++ b/src/intercom/native-supervisor-channel.js
+@@ -557,6 +557,7 @@
+         return state;
+     };
+     const pending = new Map();
++    const queuedSupervisorWakes = new Set();
+     const requestCorrelations = new Map();
+     const correlationKey = (request) => {
+         if (!request.toolCallId)
+@@ -664,6 +665,16 @@
+         }
+     };
+     const poll = () => {
++        if (deps.canTriggerTurn?.() === false) {
++            // Preserve the exact request file and allow normal polling to
++            // enqueue it after a fresh explicit operation. Never acknowledge
++            // a suppressed ask as seen/delivered, including asks cleared by abort.
++            for (const request of pending.values()) {
++                seenFiles.delete(request.requestFile);
++                queuedSupervisorWakes.delete(request.id);
++            }
++            return;
++        }
+         cleanupStaleChannelsIfDue();
+         // Only display notifications require a live UI context, not request registration.
+         refreshPendingRequests(pending, state, observeRequestLifecycle, runState);
+@@ -713,6 +724,7 @@
+                         replyHint: supervisorReplyHint(request.id),
+                     },
+                 }, { triggerTurn: true });
++                queuedSupervisorWakes.add(request.id);
+             }
+             catch (error) {
+                 console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
+@@ -889,11 +901,18 @@
+                 timers.clearImmediate(deferredWatcherRefresh);
+             deferredWatcherRefresh = undefined;
+             pending.clear();
++            queuedSupervisorWakes.clear();
+             requestCorrelations.clear();
+             seenFiles.clear();
+         },
+         pending,
+         getSupervisorRequestState,
++        hasQueuedSupervisorWake: () => {
++            for (const id of queuedSupervisorWakes)
++                if (!pending.has(id)) queuedSupervisorWakes.delete(id);
++            return pending.size > 0 && [...pending.keys()].every(id => queuedSupervisorWakes.has(id));
++        },
++        hasResolvedReply: ({ replyTo, runId, agent }) => [...requestCorrelations.values()].some(({ request, state: lifecycle }) => request.id === replyTo && request.runId === runId && request.agent === agent && lifecycle === "resolved"),
+     };
+ }
+ //# sourceMappingURL=native-supervisor-channel.js.map
+\ No newline at end of file
+--- a/src/runs/background/async-execution.js
++++ b/src/runs/background/async-execution.js
+@@ -129,7 +129,8 @@
+         && nodeExecutable === process.execPath
+         && !sourceUnderNodeModules;
+ }
+-export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
++// Compatibility export; no built-in child runtime deadline.
++export const DEFAULT_ASYNC_TIMEOUT_MS = undefined;
+ export function formatAsyncStartedMessage(headline, interactive) {
+     const guidance = interactive
+         ? [
+@@ -718,6 +719,10 @@
+     };
+     const buildSeqStep = (s, sessionFile, behaviorCwd, progressPrecreated = false, resolvedBehavior, flatIndex, parallelOutputNamespace, runFanoutPath) => {
+         const a = agents.find((x) => x.name === s.agent);
++        // Runner steps feed setTimeout directly. Reject invalid configured
++        // limits here, including Node's overflow-to-1ms range, before launch.
++        if (a.defaultTimeoutMs !== undefined && (typeof a.defaultTimeoutMs !== "number" || !Number.isInteger(a.defaultTimeoutMs) || a.defaultTimeoutMs <= 0 || a.defaultTimeoutMs > 2_147_483_647))
++            throw new AsyncStartValidationError(`Agent '${a.name}' timeoutMs must be a positive integer no larger than 2147483647.`);
+         const effectiveBehavior = resolvedBehavior ?? suppressProgressForReadOnlyTask(resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
+         const requestedMachine = s.machine ?? launchMachine ?? a.machine;
+         const externalRunner = a.runner?.type === "external-cli" || a.runner?.type === "external-job";
+@@ -919,7 +924,7 @@
+             outputMode: behavior.outputMode,
+             sessionFile,
+             maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
+-            timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS,
++            ...(a.defaultTimeoutMs !== undefined ? { timeoutMs: a.defaultTimeoutMs } : {}),
+             toolTimeoutMs: resolvedToolTimeout.toolTimeoutMs,
+             waitToolEnabled: params.waitToolEnabled,
+             waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
 --- a/src/runs/background/auto-drain.js
 +++ b/src/runs/background/auto-drain.js
-@@ -31,6 +31,7 @@
+@@ -24,13 +24,16 @@
+         if (!sessionId)
+             throw new Error("Cannot auto-drain background work without an active session identity.");
+         const now = deps.now ?? Date.now;
+-        const timeoutMs = deps.timeoutMs ?? DEFAULT_AUTO_DRAIN_TIMEOUT_MS;
+-        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
++        // A finite wait window is not a lifetime deadline. Only a caller's
++        // explicit timeout bounds the complete drain; omitted means unbounded.
++        const timeoutMs = deps.timeoutMs;
++        if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0))
+             throw new Error("Auto-drain timeoutMs must be a positive finite number.");
+-        const deadlineAt = now() + timeoutMs;
++        const deadlineAt = timeoutMs === undefined ? undefined : now() + timeoutMs;
          const hasWork = deps.hasWork ?? ((id, time) => hasOutstandingWork(deps, id, time, observation));
          const wait = deps.wait ?? waitForSubagents;
          while (true) {
@@ -118,7 +253,12 @@
              if (deps.state.currentSessionId !== sessionId)
                  throw new Error("Auto-drain stopped because the active session changed.");
              if (deps.hasPendingSupervisorRequest?.())
-@@ -43,7 +44,7 @@
+@@ -39,11 +42,11 @@
+             observation?.predicate(work);
+             if (!work)
+                 break;
+-            const remainingMs = deadlineAt - now();
++            const remainingMs = deadlineAt === undefined ? DEFAULT_AUTO_DRAIN_TIMEOUT_MS : Math.min(DEFAULT_AUTO_DRAIN_TIMEOUT_MS, deadlineAt - now());
              if (remainingMs <= 0) {
                  throw new Error(`Auto-drain timed out after ${timeoutMs}ms with background work still active in session '${sessionId}'.`);
              }
@@ -127,7 +267,7 @@
                  state: deps.state,
                  asyncDirRoot: deps.asyncDirRoot,
                  resultsDir: deps.resultsDir,
-@@ -54,7 +55,9 @@
+@@ -54,7 +57,9 @@
                  failOnFailedRuns: true,
                  failOnAttention: true,
                  hasPendingSupervisorRequest: deps.hasPendingSupervisorRequest,
@@ -192,83 +332,6 @@
      let supervisorBarrier = false;
      const isDone = () => {
          if (deps.hasPendingSupervisorRequest?.()) {
---- a/src/intercom/native-supervisor-channel.js
-+++ b/src/intercom/native-supervisor-channel.js
-@@ -557,6 +557,7 @@
-         return state;
-     };
-     const pending = new Map();
-+    const queuedSupervisorWakes = new Set();
-     const requestCorrelations = new Map();
-     const correlationKey = (request) => {
-         if (!request.toolCallId)
-@@ -664,6 +665,16 @@
-         }
-     };
-     const poll = () => {
-+        if (deps.canTriggerTurn?.() === false) {
-+            // Preserve the exact request file and allow normal polling to
-+            // enqueue it after a fresh explicit operation. Never acknowledge
-+            // a suppressed ask as seen/delivered, including asks cleared by abort.
-+            for (const request of pending.values()) {
-+                seenFiles.delete(request.requestFile);
-+                queuedSupervisorWakes.delete(request.id);
-+            }
-+            return;
-+        }
-         cleanupStaleChannelsIfDue();
-         // Only display notifications require a live UI context, not request registration.
-         refreshPendingRequests(pending, state, observeRequestLifecycle, runState);
-@@ -713,6 +724,7 @@
-                         replyHint: supervisorReplyHint(request.id),
-                     },
-                 }, { triggerTurn: true });
-+                queuedSupervisorWakes.add(request.id);
-             }
-             catch (error) {
-                 console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
-@@ -889,11 +901,18 @@
-                 timers.clearImmediate(deferredWatcherRefresh);
-             deferredWatcherRefresh = undefined;
-             pending.clear();
-+            queuedSupervisorWakes.clear();
-             requestCorrelations.clear();
-             seenFiles.clear();
-         },
-         pending,
-         getSupervisorRequestState,
-+        hasQueuedSupervisorWake: () => {
-+            for (const id of queuedSupervisorWakes)
-+                if (!pending.has(id)) queuedSupervisorWakes.delete(id);
-+            return pending.size > 0 && [...pending.keys()].every(id => queuedSupervisorWakes.has(id));
-+        },
-+        hasResolvedReply: ({ replyTo, runId, agent }) => [...requestCorrelations.values()].some(({ request, state: lifecycle }) => request.id === replyTo && request.runId === runId && request.agent === agent && lifecycle === "resolved"),
-     };
- }
- //# sourceMappingURL=native-supervisor-channel.js.map
-\ No newline at end of file
---- a/src/extension/control-notices.js
-+++ b/src/extension/control-notices.js
-@@ -18,7 +18,7 @@
-         content: noticeText,
-         display: true,
-         details: { ...input.details, childIntercomTarget, noticeText },
--    }, { triggerTurn: input.details.source === "async" });
-+    }, { triggerTurn: input.details.source === "async" && input.canTriggerTurn?.() !== false });
- }
- export function handleSubagentControlNotice(input) {
-     if (!input.details?.event || input.details.event.type === "active_long_running")
---- a/src/extension/steering-notices.js
-+++ b/src/extension/steering-notices.js
-@@ -18,6 +18,6 @@
-         content: noticeText,
-         display: true,
-         details: { ...input.details, noticeText },
--    }, { triggerTurn: true });
-+    }, { triggerTurn: input.canTriggerTurn?.() !== false });
- }
- //# sourceMappingURL=steering-notices.js.map
-\ No newline at end of file
 --- a/src/runs/background/wait-subscriptions.js
 +++ b/src/runs/background/wait-subscriptions.js
 @@ -144,7 +144,7 @@
@@ -282,7 +345,80 @@
              remove(record);
 --- a/src/runs/foreground/subagent-executor.js
 +++ b/src/runs/foreground/subagent-executor.js
-@@ -4946,7 +4946,7 @@
+@@ -2529,15 +2529,9 @@
+     }
+     return undefined;
+ }
+-export const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
+-// Async single-agent runs also need a wall-clock backstop: a child whose bash
+-// tool blocks forever (e.g. a background process inheriting the terminal with
+-// no bash `timeout` arg) would otherwise hang the parent indefinitely with
+-// zero signal. Same generous default as foreground; explicit timeoutMs/
+-// maxRuntimeMs and agent-level defaultTimeoutMs remain authoritative.
+-//
+-// Deliberately NOT applied at the workflow level: async scripted workflows
+-// stay unbounded as a whole, while each runner child has its own deadline.
++// Compatibility exports: an omitted runtime deadline is genuinely absent.
++// Explicit call, agent, config and inherited parent deadlines remain authoritative.
++export const DEFAULT_FOREGROUND_TIMEOUT_MS = undefined;
+ export { DEFAULT_ASYNC_TIMEOUT_MS };
+ /**
+  * Maximum delay a Node.js timer accepts. Values above the 32-bit signed integer
+@@ -2555,7 +2549,7 @@
+ /**
+  * Resolve the optional global default runtime deadline from extension config
+  * (`config.timeoutMs`). Returns undefined for unset or invalid values so callers
+- * fall back to the built-in defaults. "Invalid" covers non-positive-integer
++ * remain unbounded. "Invalid" covers non-positive-integer
+  * values and values above `MAX_TIMER_DELAY_MS`; the latter would overflow the
+  * Node.js timer and expire the run almost immediately instead of running long.
+  */
+@@ -2587,21 +2581,13 @@
+     return timeoutMs === undefined ? {} : { timeoutMs };
+ }
+ /**
+- * Resolve the effective launch timeout for a single-agent run, applying the
+- * async/foreground default when neither the caller nor the agent set one.
+- *
+- * A global config default (`config.timeoutMs`, passed as `configDefaultTimeoutMs`)
+- * replaces the built-in 30-minute backstop wherever a concrete default is applied.
+- * The async default is deliberately applied only to plain single-agent launches.
+- * Composite launches keep their top-level execution unbounded when no timeout is
+- * set — even with a config default — while their runner children resolve separate
+- * deadlines. Exported so the executor wiring is directly testable.
++ * Resolve an explicit call or configured deadline; no implicit runtime limit.
++ * Async composite config behavior is preserved: config bounds its children,
++ * not the whole workflow. Exported so executor wiring is directly testable.
+  */
+ export function resolveSingleAgentLaunchTimeout(params, async, configDefaultTimeoutMs) {
+     const isComposite = (params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || params.workflowScript !== undefined;
+-    const foregroundDefault = configDefaultTimeoutMs ?? DEFAULT_FOREGROUND_TIMEOUT_MS;
+-    const asyncSingleDefault = configDefaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS;
+-    const defaultTimeoutMs = !async ? foregroundDefault : isComposite ? undefined : asyncSingleDefault;
++    const defaultTimeoutMs = async && isComposite ? undefined : configDefaultTimeoutMs;
+     return resolveForegroundTimeout(params, defaultTimeoutMs);
+ }
+ function resolveToolBudget(raw, label = "toolBudget", options) {
+@@ -4730,14 +4716,10 @@
+                 }
+             }
+             const parentCwd = ctx.cwd;
+-            for (const [name, value] of [["timeoutMs", requestParams.timeoutMs], ["maxRuntimeMs", requestParams.maxRuntimeMs]]) {
+-                if (value === undefined)
+-                    continue;
+-                const overflowError = timerDelayOverflowError(name, value);
+-                if (overflowError)
+-                    return buildRequestedModeError(requestParams, overflowError);
+-            }
+-            const timeout = requestParams.timeoutMs ?? requestParams.maxRuntimeMs ?? (requestParams.async === false ? resolveConfigDefaultTimeoutMs(deps.config.timeoutMs) ?? DEFAULT_FOREGROUND_TIMEOUT_MS : undefined);
++            const workflowTimeout = resolveForegroundTimeout(requestParams, requestParams.async === false ? resolveConfigDefaultTimeoutMs(deps.config.timeoutMs) : undefined);
++            if (workflowTimeout.error)
++                return buildRequestedModeError(requestParams, workflowTimeout.error);
++            const timeout = workflowTimeout.timeoutMs;
+             const workflowUsageBudget = validateUsageBudgetConfig(requestParams.usageBudget ?? deps.config.usageBudget, requestParams.usageBudget ? "usageBudget" : "config.usageBudget");
+             if (workflowUsageBudget.error)
+                 return buildRequestedModeError(requestParams, workflowUsageBudget.error);
+@@ -4946,7 +4928,7 @@
                              customType: "subagent-workflow-result-write-failed",
                              content: message,
                              display: true,
@@ -291,7 +427,7 @@
                          resultWriteFailureWakeDelivered = true;
                      }
                      catch (sendError) {
-@@ -5498,7 +5498,7 @@
+@@ -5498,7 +5480,7 @@
                                          customType: "subagent-incremental-child-notify",
                                          content: formatIncrementalChildCompletion(notification),
                                          display: notification.outcome !== "completed",
@@ -300,6 +436,17 @@
                                  }
                                  catch (sendError) {
                                      console.error(`Failed to send incremental child completion notification for '${notification.childKey}':`, sendError);
+--- a/src/runs/shared/subagent-prompt-runtime.js
++++ b/src/runs/shared/subagent-prompt-runtime.js
+@@ -505,7 +505,7 @@
+         }
+         config.holdFinalDrain?.(true);
+         try {
+-            await drainOutstandingWork({ state: waitState, events: pi.events, nestedRootRunId, hasPendingSupervisorRequest: config.hasPendingSupervisorRequest }, drainObservation);
++            await drainOutstandingWork({ state: waitState, events: pi.events, signal: ctx?.signal, nestedRootRunId, hasPendingSupervisorRequest: config.hasPendingSupervisorRequest }, drainObservation);
+         }
+         finally {
+             config.holdFinalDrain?.(false);
 --- a/src/watchdog/register-main.js
 +++ b/src/watchdog/register-main.js
 @@ -356,9 +356,9 @@

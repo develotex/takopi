@@ -86,6 +86,27 @@ def test_mismatch_never_leaves_partial_copy(
     assert not list(tmp_path.glob(".copy-*"))
 
 
+def test_context_fuzz_is_rejected_even_when_output_hash_would_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, source, destination, pi = fixture(tmp_path, monkeypatch)
+    (source / "original.js").write_text("first\nold\nlast\n")
+    manifest_path = module.PATCH_ROOT / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"]["original.js"] = {
+        "original": hashlib.sha256(b"first\nold\nlast\n").hexdigest(),
+        "patched": hashlib.sha256(b"first\nnew\nlast\n").hexdigest(),
+    }
+    manifest_path.write_text(json.dumps(manifest))
+    (module.PATCH_ROOT / "rpc-lifetime.patch").write_text(
+        "--- a/original.js\n+++ b/original.js\n@@ -1,3 +1,3 @@\n"
+        " wrong-first\n-old\n+new\n wrong-last\n"
+    )
+    with pytest.raises(RuntimeError, match="Compatibility patch failed"):
+        module.prepare(source, destination, pi)
+    assert not destination.exists()
+
+
 def test_modified_destination_is_not_overwritten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

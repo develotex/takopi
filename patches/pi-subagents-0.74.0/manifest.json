@@ -9,11 +9,11 @@
     },
     "src/extension/index.js": {
       "original": "5734febf926c7d589d51a2b390d073a592aa588b43df0e6a07bba51ce6d05388",
-      "patched": "cfd0c7d1eb0e0e1c510cc8c0b8523c1b3769205a45637befe2c7f90ebc245911"
+      "patched": "42d1eef9da1156434b694151ae00db1cf1368ec33951c9a0c1a59429e1f1cb5c"
     },
     "src/runs/background/auto-drain.js": {
       "original": "5c840bb015b3809fdb9a69b6d9cfbe2e0e95811f9d54fa83278249b352b6e96a",
-      "patched": "f982ff0949b2d277b15cb2b4bc65c7b4c3123a23981983db86dbaf54b0404a52"
+      "patched": "75e26fd52d02f6de37f268dc80124a67728ce7dd9cc348aed53cea9f0a82fe0e"
     },
     "src/runs/background/notify.js": {
       "original": "9fa4ec50da0d41b4256349befe86c5d8e8eaaba122817a4c9a71c303fa45089f",
@@ -45,7 +45,7 @@
     },
     "src/runs/foreground/subagent-executor.js": {
       "original": "a75dfc6215c909c905f9cbc54773db92c493e3425beea42a932c79cf1d44d035",
-      "patched": "b8cf9a89987c2a10c35c037a44efaac254d9bc480c3e10b379552bcb3652ef90"
+      "patched": "02e497a887f53732293b54c98fd47eb3109da2ed58e1ce42baa4a1cce12178e6"
     },
     "src/watchdog/register-main.js": {
       "original": "f793d900d9780c76fc86dbc519dd6de85f19027b7e782b84956a2ad8750a78d0",
@@ -54,6 +54,18 @@
     "src/extension/takopi-rpc-lifetime.js": {
       "original": null,
       "patched": "c41b82fdb823e3165954744c4863ceb141e777d23b29cbc2936e5e7b62483b20"
+    },
+    "src/extension/schemas.js": {
+      "original": "ad2e2a7708fc2f5fcf06b94358f87c894c34dac8388c79f6f8931dfa7766f81e",
+      "patched": "b5f3915e9cb440ecbd83273690c4b179e2c5ed0bb409e6712b779bdebfb32cc7"
+    },
+    "src/runs/background/async-execution.js": {
+      "original": "52d54705ffce04e8714c615c89409b56b913f09e3efa1a13891f33c29478cb03",
+      "patched": "5a284af9df9112425163bb8a96d28dff79073779a06ef16ed4a9be5fa322006c"
+    },
+    "src/runs/shared/subagent-prompt-runtime.js": {
+      "original": "cb20768f7c3f1f842ce941b5e351a15de273a5791778a0a44b7d1a1ff63f2888",
+      "patched": "a256d950356c298fd1c94d4b08c3ae018aec29544b45182f17de161b543a2645"
     }
   }
 }

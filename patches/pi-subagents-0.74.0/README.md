@@ -13,10 +13,16 @@ nonempty** parent stop can settle with a live workflow. Teardown then cancels it
 The opt-in `--takopi-rpc-lifetime` flag enables draining in the existing awaited
 `agent_end`. In Pi 0.99.2 that handler still has the actual operation abort
 signal. `agent_before_settle` does not; moving the wait there strands abort.
-The unchanged headless branch and ordinary TUI behavior remain unchanged.
+The existing headless branch and ordinary TUI registration remain intact.
+Runtime-default changes below apply to **all users of this separate package
+copy**, including TUI; the RPC lifetime hook alone remains opt-in. The original
+npm installation is unchanged.
 
-The integration uses existing package-owned session/run predicates and strict
-30-minute auto-drain. It then drains native watcher/coalescer/completion batches
+The integration uses existing package-owned session/run predicates. Auto-drain
+waits in finite interruptible windows (at most 30 minutes each), re-arming until
+owned work finishes; it has **no implicit total lifetime deadline**. A caller's
+explicit auto-drain `timeoutMs` still bounds the complete drain and fails on expiry.
+It then drains native watcher/coalescer/completion batches
 within 30 seconds. Native queued messages cause parent synthesis through Pi's
 ordinary post-run continuation; no replay prompt, fake owner, or second notifier
 is introduced. New work admitted by synthesis is drained on its own boundary.
@@ -29,7 +35,9 @@ reply, only that request's resolved run/agent can wait for actual stale
 `contact_supervisor` attention to clear (maximum five seconds). Other/unknown
 attention still fails; new pending asks retain the normal supervisor barrier.
 
-Draining and delivery are abort-aware. A captured real RPC operation signal also
+Draining and delivery are abort-aware. The child-runtime and non-UI main
+`agent_end` callers forward their actual operation signal too, including signals
+already aborted before the drain starts. A captured real RPC operation signal also
 prevents late completion notifications from starting a parent turn after abort;
 results can still be appended. A fresh explicit operation resets that gate.
 The same optional predicate gates native supervisor, control/steering,
@@ -48,6 +56,23 @@ the host still consumes settlement before accepting a fresh prompt. Unexpected
 cancellation codes, child/drain failures and ordinary errors remain terminal.
 Unrelated extension/naming errors retain their existing policy.
 
+## Runtime deadlines versus waiting windows
+
+Omitted run `timeoutMs`/`maxRuntimeMs` means no runtime deadline in foreground,
+async single, chains, tasks, scripted workflows and their nested children. No
+Infinity, oversized timer, or larger replacement deadline is injected. Explicit
+call aliases, agent `timeoutMs`, supported config defaults and explicit inherited
+parent deadlines retain upstream precedence/enforcement; async composites do
+not acquire a parent deadline from config (existing upstream behavior).
+The tool schema describes this contract. `bg_wait`'s documented 30-minute default
+is only a waiting window: work continues when it expires.
+
+Idle/long-tool `needs_attention` is not terminal failure: auto-drain waits through
+it with the real waiter. Native pending supervisor requests still yield to their
+queued parent wake; unknown supervisor attention and real failed runs retain
+strict upstream error behavior. Cancellation and ownership checks remain active
+on every window and poll; no errors are silently swallowed.
+
 ## Reproducible preparation (operator action, not automatically installed)
 
 Run from the Takopi checkout, with a **new**, separate output directory:
@@ -64,8 +89,10 @@ python3 scripts/prepare_pi_rpc_lifetime.py --verify \
 ```
 
 All touched source files and the package manifest have exact SHA-256 gates.
-Preparation validates everything first, patches a staging copy, verifies output
-hashes, and only then renames it into place. A repeated invocation verifies an
+Preparation validates everything first, patches a staging copy with context
+fuzz disabled, verifies output hashes, and only then renames it into place.
+The unified patch includes explicit missing-final-newline records, so source-map
+EOFs and subsequent file headers cannot be concatenated. A repeated invocation verifies an
 existing destination rather than changing it. Mismatch never overwrites either
 package. `patch` and Python 3 are required. The copy links its `node_modules` to
 the original package's dependency root; **retain that tree and the pinned Pi
@@ -122,8 +149,14 @@ batch delay, and a working subsequent explicit prompt. The late-supervisor regre
 explicitly acknowledges `clear_queue` before `abort`, observes no autonomous
 restart, then explicitly continues, answers the retained ask and synthesizes.
 Focused tests check control/steering gates and retained wait-subscription files.
-Tests bound their own
-child/ask deadlines and reap only their unique scratch-path runners.
+Tests bound their own harness/ask deadlines and reap only their unique
+scratch-path runners. The default child launches intentionally omit deadlines;
+a separate real async single test enforces an explicit 100ms deadline.
+Caller-level tests also register the real child and main extension hooks with
+isolated session state and active background providers, covering already-aborted
+and mid-wait cancellation. Launch regressions validate agent child deadlines
+through the Node timer maximum and exercise the actual workflow-root branch's
+alias agreement and positive-integer checks before discovery/runner admission.
 
 To reproduce the old regression, select an untouched original package and set
 `LIFETIME_EXPECT_RED=1`, running only the `empty parent` test. It fails missing
@@ -133,6 +166,15 @@ failed wait, changed owner, strict attention, bounded delivery and resolved-repl
 correlation. Python tests cover prefix-scoped host errors and all-or-nothing,
 idempotent copy preparation. CI runs the pinned copy preparation and full Node
 suite, in addition to normal Python checks.
+
+The unbounded regression runs four **virtual hours**, across eight re-armed
+windows, through both a controlled waiter and the real async status/wait path.
+It checks idle attention without spin, foreign-session preservation, exactly one
+drain completion, foreground/async/composite default resolution, chain JSON
+serialization, nested explicit parent deadlines and explicit drain expiry.
+Existing real RPC cases remain short integration proofs, **not** evidence that a
+real production child has survived hours: the prior two short passing cases did
+not prove long lifetime.
 
 ## Limits
 
@@ -145,8 +187,24 @@ suite, in addition to normal Python checks.
   this pinned package integration.
 - Genuine empty stops with no owned work retain Takopi's existing empty-final
   presentation; provider errors and unrelated naming errors are not rewritten.
-- Eleven existing compiled package JS files plus one new helper are patched. Their
+- Fourteen existing compiled package JS files plus one new helper are patched. Their
   source maps/declarations remain upstream artifacts; this pinned compatibility
   copy is executed as JavaScript, not published as an upstream TypeScript build.
+- This removes implicit **Pi child run** deadlines, not every finite I/O guard.
+  HTTP header/body idle limits (default 5m), startup/control handshakes, acceptance
+  verification (default 2m), worktree setup hooks (30s), and completion delivery
+  (30s) remain bounded. Fast builtin read/grep/find/ls/edit/write/structured_output
+  operations retain a 5m per-tool guard that can terminate a child on an actual
+  stalled tool; `bash`, custom tools, `bg_wait` and supervisor tools do not receive
+  that implicit guard. Explicit per-tool limits remain authoritative.
+- External runner contracts are not made unlimited: the Herdr Codex monitor
+  defaults to a 90s placement wait capped at 30m; external-job bridge operations
+  retain their 2m request timeout. These transports/adapters need separate
+  validation before claiming unbounded external-runner behavior. Native supervisor
+  requests retain their upstream 10m unanswered-request timeout; this is an ask
+  deadline, not a child runtime deadline. Watchdog post-terminal tail/permission
+  delivery guards also remain; idle activity thresholds alone do not kill a run.
+- Unbounded work can consume resources indefinitely until cancellation. This is
+  intentional; operators who need a finite deadline must configure one explicitly.
 - Upstream changes, alternate Pi versions, and actual Telegram ingress/deployment
   require separate validation. No live installation is claimed by these tests.

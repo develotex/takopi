@@ -9,17 +9,17 @@ const root = process.env.SUBAGENTS_ROOT;
 const pi = process.env.PI_PACKAGE_ROOT;
 assert.ok(root && pi, 'set SUBAGENTS_ROOT (package copy), PI_PACKAGE_ROOT (0.99.2)');
 
-async function probe({ text = false, abort = false, supervisor = false, noWork = false, unpatched = false } = {}) {
+async function probe({ text = false, abort = false, supervisor = false, noWork = false, unpatched = false, single = '', childTimeoutMs } = {}) {
   const dir = await mkdtemp(path.join(process.env.LIFETIME_SCRATCH_ROOT ?? '/mnt/victor_vector_volume', 'rpc-proof-'));
   const agentDir = path.join(dir, 'agent');
   await mkdir(path.join(agentDir, 'extensions/subagent'), { recursive: true });
   await writeFile(path.join(agentDir, 'extensions/subagent/config.json'), JSON.stringify({ toolActivation: 'eager', completionBatch: { enabled: true, debounceMs: 1000 } }));
   await mkdir(path.join(dir, '.pi/agents'), { recursive: true });
   await writeFile(path.join(dir, '.pi/agents/probe.md'), `---\nname: probe\ndescription: Local deterministic lifecycle child\nmodel: inherit\ntools: ${supervisor ? 'contact_supervisor' : ''}\nextensions: ${path.join(here, 'rpc-lifetime-provider.mjs')}\n---\nReturn the deterministic child result.\n`);
-  await writeFile(path.join(dir, 'probe-workflow.js'), 'const child = await runs.run("leaf", { agent: "probe", task: "LEAF_ONLY_MARKER", timeoutMs: 8000 }); return child.output;');
+  await writeFile(path.join(dir, 'probe-workflow.js'), 'const child = await runs.run("leaf", { agent: "probe", task: "LEAF_ONLY_MARKER" }); return child.output;');
   const args = [path.join(pi, 'dist/cli.js'), '--mode', 'rpc', '--no-extensions', '-e', path.join(root, 'index.js'), '-e', path.join(here, 'rpc-lifetime-provider.mjs'), '--provider', 'lifetime-probe', '--model', 'script', '--session', path.join(dir, 'session.jsonl')];
   if (!unpatched) args.push('--takopi-rpc-lifetime');
-  const child = spawn(process.execPath, args, { cwd: dir, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, LIFETIME_TEXT_STOP: text ? '1' : '0', LIFETIME_SUPERVISOR: supervisor ? '1' : '0', LIFETIME_NO_WORK: noWork ? '1' : '0', PI_SUBAGENT_CHILD: '0', TMPDIR: dir, PI_INTERCOM_ASK_TIMEOUT_MS: '6000' } });
+  const child = spawn(process.execPath, args, { cwd: dir, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, LIFETIME_SINGLE: single, LIFETIME_CHILD_TIMEOUT_MS: childTimeoutMs === undefined ? '' : String(childTimeoutMs), LIFETIME_TEXT_STOP: text ? '1' : '0', LIFETIME_SUPERVISOR: supervisor ? '1' : '0', LIFETIME_NO_WORK: noWork ? '1' : '0', PI_SUBAGENT_CHILD: '0', TMPDIR: dir, PI_INTERCOM_ASK_TIMEOUT_MS: '6000' } });
   const records = [];
   let stderr = '', buffer = '', resolveSettled, rejectSettled, abortAt;
   const settled = new Promise((resolve, reject) => { resolveSettled = resolve; rejectSettled = reject; });
@@ -119,6 +119,23 @@ for (const text of [false, true]) {
     assert.equal(records.filter(r => r.type === 'extension_error' && r.error?.startsWith('TAKOPI_RPC_LIFETIME:')).length, 0);
   });
 }
+
+for (const single of ['foreground', 'async']) {
+  test(`real ${single} single without runtime deadline completes once`, { timeout: 25000 }, async () => {
+    const { records, stderr } = await probe({ single });
+    assert.equal(records.filter(r => r.type === 'agent_settled').length, 1);
+    assert.equal(records.filter(r => r.type === 'extension_error' && r.error?.startsWith('TAKOPI_RPC_LIFETIME:')).length, 0, stderr);
+    assert.ok(records.some(r => r.type === 'message_end' && JSON.stringify(r.message?.content).includes('SYNTHESIZED_REAL_CHILD_RESULT_42')), stderr);
+  });
+}
+
+test('explicit async single deadline still fails rather than becoming healthy completion', { timeout: 25000 }, async () => {
+  const { records, stderr } = await probe({ single: 'async', childTimeoutMs: 100 });
+  assert.equal(records.filter(r => r.type === 'agent_settled').length, 1);
+  assert.ok(records.some(r => r.type === 'extension_error' && r.error?.startsWith('TAKOPI_RPC_LIFETIME:')), JSON.stringify(records) + stderr);
+  assert.ok(JSON.stringify(records).includes('timed out'), stderr);
+  assert.equal(records.filter(r => r.type === 'message_end' && JSON.stringify(r.message?.content).includes('SYNTHESIZED_REAL_CHILD_RESULT_42')).length, 0);
+});
 
 test('real pending supervisor request wakes parent to reply and then synthesize', { timeout: 25000 }, async () => {
   const { records, stderr } = await probe({ supervisor: true });

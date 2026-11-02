@@ -26,7 +26,9 @@ export default function (pi) {
           } else message.content = [{ type: 'text', text: 'REAL_CHILD_RESULT_42' }];
         } else if (!context.messages.some(m => m.role === 'toolResult' && m.toolName === 'subagent')) {
           message.content = [{ type: 'toolCall', id: 'launch-owned-workflow', name: 'subagent',
-            arguments: { workflow: './probe-workflow.js', async: true } }];
+            arguments: process.env.LIFETIME_SINGLE
+              ? { agent: 'probe', task: 'LEAF_ONLY_MARKER', async: process.env.LIFETIME_SINGLE !== 'foreground', ...(process.env.LIFETIME_CHILD_TIMEOUT_MS ? { timeoutMs: Number(process.env.LIFETIME_CHILD_TIMEOUT_MS) } : {}) }
+              : { workflow: './probe-workflow.js', async: true } }];
           message.stopReason = 'toolUse';
         } else if (context.messages.some(m => text(m).includes('PROBE_SUPERVISOR_QUESTION')) && !context.messages.some(m => m.role === 'toolResult' && m.toolName === 'subagent_supervisor')) {
           message.content = [{ type: 'toolCall', id: 'answer-child', name: 'subagent_supervisor', arguments: { action: 'reply', message: 'Approved by scripted supervisor.' } }];
