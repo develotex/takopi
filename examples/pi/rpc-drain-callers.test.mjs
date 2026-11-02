@@ -8,7 +8,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 const root = process.env.SUBAGENTS_ROOT, piRoot = process.env.PI_PACKAGE_ROOT;
 assert.ok(root && piRoot);
-const scratch = mkdtempSync('/mnt/victor_vector_volume/rpc-drain-callers-');
+const scratch = mkdtempSync(path.join(process.env.LIFETIME_SCRATCH_ROOT ?? '/mnt/victor_vector_volume', 'rpc-drain-callers-'));
 process.env.TMPDIR = scratch;
 process.env.PI_CODING_AGENT_DIR = path.join(scratch, 'agent');
 process.env.PI_SUBAGENT_CHILD = '0';
