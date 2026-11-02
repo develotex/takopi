@@ -32,8 +32,20 @@ attention still fails; new pending asks retain the normal supervisor barrier.
 Draining and delivery are abort-aware. A captured real RPC operation signal also
 prevents late completion notifications from starting a parent turn after abort;
 results can still be appended. A fresh explicit operation resets that gate.
+The same optional predicate gates native supervisor, control/steering,
+wait-subscription, incremental workflow/failure, compaction and watchdog wakes.
+Suppressed supervisor asks are **not** marked seen or delivered: their exact
+request files remain for normal polling after a fresh explicit operation. Armed
+wait-subscription files are likewise retained. Other notices may append context
+without starting a turn. Supervisor reply receipts are expired on insertion,
+capped at 256 entries and cleared on session start/shutdown.
+
 The prefixed `TAKOPI_RPC_LIFETIME:` error is deliberately terminal in Takopi's RPC
 consumer, because Pi otherwise reports a handler error and can still settle.
+Only machine code `TAKOPI_RPC_LIFETIME:CANCELLED:` **and** a known local
+`interrupt()`/cancellation request follow normal user-cancellation rendering;
+the host still consumes settlement before accepting a fresh prompt. Unexpected
+cancellation codes, child/drain failures and ordinary errors remain terminal.
 Unrelated extension/naming errors retain their existing policy.
 
 ## Reproducible preparation (operator action, not automatically installed)
@@ -63,14 +75,26 @@ For an approved deployment, retain the original release/package for rollback.
 Exclude only the original npm package's **extension**, not its skills/prompts:
 change its existing Pi package declaration to the object form with
 `"extensions": []` (preserve its existing source and other resource filters).
-Load exactly one patched index in the Takopi Pi runner's existing `extra_args`:
+Load exactly one patched index through the **global Pi `settings.extensions`**
+list, preserving all existing extension entries:
 
-```toml
-extra_args = ["--extension", "/mnt/victor_vector_volume/pi-subagents-rpc-0.74.0/index.js", "--takopi-rpc-lifetime"]
+```json
+{"extensions": ["/mnt/victor_vector_volume/pi-subagents-rpc-0.74.0/index.js"]}
 ```
 
-Merge those arguments with existing options; do not discard naming/extensions
-or user intents. The custom flag is the startup capability proof: when the
+This is an illustrative entry to merge, not a replacement settings file. Loading
+it globally preserves subagent availability in ordinary interactive Pi after the
+original npm extension is filtered out. The lifetime behavior is opt-in and
+remains disabled for TUI and default RPC hosts. Add **only the flag** to Takopi's
+existing runner arguments; do not load a second index there:
+
+```toml
+extra_args = ["--takopi-rpc-lifetime"]
+```
+
+Merge that flag with existing options; do not discard naming/extensions or user
+intents. The package's unchanged `index.js` child guard skips main extension
+registration when `PI_SUBAGENT_CHILD=1`; runtime-owned child hooks remain separate. The custom flag is the startup capability proof: when the
 patched extension is missing or fails to load, Pi rejects the unknown option,
 rather than silently operating without protection. Verify the copy and runtime
 versions before each deployment; do not upgrade packages behind the copied
@@ -94,7 +118,11 @@ launch the actual pinned Pi CLI, actual patched subagents executor, actual async
 workflow and actual child with a deterministic **no-network** provider. They
 verify empty and text stops, result synthesis before settlement, supervisor
 ask/reply/resume/synthesis, abort ACK under two seconds, late completion beyond
-batch delay, and a working subsequent explicit prompt. Tests bound their own
+batch delay, and a working subsequent explicit prompt. The late-supervisor regression
+explicitly acknowledges `clear_queue` before `abort`, observes no autonomous
+restart, then explicitly continues, answers the retained ask and synthesizes.
+Focused tests check control/steering gates and retained wait-subscription files.
+Tests bound their own
 child/ask deadlines and reap only their unique scratch-path runners.
 
 To reproduce the old regression, select an untouched original package and set
@@ -111,13 +139,13 @@ suite, in addition to normal Python checks.
 - This is not a durable detached-work service or Telegram end-to-end proof.
   Topic/session isolation continues to use package ownership and Takopi's
   existing exclusive session/path claims; no topic routing was changed.
-- The late-completion gate covers native completion notifier wakes. Native
-  supervisor/control channels have independent wake paths. Explicit cancellation
-  in Takopi must still follow its normal abort/close cleanup; this patch does not
-  promise a permanently retained aborted RPC host suppresses every other channel.
+- The inventoried package-owned wake paths share cancellation gating. Normal
+  Takopi abort/close cleanup is still required for process/resource lifetime;
+  unrelated third-party extensions can own independent wake behavior outside
+  this pinned package integration.
 - Genuine empty stops with no owned work retain Takopi's existing empty-final
   presentation; provider errors and unrelated naming errors are not rewritten.
-- Six existing compiled package JS files plus one new helper are patched. Their
+- Eleven existing compiled package JS files plus one new helper are patched. Their
   source maps/declarations remain upstream artifacts; this pinned compatibility
   copy is executed as JavaScript, not published as an upstream TypeScript build.
 - Upstream changes, alternate Pi versions, and actual Telegram ingress/deployment

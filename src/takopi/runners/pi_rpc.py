@@ -26,7 +26,9 @@ _LIVE_CLAIM_USERS = 0
 _END = object()
 
 
-def _check_lifetime_error(record: dict[str, Any]) -> None:
+def _check_lifetime_error(
+    record: dict[str, Any], *, expected_cancel: bool = False
+) -> None:
     # Pi reports awaited extension-handler failures and may still emit a normal
     # agent_settled. Only the opt-in compatibility contract is terminal here.
     if (
@@ -35,6 +37,13 @@ def _check_lifetime_error(record: dict[str, Any]) -> None:
         and isinstance(record.get("error"), str)
         and record["error"].startswith("TAKOPI_RPC_LIFETIME:")
     ):
+        # Only a machine-coded abort for our own explicit cancellation is
+        # expected. Still consume agent_settled; do not hide child/drain errors
+        # or an unsolicited/foreign cancellation marker.
+        if expected_cancel and record["error"].startswith(
+            "TAKOPI_RPC_LIFETIME:CANCELLED:"
+        ):
+            return
         raise RuntimeError(f"Pi RPC background lifetime failed: {record['error']}")
 
 
@@ -368,7 +377,14 @@ class PiRpcRun:
         # Never submit a new prompt until the old run's boundary is consumed.
         async with asyncio.timeout(30):
             async for record in self.client.events():
-                _check_lifetime_error(record)
+                _check_lifetime_error(
+                    record,
+                    expected_cancel=self._interrupting
+                    or (
+                        self.cancel_requested is not None
+                        and self.cancel_requested.is_set()
+                    ),
+                )
                 if record.get("type") == "agent_settled":
                     self._unsettled = False
                     return
@@ -429,7 +445,14 @@ class PiRpcRun:
             self._prompt_started = True
             meta = {"cwd": str(self.client.cwd), "control": self}
             async for record in self.client.events():
-                _check_lifetime_error(record)
+                _check_lifetime_error(
+                    record,
+                    expected_cancel=self._interrupting
+                    or (
+                        self.cancel_requested is not None
+                        and self.cancel_requested.is_set()
+                    ),
+                )
                 kind = record.get("type")
                 if kind == "message_end":
                     message = record.get("message")

@@ -34,8 +34,10 @@ async function probe({ text = false, abort = false, supervisor = false, noWork =
       const record = JSON.parse(line); records.push(record);
       if (abort && record.type === 'message_end' && record.message?.role === 'assistant' && record.message.stopReason === 'stop' && !abortAt) {
         abortAt = Date.now();
-        setTimeout(() => child.stdin.write(JSON.stringify({ type: 'abort', id: 'abort' }) + '\n'), 30);
+        setTimeout(() => child.stdin.write(JSON.stringify({ type: 'clear_queue', id: 'clear-before-abort' }) + '\n'), 30);
       }
+      if (record.type === 'response' && record.id === 'clear-before-abort' && record.success)
+        child.stdin.write(JSON.stringify({ type: 'abort', id: 'abort' }) + '\n');
       if (record.type === 'agent_settled') resolveSettled();
     }
   });
@@ -59,6 +61,8 @@ async function probe({ text = false, abort = false, supervisor = false, noWork =
       while (!records.slice(boundary).some(r => r.type === 'agent_settled') && Date.now() < manualDeadline)
         await new Promise(resolve => setTimeout(resolve, 10));
       assert.ok(records.slice(boundary).some(r => r.type === 'agent_settled'), stderr);
+      assert.equal(records.slice(boundary).filter(r => r.type === 'extension_error' && r.error?.startsWith('TAKOPI_RPC_LIFETIME:')).length, 0, 'fresh continuation must not hide a lifecycle error');
+      if (supervisor) assert.ok(records.slice(boundary).some(r => r.type === 'tool_execution_end' && r.toolName === 'subagent_supervisor' && !r.isError), 'explicit continuation must answer retained ask');
       assert.ok(records.slice(boundary).some(r => r.type === 'message_end' && JSON.stringify(r.message?.content).includes('SYNTHESIZED_REAL_CHILD_RESULT_42')), 'fresh explicit operation must work after abort');
       return { records: records.slice(0, boundary), stderr };
     }
@@ -112,6 +116,7 @@ for (const text of [false, true]) {
     const answers = records.filter(r => r.type === 'message_end' && r.message?.role === 'assistant').map(r => JSON.stringify(r.message.content));
     assert.ok(answers.some(s => s.includes('SYNTHESIZED_REAL_CHILD_RESULT_42')), `${JSON.stringify(records)}\n${stderr}`);
     assert.equal(records.filter(r => r.type === 'agent_settled').length, 1);
+    assert.equal(records.filter(r => r.type === 'extension_error' && r.error?.startsWith('TAKOPI_RPC_LIFETIME:')).length, 0);
   });
 }
 
@@ -119,6 +124,12 @@ test('real pending supervisor request wakes parent to reply and then synthesize'
   const { records, stderr } = await probe({ supervisor: true });
   assert.ok(records.some(r => r.type === 'tool_execution_end' && r.toolName === 'subagent_supervisor' && !r.isError), stderr);
   assert.ok(records.some(r => r.type === 'message_end' && r.message?.role === 'assistant' && JSON.stringify(r.message.content).includes('SYNTHESIZED_REAL_CHILD_RESULT_42')), JSON.stringify(records.filter(r => ['extension_error', 'message_end'].includes(r.type) && r.message?.role !== 'system')) + stderr);
+});
+
+test('late native supervisor ask cannot restart aborted parent; explicit continuation answers retained ask', { timeout: 25000 }, async () => {
+  const { records } = await probe({ abort: true, supervisor: true });
+  assert.ok(records.some(r => r.type === 'response' && r.id === 'clear-before-abort' && r.success));
+  assert.equal(records.filter(r => r.type === 'tool_execution_start' && r.toolName === 'subagent_supervisor').length, 0, 'no supervisor action before explicit continuation');
 });
 
 test('actual operation abort during RPC drain ACKs promptly without parent re-prompt', { timeout: 25000 }, async () => {

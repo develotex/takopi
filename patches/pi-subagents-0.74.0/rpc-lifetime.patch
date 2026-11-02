@@ -8,13 +8,24 @@
  import registerSubagentNotify, { parseSubagentNotifyContent } from "../runs/background/notify.js";
  import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE } from "./steering-notices.js";
  import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.js";
-@@ -310,7 +311,12 @@
-     const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
-     const mainWatchdog = registerMainWatchdog(pi);
+@@ -303,14 +304,21 @@
+                 state.lastUiContext = null;
+         }, run);
+     };
++    let rpcLifetimeSignal;
++    const canTriggerTurn = () => !rpcLifetimeSignal?.aborted;
+     const supervisorChannel = createNativeSupervisorChannel(pi, state, {
++        canTriggerTurn,
+         // Owner states are created only by scheduled execution, which loads the executor first.
+         getCurrentOwnerStates: () => executor?.getCurrentSupervisorOwnerStates() ?? [],
+     });
+-    const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
+-    const mainWatchdog = registerMainWatchdog(pi);
++    const waitSubscriptionManager = createWaitSubscriptionManager(pi, state, { canTriggerTurn });
++    const mainWatchdog = registerMainWatchdog(pi, { canTriggerTurn });
      const resultDeliveryOwnership = createResultDeliveryOwnership(state);
 -    const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership });
-+    let rpcLifetimeSignal;
-+    const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership, canTriggerTurn: () => !rpcLifetimeSignal?.aborted });
++    const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership, canTriggerTurn });
 +    pi.on("agent_start", (_event, ctx) => {
 +        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true)
 +            rpcLifetimeSignal = ctx.signal;
@@ -22,14 +33,27 @@
      let retainedNestedRouteTracker;
      const fleetStatus = fleetViewEnabled
          ? new SubagentFleetStatus(state, async (itemKey) => {
-@@ -681,7 +687,15 @@
+@@ -470,6 +478,7 @@
+         }
+     };
+     const executorDeps = {
++        canTriggerTurn,
+         pi,
+         state,
+         config,
+@@ -681,7 +690,20 @@
              event.systemPromptOptions.sections.advertised_subagents = catalog;
      });
      registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager, waitToolConfig.defaultTimeoutMs, undefined, supervisorChannel.hasPendingRequests);
 +    const rpcSupervisorReplies = new Map();
 +    pi.on("tool_result", (event, ctx) => {
-+        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true && event.toolName === "subagent_supervisor" && !event.isError && typeof event.details?.replyTo === "string")
++        if (ctx.mode === "rpc" && pi.getFlag("takopi-rpc-lifetime") === true && event.toolName === "subagent_supervisor" && !event.isError && typeof event.details?.replyTo === "string") {
++            for (const [id, receipt] of rpcSupervisorReplies)
++                if (receipt.deadline <= Date.now()) rpcSupervisorReplies.delete(id);
++            if (rpcSupervisorReplies.size >= 256)
++                rpcSupervisorReplies.delete(rpcSupervisorReplies.keys().next().value);
 +            rpcSupervisorReplies.set(event.details.runId, { ...event.details, deadline: Date.now() + 5000 });
++        }
 +    });
 +    pi.registerFlag("takopi-rpc-lifetime", { type: "boolean", default: false, description: "Keep per-turn Takopi RPC alive through owned background completion (Pi 0.99.2 compatibility)" });
      pi.on("agent_end", async (_event, ctx) => {
@@ -38,6 +62,52 @@
          if (!ctx.hasUI)
              await drainOutstandingWork({ state, events: pi.events, hasPendingSupervisorRequest: supervisorChannel.hasPendingRequests });
          const ownerSessionId = state.currentSessionId;
+@@ -695,6 +717,7 @@
+                 handleSubagentControlNotice({
+                     pi,
+                     state,
++                    canTriggerTurn,
+                     visibleControlNotices: new Set(),
+                     details: { source: "goal", event: notice.event, noticeText: notice.message },
+                 });
+@@ -723,12 +746,13 @@
+         handleSubagentControlNotice({
+             pi,
+             state,
++            canTriggerTurn,
+             visibleControlNotices,
+             details: payload,
+         });
+     };
+     const steeringNoticeHandler = (payload) => {
+-        handleSubagentSteeringNotice({ pi, state, details: payload });
++        handleSubagentSteeringNotice({ pi, state, canTriggerTurn, details: payload });
+     };
+     const asyncStartedHandler = (payload) => {
+         handleStarted(payload);
+@@ -1004,9 +1028,11 @@
+             customType: "subagent-compaction-resume",
+             content: "Compaction is complete. Resume the parent task now; background subagent results will arrive separately when ready.",
+             display: false,
+-        }, { triggerTurn: true });
++        }, { triggerTurn: canTriggerTurn() });
+     });
+     pi.on("session_start", (event, ctx) => {
++        rpcSupervisorReplies.clear();
++        rpcLifetimeSignal = undefined;
+         installRuntime(ctx);
+         startSessionMaintenance();
+         scheduleModulePreload();
+@@ -1036,7 +1062,8 @@
+         supervisorChannel.activateTransport();
+     });
+     pi.on("session_shutdown", async () => {
+-        runtimeEntry.cleanup();
++        rpcSupervisorReplies.clear();
++        if (rpcLifetimeSignal) rpcLifetimeSignal = AbortSignal.abort();        runtimeEntry.cleanup();
+         try {
+             await disposeChildSessions();
+         }
 --- a/src/runs/background/auto-drain.js
 +++ b/src/runs/background/auto-drain.js
 @@ -31,6 +31,7 @@
@@ -100,7 +170,9 @@
 -    return { startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
 +    return { hasPendingDelivery: () => processing.size > 0 || pendingTriggerTurn.size > 0, startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher, refreshResultDelivery: () => { primeExistingResults(); startDemandPolling(); } };
  }
- //# sourceMappingURL=result-watcher.js.map--- a/src/runs/background/subagent-wait.js
+ //# sourceMappingURL=result-watcher.js.map
+\ No newline at end of file
+--- a/src/runs/background/subagent-wait.js
 +++ b/src/runs/background/subagent-wait.js
 @@ -209,7 +209,7 @@
  }
@@ -130,7 +202,24 @@
      const requestCorrelations = new Map();
      const correlationKey = (request) => {
          if (!request.toolCallId)
-@@ -713,6 +714,7 @@
+@@ -664,6 +665,16 @@
+         }
+     };
+     const poll = () => {
++        if (deps.canTriggerTurn?.() === false) {
++            // Preserve the exact request file and allow normal polling to
++            // enqueue it after a fresh explicit operation. Never acknowledge
++            // a suppressed ask as seen/delivered, including asks cleared by abort.
++            for (const request of pending.values()) {
++                seenFiles.delete(request.requestFile);
++                queuedSupervisorWakes.delete(request.id);
++            }
++            return;
++        }
+         cleanupStaleChannelsIfDue();
+         // Only display notifications require a live UI context, not request registration.
+         refreshPendingRequests(pending, state, observeRequestLifecycle, runState);
+@@ -713,6 +724,7 @@
                          replyHint: supervisorReplyHint(request.id),
                      },
                  }, { triggerTurn: true });
@@ -138,7 +227,7 @@
              }
              catch (error) {
                  console.error(`Failed to surface supervisor request ${request.id} as a user turn:`, error);
-@@ -889,11 +891,18 @@
+@@ -889,11 +901,18 @@
                  timers.clearImmediate(deferredWatcherRefresh);
              deferredWatcherRefresh = undefined;
              pending.clear();
@@ -157,3 +246,71 @@
      };
  }
  //# sourceMappingURL=native-supervisor-channel.js.map
+\ No newline at end of file
+--- a/src/extension/control-notices.js
++++ b/src/extension/control-notices.js
+@@ -18,7 +18,7 @@
+         content: noticeText,
+         display: true,
+         details: { ...input.details, childIntercomTarget, noticeText },
+-    }, { triggerTurn: input.details.source === "async" });
++    }, { triggerTurn: input.details.source === "async" && input.canTriggerTurn?.() !== false });
+ }
+ export function handleSubagentControlNotice(input) {
+     if (!input.details?.event || input.details.event.type === "active_long_running")
+--- a/src/extension/steering-notices.js
++++ b/src/extension/steering-notices.js
+@@ -18,6 +18,6 @@
+         content: noticeText,
+         display: true,
+         details: { ...input.details, noticeText },
+-    }, { triggerTurn: true });
++    }, { triggerTurn: input.canTriggerTurn?.() !== false });
+ }
+ //# sourceMappingURL=steering-notices.js.map
+\ No newline at end of file
+--- a/src/runs/background/wait-subscriptions.js
++++ b/src/runs/background/wait-subscriptions.js
+@@ -144,7 +144,7 @@
+         unresolvedRestoredForegroundTokens.delete(record.token);
+     };
+     const settle = (record, outcome, detail, completion) => {
+-        if (disposed || state.currentSessionId !== record.sessionId)
++        if (disposed || state.currentSessionId !== record.sessionId || options.canTriggerTurn?.() === false)
+             return;
+         try {
+             remove(record);
+--- a/src/runs/foreground/subagent-executor.js
++++ b/src/runs/foreground/subagent-executor.js
+@@ -4946,7 +4946,7 @@
+                             customType: "subagent-workflow-result-write-failed",
+                             content: message,
+                             display: true,
+-                        }, { triggerTurn: true });
++                        }, { triggerTurn: deps.canTriggerTurn?.() !== false });
+                         resultWriteFailureWakeDelivered = true;
+                     }
+                     catch (sendError) {
+@@ -5498,7 +5498,7 @@
+                                         customType: "subagent-incremental-child-notify",
+                                         content: formatIncrementalChildCompletion(notification),
+                                         display: notification.outcome !== "completed",
+-                                    }, { triggerTurn: incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin) });
++                                    }, { triggerTurn: deps.canTriggerTurn?.() !== false && incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin) });
+                                 }
+                                 catch (sendError) {
+                                     console.error(`Failed to send incremental child completion notification for '${notification.childKey}':`, sendError);
+--- a/src/watchdog/register-main.js
++++ b/src/watchdog/register-main.js
+@@ -356,9 +356,9 @@
+         review: options.review ?? createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel(), diffBaseline: () => diffBaseline }),
+         reviewDescription: options.review ? "injected seam" : "real model review",
+         reviewChangesOnly: true,
+-        displayWarning: (details, options) => pi.sendMessage(createWatchdogWarningMessage(details, { display: true, details }), options),
++        displayWarning: (details, sendOptions) => pi.sendMessage(createWatchdogWarningMessage(details, { display: true, details }), options.canTriggerTurn?.() === false ? { ...sendOptions, triggerTurn: false } : sendOptions),
+         displayUserWarning: (details) => pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, details),
+-        displayClarification: (content) => pi.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
++        displayClarification: (content) => pi.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: options.canTriggerTurn?.() !== false }),
+     });
+     pi.registerMessageRenderer(SUBAGENT_WATCHDOG_WARNING_TYPE, (message, renderOptions, theme) => {
+         const details = message.details;

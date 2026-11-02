@@ -9,7 +9,7 @@
     },
     "src/extension/index.js": {
       "original": "5734febf926c7d589d51a2b390d073a592aa588b43df0e6a07bba51ce6d05388",
-      "patched": "8fbc31b6d4e7e34064d806d576802a9015d321c96387998d53df05600a7b9436"
+      "patched": "cfd0c7d1eb0e0e1c510cc8c0b8523c1b3769205a45637befe2c7f90ebc245911"
     },
     "src/runs/background/auto-drain.js": {
       "original": "5c840bb015b3809fdb9a69b6d9cfbe2e0e95811f9d54fa83278249b352b6e96a",
@@ -29,11 +29,31 @@
     },
     "src/intercom/native-supervisor-channel.js": {
       "original": "e1acc475e45f0d81814a5b6774830c9d0d1a46dfd9de727efe2110cf2e192033",
-      "patched": "d41fe52452053a3dd2ee2b9d762982ba5980372d8035918cabc2e7b09aacc203"
+      "patched": "167d17c0de1f6f203cbbfbd767f6191ff0edc76e8e8225960559aa8b07bc7589"
+    },
+    "src/extension/control-notices.js": {
+      "original": "c1ae88f8acc2a7bdc0ce0f485e3f49c6f65d7325632ea52b9d15b4d58cf4416c",
+      "patched": "58ee5d5a4d2e204c11660641817a6fd4ad269db91786f11cb2fb65c9d6a5d6da"
+    },
+    "src/extension/steering-notices.js": {
+      "original": "3cd4514b835015630a91ca022187b0bd90ef955f4bd4f50e95b47518f0d6bd15",
+      "patched": "7126408727da59603baf47f9c5f0a779ebdcf646524ad2e0b3756c2caa0e891e"
+    },
+    "src/runs/background/wait-subscriptions.js": {
+      "original": "26d11b5d9371830a6056d27a10fc8fa684b8a0768c9b72a4e7803a4b8e0192f6",
+      "patched": "259f17892151a40c30c66274154beb68726438e277a2c6cb488066c7e1b82d73"
+    },
+    "src/runs/foreground/subagent-executor.js": {
+      "original": "a75dfc6215c909c905f9cbc54773db92c493e3425beea42a932c79cf1d44d035",
+      "patched": "b8cf9a89987c2a10c35c037a44efaac254d9bc480c3e10b379552bcb3652ef90"
+    },
+    "src/watchdog/register-main.js": {
+      "original": "f793d900d9780c76fc86dbc519dd6de85f19027b7e782b84956a2ad8750a78d0",
+      "patched": "ae5a9d6b367121baec7fffa3c3c88cfe6d63f50d386289bdb8e14aa60675591e"
     },
     "src/extension/takopi-rpc-lifetime.js": {
       "original": null,
-      "patched": "5ebca2c9d485d43e6534e95edf8e0227c45751d5d008b21995fd43acbb6d5a49"
+      "patched": "c41b82fdb823e3165954744c4863ceb141e777d23b29cbc2936e5e7b62483b20"
     }
   }
 }

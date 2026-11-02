@@ -57,6 +57,7 @@ export async function drainRpcLifetime(deps) {
         signal.throwIfAborted();
     }
     catch (error) {
-        throw new Error(`TAKOPI_RPC_LIFETIME: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+        const code = signal?.aborted ? "TAKOPI_RPC_LIFETIME:CANCELLED:" : "TAKOPI_RPC_LIFETIME:";
+        throw new Error(`${code} ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
 }
